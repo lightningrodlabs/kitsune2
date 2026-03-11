@@ -82,6 +82,14 @@ pub struct Config {
     /// If `None`, defaults to allowing any origin.
     pub allowed_origins: Option<Vec<String>>,
 
+    /// If true, the /health endpoint will return stats (total spaces,
+    /// total agents, avg/min/max agents per space) instead of just `{}`.
+    ///
+    /// Defaults:
+    /// - `testing = false`
+    /// - `production = false`
+    pub health_stats: bool,
+
     /// Authentication configuration.
     ///
     /// This is independent of the relay implementation (SBD or Iroh).
@@ -107,6 +115,7 @@ impl Config {
             tls_key: None,
             no_relay_server: false,
             allowed_origins: None,
+            health_stats: false,
             auth: crate::auth::AuthConfig::default(),
             #[cfg(feature = "sbd")]
             sbd: sbd_server::Config::default(),
@@ -128,6 +137,7 @@ impl Config {
             tls_key: None,
             no_relay_server: false,
             allowed_origins: None,
+            health_stats: false,
             auth: crate::auth::AuthConfig::default(),
             #[cfg(feature = "sbd")]
             sbd: sbd_server::Config::default(),

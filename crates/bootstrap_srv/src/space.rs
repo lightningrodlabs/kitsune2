@@ -28,6 +28,25 @@ impl SpaceMap {
         }
     }
 
+    /// Return stats about all spaces: (num_spaces, total_agents, min_agents, max_agents).
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        let map = self.0.lock().unwrap();
+        let num_spaces = map.len();
+        let mut total_agents = 0usize;
+        let mut min_agents = usize::MAX;
+        let mut max_agents = 0usize;
+        for space in map.values() {
+            let count = space.readable.lock().unwrap().len();
+            total_agents += count;
+            min_agents = min_agents.min(count);
+            max_agents = max_agents.max(count);
+        }
+        if num_spaces == 0 {
+            min_agents = 0;
+        }
+        (num_spaces, total_agents, min_agents, max_agents)
+    }
+
     /// Update all the spaces stored in this map.
     pub fn update_all(&self, max_entries: usize) {
         // minimize outer mutex lock time

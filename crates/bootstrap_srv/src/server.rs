@@ -257,7 +257,27 @@ impl Handler<'_> {
         req: HttpRequest,
     ) -> std::io::Result<(u16, Vec<u8>)> {
         match req {
-            HttpRequest::HealthGet => Ok((200, b"{}".to_vec())),
+            HttpRequest::HealthGet => {
+                if self.config.health_stats {
+                    let (num_spaces, total_agents, min_agents, max_agents) =
+                        self.space_map.stats();
+                    let avg_agents = if num_spaces > 0 {
+                        total_agents as f64 / num_spaces as f64
+                    } else {
+                        0.0
+                    };
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "totalSpaces": num_spaces,
+                        "totalAgents": total_agents,
+                        "avgAgentsPerSpace": avg_agents,
+                        "minAgentsPerSpace": min_agents,
+                        "maxAgentsPerSpace": max_agents,
+                    }))?;
+                    Ok((200, body))
+                } else {
+                    Ok((200, b"{}".to_vec()))
+                }
+            }
             HttpRequest::BootstrapGet { space } => self.handle_boot_get(space),
             HttpRequest::BootstrapPut { space, agent, body } => {
                 self.handle_boot_put(space, agent, body)

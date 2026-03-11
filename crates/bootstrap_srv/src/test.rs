@@ -8,6 +8,7 @@ mod iroh_relay_axum;
 mod sbd;
 
 const S1: &str = "2o79pTXHaK1FTPZeBiJo2lCgXW_P0ULjX_5Div_2qxU";
+const S2: &str = "7JY1S1rI_2E5Ag_xUbRO1h8g4jb7ZFO1W98cnNMxPgs";
 
 const K1: &str = "m-U7gdxW1A647O-4wkuCWOvtGGVfHEsxNScFKiL8-k8";
 const K2: &str = "v9I5GT3xVKPcaa4uyd2pcuJromf5zv1-OaahYOLBAWY";
@@ -243,6 +244,77 @@ fn happy_empty_server_health() {
         .read_to_string()
         .unwrap();
     assert_eq!("{}", res);
+}
+
+#[test]
+fn health_stats_enabled() {
+    let mut config = Config::testing();
+    config.health_stats = true;
+    let s = BootstrapSrv::new(config).unwrap();
+    let addr = format!("http://{}/health", s.listen_addrs()[0]);
+    let res = ureq::get(&addr)
+        .call()
+        .unwrap()
+        .into_body()
+        .read_to_string()
+        .unwrap();
+    let health: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(health["totalSpaces"], 0);
+    assert_eq!(health["totalAgents"], 0);
+    assert_eq!(health["avgAgentsPerSpace"], 0.0);
+    assert_eq!(health["minAgentsPerSpace"], 0);
+    assert_eq!(health["maxAgentsPerSpace"], 0);
+}
+
+#[test]
+fn health_stats_with_agents() {
+    let mut config = Config::testing();
+    config.health_stats = true;
+    let s = BootstrapSrv::new(config).unwrap();
+
+    // Put 2 agents into space S1
+    PutInfo {
+        addr: s.listen_addrs()[0],
+        space: S1,
+        space_url: S1,
+        ..Default::default()
+    }
+    .call()
+    .unwrap();
+
+    PutInfo {
+        addr: s.listen_addrs()[0],
+        space: S1,
+        space_url: S1,
+        agent_seed: K2,
+        ..Default::default()
+    }
+    .call()
+    .unwrap();
+
+    // Put 1 agent into space S2
+    PutInfo {
+        addr: s.listen_addrs()[0],
+        space: S2,
+        space_url: S2,
+        ..Default::default()
+    }
+    .call()
+    .unwrap();
+
+    let addr = format!("http://{}/health", s.listen_addrs()[0]);
+    let res = ureq::get(&addr)
+        .call()
+        .unwrap()
+        .into_body()
+        .read_to_string()
+        .unwrap();
+    let health: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(health["totalSpaces"], 2);
+    assert_eq!(health["totalAgents"], 3);
+    assert_eq!(health["avgAgentsPerSpace"], 1.5);
+    assert_eq!(health["minAgentsPerSpace"], 1);
+    assert_eq!(health["maxAgentsPerSpace"], 2);
 }
 
 #[test]

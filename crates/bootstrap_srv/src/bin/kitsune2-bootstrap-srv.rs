@@ -68,6 +68,11 @@ pub struct Args {
     #[arg(long)]
     pub allowed_origins: Option<Vec<String>>,
 
+    /// If set, the /health endpoint will return stats including total
+    /// spaces, total agents, and avg/min/max agents per space.
+    #[arg(long)]
+    pub health_stats: bool,
+
     /// If specified, this server will only handle bootstrap requests,
     /// dropping websocket upgrade requests from sbd clients.
     #[arg(long)]
@@ -169,6 +174,7 @@ fn main() {
     if let Some(allowed_origins) = args.allowed_origins {
         config.allowed_origins = Some(allowed_origins);
     }
+    config.health_stats = args.health_stats;
 
     #[cfg(feature = "sbd")]
     {
