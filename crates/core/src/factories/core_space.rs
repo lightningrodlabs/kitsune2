@@ -118,14 +118,24 @@ impl SpaceFactory for CoreSpaceFactory {
                 .blocks
                 .create(builder.clone(), space_id.clone())
                 .await?;
+            let known_peers = builder
+                .known_peers
+                .create(builder.clone(), space_id.clone())
+                .await?;
             let peer_store = builder
                 .peer_store
-                .create(builder.clone(), space_id.clone(), blocks.clone())
+                .create(
+                    builder.clone(),
+                    space_id.clone(),
+                    blocks.clone(),
+                    known_peers.clone(),
+                )
                 .await?;
 
             let peer_access_state = Arc::new(CorePeerAccessState::new(
-                peer_store.clone(),
+                known_peers.clone(),
                 blocks.clone(),
+                &peer_store,
             )?);
 
             let bootstrap = builder
@@ -228,6 +238,7 @@ impl SpaceFactory for CoreSpaceFactory {
                     publish,
                     gossip,
                     blocks,
+                    known_peers,
                     peer_access_state,
                     hello,
                 )
@@ -394,6 +405,7 @@ struct CoreSpace {
     publish: DynPublish,
     gossip: DynGossip,
     blocks: DynBlocks,
+    known_peers: DynKnownPeers,
     peer_access_state: DynPeerAccessState,
     hello: Arc<CoreHello>,
     inner: Arc<RwLock<InnerData>>,
@@ -432,6 +444,7 @@ impl CoreSpace {
         publish: DynPublish,
         gossip: DynGossip,
         blocks: DynBlocks,
+        known_peers: DynKnownPeers,
         peer_access_state: DynPeerAccessState,
         hello: Arc<CoreHello>,
     ) -> Self {
@@ -456,6 +469,7 @@ impl CoreSpace {
             publish,
             gossip,
             blocks,
+            known_peers,
         }
     }
 
@@ -504,6 +518,10 @@ impl Space for CoreSpace {
 
     fn blocks(&self) -> &DynBlocks {
         &self.blocks
+    }
+
+    fn known_peers(&self) -> &DynKnownPeers {
+        &self.known_peers
     }
 
     fn peer_access_state(&self) -> &DynPeerAccessState {

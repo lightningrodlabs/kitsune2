@@ -71,6 +71,7 @@ pub fn default_builder() -> Builder {
         local_agent_store: factories::CoreLocalAgentStoreFactory::create(),
         publish: factories::CorePublishFactory::create(),
         blocks: factories::MemBlocksFactory::create(),
+        known_peers: factories::CoreKnownPeersFactory::create(),
         // TODO(hello-pok phase 6): replace with `CoreSpaceSecretFactory`.
         space_secret: factories::NoopSpaceSecretFactory::create(),
     }

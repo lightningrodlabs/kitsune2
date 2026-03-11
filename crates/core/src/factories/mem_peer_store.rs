@@ -82,12 +82,16 @@ impl PeerStoreFactory for MemPeerStoreFactory {
         builder: Arc<Builder>,
         _space_id: SpaceId,
         blocks: DynBlocks,
+        known_peers: DynKnownPeers,
     ) -> BoxFut<'static, K2Result<DynPeerStore>> {
         Box::pin(async move {
             let config: MemPeerStoreModConfig =
                 builder.config.get_module_config()?;
-            let out: DynPeerStore =
-                Arc::new(MemPeerStore::new(config.mem_peer_store, blocks));
+            let out: DynPeerStore = Arc::new(MemPeerStore::new(
+                config.mem_peer_store,
+                blocks,
+                known_peers,
+            ));
             Ok(out)
         })
     }
@@ -104,11 +108,16 @@ impl std::fmt::Debug for MemPeerStore {
 
 impl MemPeerStore {
     /// Construct a new MemPeerStore.
-    pub fn new(config: MemPeerStoreConfig, blocks: DynBlocks) -> Self {
+    pub fn new(
+        config: MemPeerStoreConfig,
+        blocks: DynBlocks,
+        known_peers: DynKnownPeers,
+    ) -> Self {
         Self(Mutex::new(Inner::new(
             config,
             std::time::Instant::now(),
             blocks,
+            known_peers,
         )))
     }
 }
@@ -215,6 +224,7 @@ struct Inner {
     no_prune_until: std::time::Instant,
     listeners: Vec<Listener>,
     blocks: DynBlocks,
+    known_peers: DynKnownPeers,
 }
 
 impl Inner {
@@ -222,6 +232,7 @@ impl Inner {
         config: MemPeerStoreConfig,
         now_inst: std::time::Instant,
         blocks: DynBlocks,
+        known_peers: DynKnownPeers,
     ) -> Self {
         let no_prune_until = now_inst + config.prune_interval();
         Self {
@@ -230,6 +241,7 @@ impl Inner {
             no_prune_until,
             listeners: Vec::new(),
             blocks,
+            known_peers,
         }
     }
 
@@ -264,6 +276,11 @@ impl Inner {
         agent_list: Vec<Arc<AgentInfoSigned>>,
     ) -> K2Result<Vec<Arc<AgentInfoSigned>>> {
         self.check_prune();
+
+        // Record all agent infos to the known-peers index *before* any block
+        // or expiry filtering so that the access control layer can still
+        // resolve URLs even for blocked agents.
+        self.known_peers.record(agent_list.clone()).await?;
 
         let now = Timestamp::now();
 

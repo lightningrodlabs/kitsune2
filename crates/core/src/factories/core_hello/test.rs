@@ -7,8 +7,9 @@
 
 use super::*;
 use crate::factories::{
-    CorePeerAccessState, CoreSpaceSecret, CoreSpaceSecretConfig, MemBlocks,
-    MemPeerStore, MemPeerStoreConfig, encode_space_secret,
+    CoreKnownPeers, CorePeerAccessState, CoreSpaceSecret,
+    CoreSpaceSecretConfig, MemBlocks, MemPeerStore, MemPeerStoreConfig,
+    encode_space_secret,
 };
 use crate::{Ed25519LocalAgent, Ed25519Verifier};
 use bytes::Bytes;
@@ -131,12 +132,14 @@ impl Node {
     ) -> Self {
         let url = Url::from_str(url).unwrap();
         let blocks = Arc::new(MemBlocks::default());
+        let known_peers = Arc::new(CoreKnownPeers::default());
         let peer_store: DynPeerStore = Arc::new(MemPeerStore::new(
             MemPeerStoreConfig::default(),
             blocks.clone(),
+            known_peers.clone(),
         ));
         let access_state: DynPeerAccessState = Arc::new(
-            CorePeerAccessState::new(peer_store.clone(), blocks).unwrap(),
+            CorePeerAccessState::new(known_peers, blocks, &peer_store).unwrap(),
         );
         let local_agent_store = local_agent_store().await;
         let transport = Arc::new(StubTransport::default());
@@ -768,12 +771,14 @@ async fn the_join_trigger_tolerates_a_transport_without_connection_listing() {
     let transport: DynTransport = Arc::new(NoListing(stub.clone()));
     let url = Url::from_str(URL_A).unwrap();
     let blocks = Arc::new(MemBlocks::default());
+    let known_peers = Arc::new(CoreKnownPeers::default());
     let peer_store: DynPeerStore = Arc::new(MemPeerStore::new(
         MemPeerStoreConfig::default(),
         blocks.clone(),
+        known_peers.clone(),
     ));
     let access_state: DynPeerAccessState = Arc::new(
-        CorePeerAccessState::new(peer_store.clone(), blocks).unwrap(),
+        CorePeerAccessState::new(known_peers, blocks, &peer_store).unwrap(),
     );
 
     let hello = CoreHello::create(
