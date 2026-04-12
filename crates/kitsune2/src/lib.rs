@@ -72,3 +72,42 @@ pub fn default_builder() -> Builder {
         blocks: factories::MemBlocksFactory::create(),
     }
 }
+
+/// Construct a builder wired for the Reticulum transport and bootstrap.
+///
+/// Unlike [`default_builder`], this helper swaps in
+/// [`kitsune2_transport_reticulum::ReticulumTransportFactory`] and
+/// [`kitsune2_transport_reticulum::ReticulumBootstrapFactory`], both
+/// sharing a single
+/// [`kitsune2_transport_reticulum::ReticulumNode`].
+///
+/// The Reticulum transport uses announces for peer discovery, so there
+/// is no HTTP bootstrap client in this configuration.
+#[cfg(feature = "transport-reticulum")]
+pub fn reticulum_builder(
+    node: std::sync::Arc<kitsune2_transport_reticulum::ReticulumNode>,
+) -> Builder {
+    use kitsune2_transport_reticulum::{
+        ReticulumBootstrapFactory, ReticulumTransportFactory,
+    };
+
+    Builder {
+        config: Config::default(),
+        verifier: std::sync::Arc::new(Ed25519Verifier),
+        auth_material_bootstrap: None,
+        auth_material_relay: None,
+        kitsune: factories::CoreKitsuneFactory::create(),
+        space: factories::CoreSpaceFactory::create(),
+        peer_store: factories::MemPeerStoreFactory::create(),
+        bootstrap: ReticulumBootstrapFactory::create(node.clone()),
+        fetch: factories::CoreFetchFactory::create(),
+        report: factories::CoreReportFactory::create(),
+        transport: ReticulumTransportFactory::create(node),
+        op_store: MemOpStoreFactory::create(),
+        peer_meta_store: factories::MemPeerMetaStoreFactory::create(),
+        gossip: K2GossipFactory::create(),
+        local_agent_store: factories::CoreLocalAgentStoreFactory::create(),
+        publish: factories::CorePublishFactory::create(),
+        blocks: factories::MemBlocksFactory::create(),
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "reticulum-spike-beechat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand_core = "0.6"
+reticulum = "0.1.0"
+tokio = { version = "1", features = ["full"] }

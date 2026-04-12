@@ -22,6 +22,7 @@ kitsune2_core = { workspace = true }
 kitsune2_gossip = { workspace = true }
 kitsune2_transport_tx5 = { workspace = true, default-features = false, optional = true }
 kitsune2_transport_iroh = { workspace = true, optional = true }
+kitsune2_transport_reticulum = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 
 # Feature: schema
@@ -50,6 +51,12 @@ transport-tx5-backend-go-pion = [
 # Use the iroh transport
 transport-iroh = ["dep:kitsune2_transport_iroh"]
 
+# Use the reticulum transport (opt-in alternative).
+# This does not change the default builder; applications that want the
+# Reticulum transport must call the `reticulum_builder` helper directly
+# and wire in both the transport and bootstrap factories together.
+transport-reticulum = ["dep:kitsune2_transport_reticulum"]
+
 schema = [
   "dep:schemars",
   "dep:serde_json",
@@ -57,4 +64,5 @@ schema = [
   "kitsune2_gossip/schema",
   "kitsune2_transport_tx5?/schema",
   "kitsune2_transport_iroh?/schema",
+  "kitsune2_transport_reticulum?/schema",
 ]

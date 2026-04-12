@@ -1,5 +1,6 @@
 /target
 /output-*
+spikes/*/target
 .cargo
 logs
 .direnv

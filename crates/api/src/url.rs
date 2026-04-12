@@ -119,7 +119,8 @@ impl Url {
             scheme @ "ws"
             | scheme @ "wss"
             | scheme @ "http"
-            | scheme @ "https" => scheme,
+            | scheme @ "https"
+            | scheme @ "ret" => scheme,
             oth => {
                 return Err(K2Error::other(format!(
                     "Invalid Kitsune2 Url Scheme: {oth}",
@@ -246,6 +247,12 @@ mod test {
             ("ws://a.b:80/foo", Some("foo"), false, "a.b:80"),
             ("wss://a.b:443/foo", Some("foo"), true, "a.b:443"),
             ("ws://a.b:999/foo", Some("foo"), false, "a.b:999"),
+            (
+                "ret://reticulum:1/abc123",
+                Some("abc123"),
+                false,
+                "reticulum:1",
+            ),
         ];
 
         for (s, id, tls, addr) in F.iter() {

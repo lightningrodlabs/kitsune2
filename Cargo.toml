@@ -11,9 +11,11 @@ members = [
   "crates/test_utils",
   "crates/tool_proto_build",
   "crates/transport_iroh",
+  "crates/transport_reticulum",
   "crates/transport_tx5",
 ]
 
+exclude = ["spikes"]
 resolver = "2"
 
 [workspace.package]
@@ -41,6 +43,7 @@ kitsune2_dht = { version = "0.5.0-dev.0", path = "crates/dht" }
 kitsune2_gossip = { version = "0.5.0-dev.0", path = "crates/gossip" }
 kitsune2_transport_tx5 = { version = "0.5.0-dev.0", path = "crates/transport_tx5", default-features = false }
 kitsune2_transport_iroh = { version = "0.5.0-dev.0", path = "crates/transport_iroh" }
+kitsune2_transport_reticulum = { version = "0.5.0-dev.0", path = "crates/transport_reticulum" }
 kitsune2_bootstrap_client = { version = "0.5.0-dev.0", path = "crates/bootstrap_client" }
 
 # used by bootstrap_srv for mpmc worker queue pattern.
@@ -82,6 +85,10 @@ num_cpus = "1.16.0"
 prost = "0.14"
 # used to generate private cryptography keys.
 rand = "0.8.5"
+# used by the Reticulum transport for key generation.
+rand_core = "0.6"
+# Reticulum network stack implementation.
+reticulum-rs-transport = "0.2.0"
 # kitsune types need to be serializable for network transmission.
 serde = { version = "1.0", features = ["derive"] }
 # kitsune2 agent info is serialized as json to improve debugability of

@@ -1,0 +1,32 @@
+[package]
+name = "kitsune2_transport_reticulum"
+version.workspace = true
+description = "Kitsune2 transport implementation backed by Reticulum"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/kitsune2_transport_reticulum"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+reticulum-rs-transport = { workspace = true }
+rand_core = { workspace = true }
+kitsune2_api = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "io-util"] }
+tracing = { workspace = true }
+url = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+# optional, for test-utils feature
+kitsune2_core = { workspace = true, optional = true }
+kitsune2_test_utils = { workspace = true, optional = true }
+
+[features]
+schema = ["dep:schemars"]
+test-utils = ["dep:kitsune2_core", "dep:kitsune2_test_utils"]
