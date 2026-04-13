@@ -228,6 +228,13 @@ impl ReticulumTransport {
             handler.clone(),
         );
 
+        let close_rx = node.endpoint().recv_link_closures().await?;
+        let close_router_handle = routers::spawn_close_router(
+            close_rx,
+            router_state.clone(),
+            handler.clone(),
+        );
+
         let out: DynTxImp = Arc::new(Self {
             node,
             handler,
@@ -239,6 +246,7 @@ impl ReticulumTransport {
                 announce_listener_handle,
                 links_router_handle,
                 data_router_handle,
+                close_router_handle,
             ]),
         });
         Ok(out)

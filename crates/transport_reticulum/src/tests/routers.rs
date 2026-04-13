@@ -8,7 +8,8 @@ use crate::destination::{Endpoint, Link};
 use crate::frame::{encode_frame, ReticulumFrame};
 use crate::peer_state::PreflightState;
 use crate::routers::{
-    remove_link, spawn_data_router, spawn_links_router, RouterState,
+    remove_link, spawn_close_router, spawn_data_router, spawn_links_router,
+    RouterState,
 };
 use crate::test_utils::harness::FakeLink;
 use crate::test_utils::FakeEndpoint;
@@ -326,6 +327,75 @@ async fn remove_link_penultimate_does_not_disconnect() {
     // Close link_b -- now disconnect fires.
     remove_link(&link_b.id(), None, &state, &hnd).await;
     assert_eq!(rec.peer_disconnects.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_router_fires_peer_disconnect_on_last_close() {
+    let endpoint = FakeEndpoint::new();
+    let (rec, hnd) = mk_handler();
+    let state = RouterState::new(1024 * 1024);
+    state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
+
+    let links_rx = endpoint.recv_links().await.unwrap();
+    let _hl = spawn_links_router(
+        links_rx,
+        state.clone(),
+        hnd.clone(),
+        endpoint.clone(),
+    );
+    let close_rx = endpoint.recv_link_closures().await.unwrap();
+    let _hc = spawn_close_router(close_rx, state.clone(), hnd.clone());
+
+    // Inject a link, wait for it to land, then inject a close for that
+    // same link_id. Expect peer_disconnect to fire via the close router.
+    let link = FakeLink::new(0x11, 0xbb, 0x77);
+    endpoint.inject_link(link.clone()).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    endpoint.inject_link_closed(link.id()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(rec.peer_disconnects.lock().unwrap().len(), 1);
+    assert!(state.peer_states.read().unwrap().is_empty());
+    assert!(state.link_registry.read().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_router_holds_peer_when_other_links_still_open() {
+    let endpoint = FakeEndpoint::new();
+    let (rec, hnd) = mk_handler();
+    let state = RouterState::new(1024 * 1024);
+    state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
+    state.register_dest(AddressHash::new([0x88; 16]), space("beta"));
+
+    let links_rx = endpoint.recv_links().await.unwrap();
+    let _hl = spawn_links_router(
+        links_rx,
+        state.clone(),
+        hnd.clone(),
+        endpoint.clone(),
+    );
+    let close_rx = endpoint.recv_link_closures().await.unwrap();
+    let _hc = spawn_close_router(close_rx, state.clone(), hnd.clone());
+
+    // Two links to the same peer across two spaces.
+    let link_a = FakeLink::new(0x11, 0xbb, 0x77);
+    let link_b = FakeLink::new(0x22, 0xbb, 0x88);
+    endpoint.inject_link(link_a.clone()).await;
+    endpoint.inject_link(link_b.clone()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Close one -- peer should remain because link_b is still open.
+    endpoint.inject_link_closed(link_a.id()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(rec.peer_disconnects.lock().unwrap().is_empty());
+    assert_eq!(state.peer_states.read().unwrap().len(), 1);
+
+    // Close the second -- now disconnect fires.
+    endpoint.inject_link_closed(link_b.id()).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(rec.peer_disconnects.lock().unwrap().len(), 1);
+    assert!(state.peer_states.read().unwrap().is_empty());
 }
 
 /// Regression test for AgentId being unused — compile-only signal that

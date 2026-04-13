@@ -25,7 +25,7 @@ use rns_transport::hash::AddressHash;
 use rns_transport::identity::{Identity, PrivateIdentity};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 /// Shared handle to a live `rns_transport::Transport`.
 pub(crate) type SharedTransport =
@@ -52,6 +52,10 @@ pub(crate) struct RealEndpoint {
     _data_tx: mpsc::Sender<(LinkId, Bytes)>,
     /// Holder for the data receiver until `recv_resource_data()` is called.
     data_rx: TokioMutex<Option<mpsc::Receiver<(LinkId, Bytes)>>>,
+    /// Bridged link-close stream. Same retention rationale as `_links_tx`.
+    _close_tx: mpsc::Sender<LinkId>,
+    /// Holder for the close receiver until `recv_link_closures()` is called.
+    close_rx: TokioMutex<Option<mpsc::Receiver<LinkId>>>,
 }
 
 impl std::fmt::Debug for RealEndpoint {
@@ -74,14 +78,24 @@ impl RealEndpoint {
             mpsc::channel::<DynLink>(BRIDGE_CHANNEL_SIZE);
         let (data_tx, data_rx) =
             mpsc::channel::<(LinkId, Bytes)>(BRIDGE_CHANNEL_SIZE);
+        let (close_tx, close_rx) =
+            mpsc::channel::<LinkId>(BRIDGE_CHANNEL_SIZE);
 
         // Subscribe to the underlying streams once, then let each bridge
-        // task own its receiver.
-        let (announce_rx, inbound_link_rx, received_data_rx, resource_rx) = {
+        // task own its receiver. We subscribe to `out_link_events` too
+        // so link-close notifications fire for outbound-initiated links.
+        let (
+            announce_rx,
+            inbound_link_rx,
+            outbound_link_rx,
+            received_data_rx,
+            resource_rx,
+        ) = {
             let t = transport.lock().await;
             (
                 t.recv_announces().await,
                 t.in_link_events(),
+                t.out_link_events(),
                 t.received_data_events(),
                 t.resource_events(),
             )
@@ -93,6 +107,11 @@ impl RealEndpoint {
             transport.clone(),
             identity.as_identity().address_hash,
             links_tx.clone(),
+            close_tx.clone(),
+        );
+        spawn_outbound_link_close_bridge(
+            outbound_link_rx,
+            close_tx.clone(),
         );
         spawn_received_data_bridge(received_data_rx, data_tx.clone());
         spawn_resource_bridge(resource_rx, data_tx.clone());
@@ -105,6 +124,8 @@ impl RealEndpoint {
             links_rx: TokioMutex::new(Some(links_rx)),
             _data_tx: data_tx,
             data_rx: TokioMutex::new(Some(data_rx)),
+            _close_tx: close_tx,
+            close_rx: TokioMutex::new(Some(close_rx)),
         }
     }
 
@@ -167,6 +188,7 @@ fn spawn_inbound_link_bridge(
     transport: SharedTransport,
     _local_identity_hash: AddressHash,
     tx: mpsc::Sender<DynLink>,
+    close_tx: mpsc::Sender<LinkId>,
 ) {
     tokio::spawn(async move {
         use rns_transport::destination::link::LinkEvent;
@@ -209,15 +231,15 @@ fn spawn_inbound_link_bridge(
                             }
                         }
                         LinkEvent::Closed => {
-                            // The router's `remove_link` path is currently
-                            // triggered from `disconnect()` / tests rather
-                            // than this event. Wiring closures through
-                            // would need a parallel mpsc channel; TODO
-                            // when link closure handling lands.
-                            trace!(
-                                link_id = ?event.id,
-                                "inbound link closed (unhandled)"
-                            );
+                            // Forward to the close router so the peer
+                            // refcount is decremented and
+                            // `peer_disconnect` fires on the last close.
+                            if close_tx.send(event.id).await.is_err() {
+                                debug!(
+                                    "link-close bridge: receiver closed, exiting"
+                                );
+                                return;
+                            }
                         }
                         LinkEvent::Data(_) => {
                             // Small-packet data is mirrored into
@@ -232,6 +254,42 @@ fn spawn_inbound_link_bridge(
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!("inbound link bridge closed");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Bridge `Transport::out_link_events` → the link-close mpsc. We only
+/// care about `LinkEvent::Closed` here; activation for outbound links
+/// is synchronous through the value returned by `Transport::link`, and
+/// `Data` is covered by the received-data + resource bridges.
+fn spawn_outbound_link_close_bridge(
+    mut link_rx: broadcast::Receiver<
+        rns_transport::destination::link::LinkEventData,
+    >,
+    close_tx: mpsc::Sender<LinkId>,
+) {
+    tokio::spawn(async move {
+        use rns_transport::destination::link::LinkEvent;
+        loop {
+            match link_rx.recv().await {
+                Ok(event) => {
+                    if matches!(event.event, LinkEvent::Closed)
+                        && close_tx.send(event.id).await.is_err()
+                    {
+                        debug!(
+                            "outbound link-close bridge: receiver closed, exiting"
+                        );
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(n, "outbound link bridge lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!("outbound link bridge closed");
                     break;
                 }
             }
@@ -404,6 +462,19 @@ impl Endpoint for RealEndpoint {
             slot.take().ok_or_else(|| {
                 K2Error::other(
                     "recv_links can only be called once per RealEndpoint",
+                )
+            })
+        })
+    }
+
+    fn recv_link_closures(
+        &self,
+    ) -> BoxFut<'_, K2Result<mpsc::Receiver<LinkId>>> {
+        Box::pin(async move {
+            let mut slot = self.close_rx.lock().await;
+            slot.take().ok_or_else(|| {
+                K2Error::other(
+                    "recv_link_closures can only be called once per RealEndpoint",
                 )
             })
         })

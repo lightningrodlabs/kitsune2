@@ -33,6 +33,7 @@ pub(crate) struct FakeEndpoint {
     announce_tx: broadcast::Sender<AnnounceInfo>,
     links_tx: Mutex<Option<mpsc::Sender<DynLink>>>,
     resource_tx: Mutex<Option<mpsc::Sender<(LinkId, Bytes)>>>,
+    close_tx: Mutex<Option<mpsc::Sender<LinkId>>>,
     /// Every destination added (for inspection).
     pub(crate) destinations_added: AddedDests,
     /// Every `send_resource` call (for inspection).
@@ -55,6 +56,7 @@ impl FakeEndpoint {
             announce_tx,
             links_tx: Mutex::new(None),
             resource_tx: Mutex::new(None),
+            close_tx: Mutex::new(None),
             destinations_added: Arc::new(Mutex::new(Vec::new())),
             resource_sends: Arc::new(Mutex::new(Vec::new())),
             links_issued: Arc::new(Mutex::new(Vec::new())),
@@ -80,6 +82,15 @@ impl FakeEndpoint {
         let tx = { self.resource_tx.lock().unwrap().clone() };
         if let Some(tx) = tx {
             let _ = tx.send((link_id, data)).await;
+        }
+    }
+
+    /// Inject a link-close event. `recv_link_closures()` must have been
+    /// called at least once beforehand so the sender is initialised.
+    pub async fn inject_link_closed(&self, link_id: LinkId) {
+        let tx = { self.close_tx.lock().unwrap().clone() };
+        if let Some(tx) = tx {
+            let _ = tx.send(link_id).await;
         }
     }
 }
@@ -161,6 +172,16 @@ impl Endpoint for FakeEndpoint {
         Box::pin(async move {
             let (tx, rx) = mpsc::channel(64);
             *self.links_tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        })
+    }
+
+    fn recv_link_closures(
+        &self,
+    ) -> BoxFut<'_, K2Result<mpsc::Receiver<LinkId>>> {
+        Box::pin(async move {
+            let (tx, rx) = mpsc::channel(64);
+            *self.close_tx.lock().unwrap() = Some(tx);
             Ok(rx)
         })
     }

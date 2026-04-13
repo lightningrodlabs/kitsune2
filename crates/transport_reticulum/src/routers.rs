@@ -361,3 +361,21 @@ pub(crate) async fn remove_link(
 pub(crate) fn link_is_active(link: &DynLink) -> bool {
     matches!(link.status(), LinkStatus::Active | LinkStatus::Handshake)
 }
+
+/// Spawn the link-close router. Consumes `LinkId`s from
+/// `Endpoint::recv_link_closures()` and hands them to [`remove_link`],
+/// which decrements the per-peer refcount and fires
+/// `TxImpHnd::peer_disconnect` on the last close.
+pub(crate) fn spawn_close_router(
+    mut rx: tokio::sync::mpsc::Receiver<LinkId>,
+    state: RouterState,
+    handler: Arc<TxImpHnd>,
+) -> AbortHandle {
+    tokio::spawn(async move {
+        while let Some(link_id) = rx.recv().await {
+            remove_link(&link_id, None, &state, &handler).await;
+        }
+        debug!("close router: channel closed");
+    })
+    .abort_handle()
+}

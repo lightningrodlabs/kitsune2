@@ -146,6 +146,17 @@ pub(crate) trait Endpoint:
     fn recv_links(
         &self,
     ) -> BoxFut<'_, K2Result<tokio::sync::mpsc::Receiver<Arc<dyn Link>>>>;
+
+    /// Subscribe to link-close events. Each yielded `LinkId` identifies
+    /// a link that has transitioned to `LinkStatus::Closed` (either
+    /// because the remote tore it down or because rns timed it out).
+    ///
+    /// A single close receiver is consumed by the transport's
+    /// link-close router, which decrements the per-peer refcount and
+    /// fires `TxImpHnd::peer_disconnect` on the last-link close.
+    fn recv_link_closures(
+        &self,
+    ) -> BoxFut<'_, K2Result<tokio::sync::mpsc::Receiver<LinkId>>>;
 }
 
 pub(crate) type DynEndpoint = Arc<dyn Endpoint>;
