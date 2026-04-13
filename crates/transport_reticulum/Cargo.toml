@@ -31,8 +31,4 @@ kitsune2_test_utils = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [features]
-# Retained as a no-op for API compatibility; schemars is now a required
-# dep because downstream consumers (holochain conductor config) need
-# JsonSchema derives unconditionally.
-schema = []
 test-utils = ["dep:kitsune2_core", "dep:kitsune2_test_utils"]

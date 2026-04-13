@@ -1,4 +1,14 @@
 //! Configuration types for the Reticulum transport.
+//!
+//! Unlike [`kitsune2_transport_iroh`] and [`kitsune2_transport_tx5`],
+//! `schemars::JsonSchema` is derived unconditionally on these types
+//! (not behind a `schema` feature). Reticulum's configuration is
+//! structural — a list of interface variants, identity path, and
+//! tuning — so consumers that expose the conductor config in their
+//! own `JsonSchema`-deriving structs (e.g. holochain's `NetworkConfig`)
+//! need this derive always-on. iroh/tx5 can stay gated because their
+//! typed configs never leak into user-facing config structs; they're
+//! only ever seen through URL primitives or internal schema-gen.
 
 use kitsune2_api::{K2Error, K2Result};
 

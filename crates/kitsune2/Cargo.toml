@@ -64,5 +64,6 @@ schema = [
   "kitsune2_gossip/schema",
   "kitsune2_transport_tx5?/schema",
   "kitsune2_transport_iroh?/schema",
-  "kitsune2_transport_reticulum?/schema",
+  # kitsune2_transport_reticulum: no `schema` feature -- JsonSchema is
+  # unconditional there. See its crate-level doc for the rationale.
 ]
