@@ -300,9 +300,15 @@ impl Link for FakeLink {
         *self.status.lock().unwrap()
     }
 
-    fn data_packet(&self, data: &[u8]) -> K2Result<Vec<u8>> {
-        self.sent.lock().unwrap().push(data.to_vec());
-        Ok(data.to_vec())
+    fn send_small<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> BoxFut<'a, K2Result<()>> {
+        let bytes = data.to_vec();
+        Box::pin(async move {
+            self.sent.lock().unwrap().push(bytes);
+            Ok(())
+        })
     }
 
     fn teardown(&self) -> Option<Vec<u8>> {

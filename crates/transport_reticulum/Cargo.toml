@@ -21,12 +21,18 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "io-util"] }
 tracing = { workspace = true }
 url = { workspace = true }
-schemars = { workspace = true, optional = true }
+schemars = { workspace = true }
 
 # optional, for test-utils feature
 kitsune2_core = { workspace = true, optional = true }
 kitsune2_test_utils = { workspace = true, optional = true }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
 [features]
-schema = ["dep:schemars"]
+# Retained as a no-op for API compatibility; schemars is now a required
+# dep because downstream consumers (holochain conductor config) need
+# JsonSchema derives unconditionally.
+schema = []
 test-utils = ["dep:kitsune2_core", "dep:kitsune2_test_utils"]

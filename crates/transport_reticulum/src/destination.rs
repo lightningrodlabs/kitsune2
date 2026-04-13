@@ -49,8 +49,18 @@ pub(crate) trait Link: Send + Sync + std::fmt::Debug {
     /// Get the current link status.
     fn status(&self) -> LinkStatus;
 
-    /// Create a data packet for sending (payload must fit in PACKET_MDU).
-    fn data_packet(&self, data: &[u8]) -> K2Result<Vec<u8>>;
+    /// Send a small payload as a single rns Packet (≤ PACKET_MDU).
+    ///
+    /// This bypasses the Resource advertise/request/fragments/proof
+    /// handshake. Used for preflight frames and any other payload
+    /// that fits in the MDU. The data router on the receiver side
+    /// gets it via `Endpoint::recv_resource_data` (which the
+    /// `RealEndpoint` bridges from `received_data_events` for
+    /// `data_packet` traffic).
+    fn send_small<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> BoxFut<'a, K2Result<()>>;
 
     /// Tear down the link, returning a teardown packet if applicable.
     fn teardown(&self) -> Option<Vec<u8>>;

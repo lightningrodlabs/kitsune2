@@ -129,8 +129,11 @@ mod tests {
         fn status(&self) -> LinkStatus {
             LinkStatus::Active
         }
-        fn data_packet(&self, _data: &[u8]) -> kitsune2_api::K2Result<Vec<u8>> {
-            Ok(Vec::new())
+        fn send_small<'a>(
+            &'a self,
+            _data: &'a [u8],
+        ) -> kitsune2_api::BoxFut<'a, kitsune2_api::K2Result<()>> {
+            Box::pin(async move { Ok(()) })
         }
         fn teardown(&self) -> Option<Vec<u8>> {
             None

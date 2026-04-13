@@ -3,8 +3,9 @@
 use kitsune2_api::{K2Error, K2Result};
 
 /// Configuration for the Reticulum transport.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ReticulumTransportConfig {
     /// Reticulum interfaces to bring up on startup.
@@ -20,7 +21,7 @@ pub struct ReticulumTransportConfig {
     /// is strongly recommended for anything beyond ephemeral tests.
     ///
     /// Defaults to `None`.
-    #[cfg_attr(feature = "schema", schemars(default))]
+    #[schemars(default)]
     pub identity_path: Option<std::path::PathBuf>,
 
     /// Maximum kitsune2 frame size in bytes.
@@ -30,7 +31,7 @@ pub struct ReticulumTransportConfig {
     /// cap limits what we hand to `send_resource()`.
     ///
     /// Default: 1 MiB.
-    #[cfg_attr(feature = "schema", schemars(default))]
+    #[schemars(default)]
     pub max_frame_bytes: usize,
 
     /// Link-establishment timeout in seconds.
@@ -39,7 +40,7 @@ pub struct ReticulumTransportConfig {
     /// round-trip.
     ///
     /// Default: 30 seconds.
-    #[cfg_attr(feature = "schema", schemars(default))]
+    #[schemars(default)]
     pub connect_timeout_s: u32,
 
     /// How often (seconds) to re-announce each joined-space destination.
@@ -48,7 +49,7 @@ pub struct ReticulumTransportConfig {
     /// every interval.
     ///
     /// Default: 300 seconds.
-    #[cfg_attr(feature = "schema", schemars(default))]
+    #[schemars(default)]
     pub announce_interval_s: u32,
 
     /// Idle timeout for a per-space Link in seconds.
@@ -58,13 +59,14 @@ pub struct ReticulumTransportConfig {
     /// other per-space Links may still be active.
     ///
     /// Default: 600 seconds.
-    #[cfg_attr(feature = "schema", schemars(default))]
+    #[schemars(default)]
     pub link_idle_timeout_s: u32,
 }
 
 /// Configuration for a single Reticulum interface.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ReticulumInterfaceConfig {
     /// TCP client interface -- connects to a remote Reticulum node.
@@ -132,8 +134,16 @@ impl ReticulumTransportConfig {
 }
 
 /// Module-level config wrapper, matching the `ModConfig` pattern.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ReticulumTransportModConfig {
     /// The Reticulum transport configuration.

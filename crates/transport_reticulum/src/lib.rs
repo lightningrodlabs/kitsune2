@@ -68,6 +68,19 @@ pub use config::{
 };
 pub use node::ReticulumNode;
 
+/// Build a `DynTransport` for tests without going through the full
+/// `Builder` ceremony. Internal — test surface only.
+async fn create_reticulum_transport(
+    config: ReticulumTransportConfig,
+    handler: DynTxHandler,
+    node: Arc<ReticulumNode>,
+) -> K2Result<DynTransport> {
+    let handler = TxImpHnd::new(handler);
+    let imp =
+        ReticulumTransport::create(config, handler.clone(), node).await?;
+    Ok(DefaultTransport::create(&handler, imp))
+}
+
 /// Internals re-exported for this crate's `tests/` integration tests.
 ///
 /// This module is **not** part of the stable public API. It exists so
@@ -103,6 +116,27 @@ pub mod internal_testing {
             node.clone(),
         );
         Ok(vec![listener, drain])
+    }
+
+    /// Build a fully-wired `DynTransport` (the `Transport` trait
+    /// object that kitsune2 callers see) without needing a full
+    /// `Builder`. The returned `Transport` already has the announce
+    /// listener, links / data / close routers, and bootstrap drain
+    /// running.
+    pub async fn create_transport(
+        config: ReticulumTransportConfig,
+        handler: DynTxHandler,
+        node: Arc<ReticulumNode>,
+    ) -> K2Result<DynTransport> {
+        super::create_reticulum_transport(config, handler, node).await
+    }
+
+    /// Convert an rns Identity address hash into the canonical
+    /// `ret://reticulum:1/<hex>` URL used to address a peer.
+    pub fn identity_hash_to_url(
+        hash: &rns_transport::hash::AddressHash,
+    ) -> K2Result<Url> {
+        crate::url::identity_hash_to_url(hash)
     }
 }
 
@@ -410,6 +444,23 @@ impl TxImp for ReticulumTransport {
                             (remote_url.clone(), space_id.clone()),
                         );
 
+                    // rns returns the link object immediately, but the
+                    // link is still in `Pending` / `Handshake` state
+                    // until the proof round-trip completes. Sending
+                    // resource packets before then races the rns
+                    // resource manager: the local send may report
+                    // success but the remote drops fragments because
+                    // its link mirror isn't yet Active. Block on a
+                    // status poll up to `connect_timeout_s` here so
+                    // both preflight and data go out on a live link.
+                    routers::wait_for_link_active(
+                        &link,
+                        std::time::Duration::from_secs(
+                            config.connect_timeout_s as u64,
+                        ),
+                    )
+                    .await?;
+
                     if first_link {
                         routers::start_preflight(
                             &remote_url,
@@ -425,13 +476,25 @@ impl TxImp for ReticulumTransport {
                 }
             };
 
-            // Encode as a Data frame and send. The data router on the
-            // remote side will gate on preflight readiness; locally we
-            // fire-and-forget -- any queued data before preflight
-            // completes will be sent now and the remote may drop it.
-            // This matches the plan's §3 shape: kitsune2's send layer
-            // doesn't retry, the sender is expected to know the link
-            // is ready before calling.
+            // Wait for the preflight handshake to finish before
+            // sending data. The remote's data router gates Data frames
+            // on its own peer state being Ready, which happens when
+            // it receives our preflight. But if our data frame races
+            // ahead of our preflight on the wire (rns sends them as
+            // independent Resource transfers, no ordering guarantee),
+            // the remote drops the data. Waiting for our own state to
+            // flip to Ready -- which happens when we receive the
+            // remote's preflight back -- is a reasonable proxy that
+            // says "the link is bidirectionally ready."
+            routers::wait_for_preflight_ready(
+                &peer_state,
+                std::time::Duration::from_secs(
+                    config.connect_timeout_s as u64,
+                ),
+            )
+            .await?;
+
+            // Encode as a Data frame and send.
             let frame = frame::ReticulumFrame::Data(data);
             let encoded =
                 frame::encode_frame(&frame, config.max_frame_bytes)?;

@@ -36,12 +36,18 @@ pub(crate) type SharedTransport =
 /// lagging here because kitsune2's gossip can retransmit.
 const BRIDGE_CHANNEL_SIZE: usize = 256;
 
+/// Per-link cached status, shared with `RealLink::status()`.
+type LinkStatusCache =
+    Arc<std::sync::RwLock<std::collections::HashMap<LinkId, LinkStatus>>>;
+
 /// Real `Endpoint` implementation backed by `rns_transport::Transport`.
 pub(crate) struct RealEndpoint {
     transport: SharedTransport,
     identity: PrivateIdentity,
     /// Bridged announce stream — one publisher, many subscribers.
     announce_bridge_tx: broadcast::Sender<AnnounceInfo>,
+    /// Per-link status mirror, kept in sync with rns link events.
+    link_status: LinkStatusCache,
     /// Bridged inbound-link stream. Held on the endpoint to keep the
     /// bridge task's mpsc sender alive for the endpoint's lifetime,
     /// even after `recv_links()` hands off the receiver.
@@ -101,6 +107,9 @@ impl RealEndpoint {
             )
         };
 
+        let link_status: LinkStatusCache =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
         spawn_announce_bridge(announce_rx, announce_bridge_tx.clone());
         spawn_inbound_link_bridge(
             inbound_link_rx,
@@ -108,10 +117,12 @@ impl RealEndpoint {
             identity.as_identity().address_hash,
             links_tx.clone(),
             close_tx.clone(),
+            link_status.clone(),
         );
-        spawn_outbound_link_close_bridge(
+        spawn_outbound_link_status_bridge(
             outbound_link_rx,
             close_tx.clone(),
+            link_status.clone(),
         );
         spawn_received_data_bridge(received_data_rx, data_tx.clone());
         spawn_resource_bridge(resource_rx, data_tx.clone());
@@ -120,6 +131,7 @@ impl RealEndpoint {
             transport,
             identity,
             announce_bridge_tx,
+            link_status,
             _links_tx: links_tx,
             links_rx: TokioMutex::new(Some(links_rx)),
             _data_tx: data_tx,
@@ -189,6 +201,7 @@ fn spawn_inbound_link_bridge(
     _local_identity_hash: AddressHash,
     tx: mpsc::Sender<DynLink>,
     close_tx: mpsc::Sender<LinkId>,
+    status_cache: LinkStatusCache,
 ) {
     tokio::spawn(async move {
         use rns_transport::destination::link::LinkEvent;
@@ -197,6 +210,11 @@ fn spawn_inbound_link_bridge(
                 Ok(event) => {
                     match event.event {
                         LinkEvent::Activated => {
+                            // Mirror the active state.
+                            status_cache
+                                .write()
+                                .expect("poisoned")
+                                .insert(event.id, LinkStatus::Active);
                             // Find the underlying Link so we can wrap it.
                             let link_arc = {
                                 let t = transport.lock().await;
@@ -209,7 +227,13 @@ fn spawn_inbound_link_bridge(
                                 );
                                 continue;
                             };
-                            match RealLink::from_inner(link_arc).await {
+                            match RealLink::from_inner(
+                                link_arc,
+                                status_cache.clone(),
+                                transport.clone(),
+                            )
+                            .await
+                            {
                                 Ok(real) => {
                                     if tx
                                         .send(Arc::new(real) as DynLink)
@@ -231,6 +255,10 @@ fn spawn_inbound_link_bridge(
                             }
                         }
                         LinkEvent::Closed => {
+                            status_cache
+                                .write()
+                                .expect("poisoned")
+                                .insert(event.id, LinkStatus::Closed);
                             // Forward to the close router so the peer
                             // refcount is decremented and
                             // `peer_disconnect` fires on the last close.
@@ -261,30 +289,46 @@ fn spawn_inbound_link_bridge(
     });
 }
 
-/// Bridge `Transport::out_link_events` → the link-close mpsc. We only
-/// care about `LinkEvent::Closed` here; activation for outbound links
-/// is synchronous through the value returned by `Transport::link`, and
-/// `Data` is covered by the received-data + resource bridges.
-fn spawn_outbound_link_close_bridge(
+/// Bridge `Transport::out_link_events` → status cache + close mpsc.
+///
+/// Outbound links don't surface as new `DynLink`s (we already returned
+/// one from `link_to`), but we still need their state transitions to:
+/// - update the per-link status cache so `RealLink::status()` can
+///   reflect the live Active state without locking,
+/// - forward `Closed` to the link-close router for the same teardown
+///   semantics inbound links get.
+fn spawn_outbound_link_status_bridge(
     mut link_rx: broadcast::Receiver<
         rns_transport::destination::link::LinkEventData,
     >,
     close_tx: mpsc::Sender<LinkId>,
+    status_cache: LinkStatusCache,
 ) {
     tokio::spawn(async move {
         use rns_transport::destination::link::LinkEvent;
         loop {
             match link_rx.recv().await {
-                Ok(event) => {
-                    if matches!(event.event, LinkEvent::Closed)
-                        && close_tx.send(event.id).await.is_err()
-                    {
-                        debug!(
-                            "outbound link-close bridge: receiver closed, exiting"
-                        );
-                        return;
+                Ok(event) => match event.event {
+                    LinkEvent::Activated => {
+                        status_cache
+                            .write()
+                            .expect("poisoned")
+                            .insert(event.id, LinkStatus::Active);
                     }
-                }
+                    LinkEvent::Closed => {
+                        status_cache
+                            .write()
+                            .expect("poisoned")
+                            .insert(event.id, LinkStatus::Closed);
+                        if close_tx.send(event.id).await.is_err() {
+                            debug!(
+                                "outbound link-close bridge: receiver closed, exiting"
+                            );
+                            return;
+                        }
+                    }
+                    LinkEvent::Data(_) => {}
+                },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(n, "outbound link bridge lagged");
                 }
@@ -388,7 +432,12 @@ impl Endpoint for RealEndpoint {
                 let mut t = self.transport.lock().await;
                 t.add_destination(identity, name).await
             };
-            let dest = RealDestination::new(dest_arc, name).await;
+            // The destination needs a handle to the Transport so its
+            // `announce()` can actually emit the packet via
+            // `send_packet`.
+            let dest =
+                RealDestination::new(dest_arc, name, self.transport.clone())
+                    .await;
             Ok(Arc::new(dest) as DynDestination)
         })
     }
@@ -409,7 +458,12 @@ impl Endpoint for RealEndpoint {
                 let t = self.transport.lock().await;
                 t.link(desc).await
             };
-            let real = RealLink::from_inner(link_arc).await?;
+            let real = RealLink::from_inner(
+                link_arc,
+                self.link_status.clone(),
+                self.transport.clone(),
+            )
+            .await?;
             Ok(Arc::new(real) as DynLink)
         })
     }
@@ -503,6 +557,9 @@ struct RealDestination {
     >,
     name: DestinationName,
     address_hash: AddressHash,
+    /// Handle back to the owning Transport so `announce()` can call
+    /// `send_packet` on the announce it produces.
+    transport: SharedTransport,
 }
 
 impl std::fmt::Debug for RealDestination {
@@ -519,6 +576,7 @@ impl RealDestination {
             TokioMutex<rns_transport::destination::SingleInputDestination>,
         >,
         name: DestinationName,
+        transport: SharedTransport,
     ) -> Self {
         let address_hash = {
             let d = inner.lock().await;
@@ -528,6 +586,7 @@ impl RealDestination {
             inner,
             name,
             address_hash,
+            transport,
         }
     }
 }
@@ -546,12 +605,20 @@ impl Destination for RealDestination {
         app_data: Option<&'a [u8]>,
     ) -> BoxFut<'a, K2Result<Vec<u8>>> {
         Box::pin(async move {
-            let mut guard = self.inner.lock().await;
-            let packet =
-                guard.announce(OsRng, app_data).map_err(|e| {
+            // Generate the announce packet and a serialized copy for
+            // any caller that wants to inspect the bytes.
+            let (packet, bytes) = {
+                let mut guard = self.inner.lock().await;
+                let p = guard.announce(OsRng, app_data).map_err(|e| {
                     K2Error::other(format!("rns announce failed: {e:?}"))
                 })?;
-            Ok(packet.data.as_slice().to_vec())
+                let b = p.data.as_slice().to_vec();
+                (p, b)
+            };
+            // Actually emit it on the network.
+            let tp = self.transport.lock().await;
+            tp.send_packet(packet).await;
+            Ok(bytes)
         })
     }
 }
@@ -559,12 +626,15 @@ impl Destination for RealDestination {
 /// Real `Link` implementation. Caches immutable fields so trait
 /// methods can answer without acquiring the link's mutex.
 pub(crate) struct RealLink {
-    _inner: Arc<TokioMutex<rns_transport::destination::link::Link>>,
+    inner: Arc<TokioMutex<rns_transport::destination::link::Link>>,
     id: LinkId,
     peer_hash: AddressHash,
     local_dest_hash: AddressHash,
-    /// Cached status snapshot. Updated opportunistically.
-    cached_status: std::sync::Mutex<LinkStatus>,
+    /// Handle back to the owning Transport so `send_small` can call
+    /// `send_packet` after `data_packet` produces the rns Packet.
+    transport: SharedTransport,
+    /// Shared status mirror updated by the in/out link event bridges.
+    status_cache: LinkStatusCache,
 }
 
 impl std::fmt::Debug for RealLink {
@@ -578,29 +648,32 @@ impl std::fmt::Debug for RealLink {
 
 impl RealLink {
     /// Wrap an existing `Arc<Mutex<Link>>` by reading its immutable
-    /// fields once under the lock.
+    /// fields once under the lock and seeding the status cache.
     async fn from_inner(
         inner: Arc<TokioMutex<rns_transport::destination::link::Link>>,
+        status_cache: LinkStatusCache,
+        transport: SharedTransport,
     ) -> K2Result<Self> {
         let (id, peer_hash, local_dest_hash, status) = {
             let link = inner.lock().await;
             let id = *link.id();
             let peer_hash = link.peer_identity().address_hash;
-            // `destination` on a Link is the *remote* DestinationDesc
-            // for outbound links, and our own for inbound links. We
-            // use it as-is -- the links router only inspects
-            // `local_destination_hash` on inbound links, where this
-            // matches our registered per-space destination.
             let local_dest_hash = link.destination().address_hash;
             let status = map_status(link.status());
             (id, peer_hash, local_dest_hash, status)
         };
+        status_cache
+            .write()
+            .expect("poisoned")
+            .entry(id)
+            .or_insert(status);
         Ok(Self {
-            _inner: inner,
+            inner,
             id,
             peer_hash,
             local_dest_hash,
-            cached_status: std::sync::Mutex::new(status),
+            transport,
+            status_cache,
         })
     }
 }
@@ -630,21 +703,36 @@ impl Link for RealLink {
     }
 
     fn status(&self) -> LinkStatus {
-        *self.cached_status.lock().expect("poisoned")
+        // Read from the shared status mirror updated by the in/out
+        // link event bridges. No lock contention with rns internals.
+        self.status_cache
+            .read()
+            .expect("poisoned")
+            .get(&self.id)
+            .copied()
+            .unwrap_or(LinkStatus::Pending)
     }
 
-    fn data_packet(&self, data: &[u8]) -> K2Result<Vec<u8>> {
-        // Encode the data as a Reticulum Packet ready for
-        // `Transport::send_packet`. Taking a sync lock here is ok
-        // because `data_packet` on the underlying `Link` is a
-        // synchronous encrypt+frame operation -- but rns wraps it
-        // behind a tokio::Mutex, which we can't sync-lock safely from
-        // async context. See `send_packet` above for the full story;
-        // the ≤ MDU path is wired up once step 15 demands it.
-        let _ = data;
-        Err(K2Error::other(
-            "RealLink::data_packet: ≤ MDU send path not yet wired (use send_resource via send_over_link)",
-        ))
+    fn send_small<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> BoxFut<'a, K2Result<()>> {
+        Box::pin(async move {
+            // Build the rns Packet under the link's lock, then drop
+            // the lock before calling Transport::send_packet (which
+            // takes its own internal locks).
+            let packet = {
+                let link = self.inner.lock().await;
+                link.data_packet(data).map_err(|e| {
+                    K2Error::other(format!(
+                        "rns Link::data_packet failed: {e:?}"
+                    ))
+                })?
+            };
+            let tp = self.transport.lock().await;
+            tp.send_packet(packet).await;
+            Ok(())
+        })
     }
 
     fn teardown(&self) -> Option<Vec<u8>> {

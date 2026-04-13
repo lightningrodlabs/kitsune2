@@ -129,15 +129,14 @@ async fn links_router_inserts_peer_on_first_inbound_link() {
     assert_eq!(sid.as_ref(), b"alpha");
     drop(reg);
 
-    // TxHandler should have received peer_connect and the preflight
-    // frame should have been written via `send_resource` (we use the
-    // Resource path uniformly; see routers::send_over_link).
+    // TxHandler should have received peer_connect, and the preflight
+    // frame should have been written via `Link::send_small` (the
+    // ≤ MDU fast path; see routers::send_over_link).
     assert_eq!(rec.peer_connects.lock().unwrap().len(), 1);
-    let sends = endpoint.resource_sends.lock().unwrap();
-    assert_eq!(sends.len(), 1, "preflight frame should have been sent");
-    assert_eq!(sends[0].0, link.id());
+    let sent = link.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1, "preflight frame should have been sent");
     // First byte should be the Preflight tag (0x00).
-    assert_eq!(sends[0].1[0], 0x00);
+    assert_eq!(sent[0][0], 0x00);
 
     // Preflight state should be Sent (not yet Ready -- we haven't
     // received a preflight back).

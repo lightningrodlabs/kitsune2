@@ -211,25 +211,34 @@ pub(crate) async fn start_preflight(
     Ok(())
 }
 
-/// Send one encoded frame over a link via Reticulum's Resource
-/// transfer.
+/// Send one encoded frame over a link, picking the right path for
+/// the payload size.
 ///
-/// kitsune2 gossip traffic is almost always above the ~464-byte
-/// Reticulum packet MDU, so the Resource path is the common case
-/// anyway. Resource transparently handles smaller payloads as a
-/// single-fragment transfer -- at the cost of a small per-transfer
-/// metadata overhead compared to a raw `data_packet`. An
-/// `Endpoint::packet_mdu`-aware fast path for ≤ MDU payloads is a
-/// follow-up once the real backend wires `data_packet` + `send_packet`
-/// together (blocked on a tokio-compatible signature; see backend.rs).
+/// rns has two delivery primitives on a Link:
+/// - `data_packet` — single rns Packet, ≤ `PACKET_MDU` (~464 bytes).
+///   No advertise/request/fragments/proof round-trip; the payload
+///   ships in one packet and arrives at the receiver as a `Link::Data`
+///   event mirrored into `received_data_events`.
+/// - `send_resource` — for larger payloads. Multi-packet transfer
+///   with its own handshake.
+///
+/// Using Resource for *every* size, which we did initially, was
+/// unreliable for tiny preflight frames: rns's resource manager
+/// appears to silently drop the very first Resource transfer on a
+/// freshly-Active link. Keeping small frames on `data_packet` avoids
+/// that path entirely.
 pub(crate) async fn send_over_link(
     link: &DynLink,
     encoded: &[u8],
     endpoint: &DynEndpoint,
     _max_frame_bytes: usize,
 ) -> kitsune2_api::K2Result<()> {
-    let link_id = link.id();
-    endpoint.send_resource(&link_id, encoded).await
+    if encoded.len() <= endpoint.packet_mdu() {
+        link.send_small(encoded).await
+    } else {
+        let link_id = link.id();
+        endpoint.send_resource(&link_id, encoded).await
+    }
 }
 
 /// Spawn the resource-data router. Consumes `(LinkId, Bytes)` events,
@@ -258,14 +267,42 @@ async fn route_data(
     state: &RouterState,
     handler: &Arc<TxImpHnd>,
 ) -> kitsune2_api::K2Result<()> {
-    let (peer_url, _space_id) = {
-        let reg = state.link_registry.read().expect("poisoned");
-        match reg.get(link_id) {
-            Some(entry) => entry.clone(),
-            None => {
-                trace!(?link_id, "data for unknown link -- dropping");
-                return Ok(());
+    // Resource transfers can complete before the links router has
+    // observed the matching `LinkEvent::Activated` and registered the
+    // link in `RouterState`. Both events come from the same rns
+    // Transport but flow through separate broadcast channels with
+    // independent receivers, so a tiny preflight Resource (a few
+    // bytes — single fragment + proof) can land in the data router
+    // before the links router has caught up. Retry a few times
+    // rather than dropping.
+    let mut peer_entry = None;
+    for attempt in 0..20 {
+        {
+            let reg = state.link_registry.read().expect("poisoned");
+            if let Some(entry) = reg.get(link_id) {
+                peer_entry = Some(entry.clone());
+                break;
             }
+        }
+        if attempt == 0 {
+            trace!(
+                ?link_id,
+                "data router: link not yet registered, awaiting links router"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (peer_url, _space_id) = match peer_entry {
+        Some(entry) => entry,
+        None => {
+            let reg = state.link_registry.read().expect("poisoned");
+            let known: Vec<LinkId> = reg.keys().copied().collect();
+            warn!(
+                ?link_id,
+                ?known,
+                "data router: link still unknown after retries -- dropping"
+            );
+            return Ok(());
         }
     };
 
@@ -360,6 +397,70 @@ pub(crate) async fn remove_link(
 #[allow(dead_code)]
 pub(crate) fn link_is_active(link: &DynLink) -> bool {
     matches!(link.status(), LinkStatus::Active | LinkStatus::Handshake)
+}
+
+/// Block until the peer's preflight state is `Ready` (or timeout).
+///
+/// The data router on the remote side drops `Data` frames that arrive
+/// before its preflight state is Ready. rns sends our preflight and
+/// data as two independent Resource transfers with no ordering
+/// guarantee, so a fast data frame can lap the preflight on the wire.
+/// Waiting locally for our own state to flip — which happens when we
+/// receive the remote's preflight in response — is a serviceable
+/// proxy for "the link's preflight handshake is done in both
+/// directions."
+pub(crate) async fn wait_for_preflight_ready(
+    peer_state: &Arc<PeerState>,
+    timeout: std::time::Duration,
+) -> kitsune2_api::K2Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if matches!(
+            *peer_state.preflight_state.lock().expect("poisoned"),
+            PreflightState::Ready
+        ) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(kitsune2_api::K2Error::other(format!(
+                "timed out waiting for preflight Ready (timeout {timeout:?})"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Block until the link reaches `Active` (or `Closed` / timeout).
+///
+/// rns's `Transport::link()` returns immediately with a Link in
+/// `Pending` state; the proof round-trip happens in the background.
+/// Sending resources on a non-Active link races the remote's link
+/// mirror — locally the send reports success while the remote drops
+/// fragments because reassembly requires the link to be live on its
+/// side first. This helper polls `Link::status()` so the caller can
+/// hold off until the handshake settles.
+pub(crate) async fn wait_for_link_active(
+    link: &DynLink,
+    timeout: std::time::Duration,
+) -> kitsune2_api::K2Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match link.status() {
+            LinkStatus::Active => return Ok(()),
+            LinkStatus::Closed => {
+                return Err(kitsune2_api::K2Error::other(
+                    "link closed during wait_for_link_active",
+                ));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(kitsune2_api::K2Error::other(format!(
+                "timed out waiting for link to become Active (timeout {timeout:?})"
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Spawn the link-close router. Consumes `LinkId`s from
