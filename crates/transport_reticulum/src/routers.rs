@@ -211,25 +211,25 @@ pub(crate) async fn start_preflight(
     Ok(())
 }
 
-/// Send one encoded frame over a link, choosing `data_packet` + raw
-/// send for small payloads and `send_resource` for larger ones.
+/// Send one encoded frame over a link via Reticulum's Resource
+/// transfer.
 ///
-/// The MDU boundary is exposed by `Endpoint::packet_mdu()`. kitsune2
-/// gossip traffic is almost always above the ~464-byte Reticulum MDU,
-/// so in practice the Resource path dominates.
+/// kitsune2 gossip traffic is almost always above the ~464-byte
+/// Reticulum packet MDU, so the Resource path is the common case
+/// anyway. Resource transparently handles smaller payloads as a
+/// single-fragment transfer -- at the cost of a small per-transfer
+/// metadata overhead compared to a raw `data_packet`. An
+/// `Endpoint::packet_mdu`-aware fast path for ≤ MDU payloads is a
+/// follow-up once the real backend wires `data_packet` + `send_packet`
+/// together (blocked on a tokio-compatible signature; see backend.rs).
 pub(crate) async fn send_over_link(
     link: &DynLink,
     encoded: &[u8],
     endpoint: &DynEndpoint,
     _max_frame_bytes: usize,
 ) -> kitsune2_api::K2Result<()> {
-    if encoded.len() <= endpoint.packet_mdu() {
-        let packet = link.data_packet(encoded)?;
-        endpoint.send_packet(&packet).await
-    } else {
-        let link_id = link.id();
-        endpoint.send_resource(&link_id, encoded).await
-    }
+    let link_id = link.id();
+    endpoint.send_resource(&link_id, encoded).await
 }
 
 /// Spawn the resource-data router. Consumes `(LinkId, Bytes)` events,

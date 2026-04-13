@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
 type AddedDests = Arc<Mutex<Vec<(DestinationName, Arc<FakeDestination>)>>>;
+type ResourceSends = Arc<Mutex<Vec<(LinkId, Vec<u8>)>>>;
 
 /// Fake endpoint -- push inputs, read outputs.
 pub(crate) struct FakeEndpoint {
@@ -34,6 +35,10 @@ pub(crate) struct FakeEndpoint {
     resource_tx: Mutex<Option<mpsc::Sender<(LinkId, Bytes)>>>,
     /// Every destination added (for inspection).
     pub(crate) destinations_added: AddedDests,
+    /// Every `send_resource` call (for inspection).
+    pub(crate) resource_sends: ResourceSends,
+    /// Every `link_to` call's returned link (for inspection).
+    pub(crate) links_issued: Arc<Mutex<Vec<Arc<FakeLink>>>>,
 }
 
 impl std::fmt::Debug for FakeEndpoint {
@@ -51,6 +56,8 @@ impl FakeEndpoint {
             links_tx: Mutex::new(None),
             resource_tx: Mutex::new(None),
             destinations_added: Arc::new(Mutex::new(Vec::new())),
+            resource_sends: Arc::new(Mutex::new(Vec::new())),
+            links_issued: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -101,15 +108,17 @@ impl Endpoint for FakeEndpoint {
 
     fn link_to(
         &self,
-        _identity: Identity,
+        identity: Identity,
         _app_name: String,
         _aspect: String,
     ) -> BoxFut<'_, K2Result<DynLink>> {
-        Box::pin(async move {
-            Err(kitsune2_api::K2Error::other(
-                "FakeEndpoint::link_to not implemented for this test",
-            ))
-        })
+        // Synthesise a fake link deterministically from the requested
+        // peer identity. Tests can inspect `links_issued` to assert
+        // which peers we opened links to.
+        let peer_byte = identity.address_hash.as_slice()[0];
+        let link = FakeLink::new(0x55, peer_byte, 0x77);
+        self.links_issued.lock().unwrap().push(link.clone());
+        Box::pin(async move { Ok(link as DynLink) })
     }
 
     fn send_packet(&self, _packet: &[u8]) -> BoxFut<'_, K2Result<()>> {
@@ -118,10 +127,14 @@ impl Endpoint for FakeEndpoint {
 
     fn send_resource(
         &self,
-        _link_id: &LinkId,
-        _data: &[u8],
+        link_id: &LinkId,
+        data: &[u8],
     ) -> BoxFut<'_, K2Result<()>> {
-        Box::pin(async move { Ok(()) })
+        let entry = (*link_id, data.to_vec());
+        Box::pin(async move {
+            self.resource_sends.lock().unwrap().push(entry);
+            Ok(())
+        })
     }
 
     fn packet_mdu(&self) -> usize {
