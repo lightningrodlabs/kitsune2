@@ -138,9 +138,19 @@ async fn put_stages_agent_info_for_announce() {
     let signed = mk_signed(1, space.clone()).await;
     bs.put(signed.clone());
 
-    // The node should now have the encoded bytes staged for that space.
+    // The node now has compressed bytes staged for that space; the
+    // drain decompresses before decoding, so mirror that here.
     let staged = node.get_my_agent_info(&space).expect("staged");
-    let decoded = AgentInfoSigned::decode(&YesVerifier, &staged).unwrap();
+    let decompressed = {
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+        let mut dec = DeflateDecoder::new(&staged[..]);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        out
+    };
+    let decoded =
+        AgentInfoSigned::decode(&YesVerifier, &decompressed).unwrap();
     assert_eq!(decoded.agent, signed.agent);
 }
 
@@ -190,7 +200,11 @@ async fn drain_inserts_decoded_agent_info_into_peer_store() {
 
     // Fabricate a signed AgentInfo and encode it as the announce app_data.
     let signed = mk_signed(2, space.clone()).await;
-    let encoded_bytes: Bytes = signed.encode().unwrap().into_bytes().into();
+    // Announce app_data is compressed -- the drain decompresses.
+    let encoded_bytes: Bytes = crate::bootstrap::compress_app_data(
+        signed.encode().unwrap().as_bytes(),
+    )
+    .unwrap();
 
     // Inject an announce carrying the signed AgentInfo in app_data.
     let identity =

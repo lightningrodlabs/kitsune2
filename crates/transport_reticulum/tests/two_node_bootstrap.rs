@@ -217,7 +217,14 @@ async fn announce_flows_through_real_endpoint_and_bootstrap_drain() {
     // don't need A to run the full node stack — we just want it to
     // emit an announce whose app_data carries a signed AgentInfo.
     let signed = mk_signed(1, space.clone()).await;
-    let encoded = signed.encode().unwrap().into_bytes();
+    // The bootstrap drain expects compressed app_data (to fit in the
+    // announce packet's ~316-byte budget with real Ed25519 sigs).
+    let encoded: Vec<u8> =
+        kitsune2_transport_reticulum::internal_testing::compress_app_data(
+            signed.encode().unwrap().as_bytes(),
+        )
+        .unwrap()
+        .to_vec();
 
     // A registers the same space destination name B is filtering on.
     // `register_space` uses the hex-encoded space id as the aspect,

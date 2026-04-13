@@ -93,10 +93,18 @@ pub(crate) fn spawn_links_router(
     state: RouterState,
     handler: Arc<TxImpHnd>,
     endpoint: DynEndpoint,
+    local_main_identity: AddressHash,
 ) -> AbortHandle {
     tokio::spawn(async move {
         while let Some(link) = rx.recv().await {
-            route_new_link(&link, &state, &handler, &endpoint).await;
+            route_new_link(
+                &link,
+                &state,
+                &handler,
+                &endpoint,
+                local_main_identity,
+            )
+            .await;
         }
         debug!("links router: channel closed");
     })
@@ -108,6 +116,7 @@ async fn route_new_link(
     state: &RouterState,
     handler: &Arc<TxImpHnd>,
     endpoint: &DynEndpoint,
+    local_main_identity: AddressHash,
 ) {
     // Map the local destination hash back to a SpaceId.
     let local_dest = link.local_destination_hash();
@@ -164,6 +173,7 @@ async fn route_new_link(
         // First link to this peer: kick off preflight.
         if let Err(e) = start_preflight(
             &peer_url,
+            local_main_identity,
             link,
             &peer_state,
             handler,
@@ -180,10 +190,13 @@ async fn route_new_link(
 /// Kick off the outbound preflight exchange for a peer on the given link.
 ///
 /// Fetches preflight bytes from `handler.peer_connect(url)`, encodes a
-/// `ReticulumFrame::Preflight`, sends it over the link, and flips the
-/// peer's preflight state to `Sent`.
+/// `ReticulumFrame::Preflight` (carrying our main identity so the
+/// receiver can re-key its `PeerState` under the URL kitsune2
+/// advertises in `AgentInfoSigned.url`), sends it over the link, and
+/// flips `local_sent`.
 pub(crate) async fn start_preflight(
     peer_url: &Url,
+    local_main_identity: AddressHash,
     link: &DynLink,
     peer_state: &Arc<PeerState>,
     handler: &Arc<TxImpHnd>,
@@ -206,7 +219,10 @@ pub(crate) async fn start_preflight(
     }
 
     let preflight_bytes = handler.peer_connect(peer_url.clone()).await?;
-    let frame = ReticulumFrame::Preflight(preflight_bytes);
+    let frame = ReticulumFrame::Preflight {
+        sender_main_identity: local_main_identity,
+        payload: preflight_bytes,
+    };
     let encoded = encode_frame(&frame, max_frame_bytes)?;
     send_over_link(link, &encoded, endpoint, max_frame_bytes).await?;
 
@@ -326,17 +342,83 @@ async fn route_data(
     // Module / Disconnect internally.
     let frame = decode_frame(&data)?;
     match frame {
-        ReticulumFrame::Preflight(bytes) => {
-            // Feed the preflight through; kitsune2 will route it to
-            // preflight_validate_incoming. On success, flip our state
-            // to Ready.
-            handler.recv_data(peer_url.clone(), bytes).await?;
+        ReticulumFrame::Preflight {
+            sender_main_identity,
+            payload,
+        } => {
+            // rns exposes the remote's *ephemeral* per-link identity,
+            // not their main identity. When the links router inserts
+            // the link into the registry + PeerState, it has to key
+            // by the ephemeral URL (it's all rns gives us). That URL
+            // doesn't match the `AgentInfoSigned.url` kitsune2 knows
+            // for the peer — so any message keyed by it would be
+            // dropped by the block check.
+            //
+            // The preflight frame carries the sender's main identity
+            // hash for exactly this reason: re-key PeerState +
+            // link_registry under the main URL before dispatching the
+            // preflight up to TxImpHnd.
+            let main_url =
+                match crate::url::identity_hash_to_url(&sender_main_identity)
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(
+                            ?e,
+                            ?peer_url,
+                            "data router: invalid main-identity hash in preflight"
+                        );
+                        return Ok(());
+                    }
+                };
+            let main_peer_url = if main_url == peer_url {
+                peer_url
+            } else {
+                debug!(
+                    ephemeral = %peer_url,
+                    main = %main_url,
+                    "data router: re-keying PeerState to main identity URL"
+                );
+                // Move the PeerState entry under the main URL.
+                {
+                    let mut states =
+                        state.peer_states.write().expect("poisoned");
+                    if let Some(existing) = states.remove(&peer_url) {
+                        states.insert(main_url.clone(), existing);
+                    }
+                }
+                // Update every link_registry entry that referenced the
+                // ephemeral URL so future data frames arrive under main.
+                {
+                    let mut reg =
+                        state.link_registry.write().expect("poisoned");
+                    for entry in reg.values_mut() {
+                        if entry.0 == peer_url {
+                            entry.0 = main_url.clone();
+                        }
+                    }
+                }
+                main_url
+            };
+
+            // Re-fetch the PeerState from its (possibly new) key.
+            let peer_state_after = state
+                .peer_states
+                .read()
+                .expect("poisoned")
+                .get(&main_peer_url)
+                .cloned();
+            let ps = match peer_state_after {
+                Some(ps) => ps,
+                None => peer_state,
+            };
+
+            handler.recv_data(main_peer_url.clone(), payload).await?;
             {
-                let mut pf =
-                    peer_state.preflight_state.lock().expect("poisoned");
+                let mut pf = ps.preflight_state.lock().expect("poisoned");
                 pf.remote_received = true;
             }
-            debug!(?peer_url, "preflight received");
+            debug!(?main_peer_url, "preflight received");
         }
         ReticulumFrame::Data(bytes) => {
             // Gate on preflight readiness. Frames received before

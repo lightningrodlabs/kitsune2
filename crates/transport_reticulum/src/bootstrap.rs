@@ -53,27 +53,63 @@ impl ReticulumBootstrap {
 
 impl Bootstrap for ReticulumBootstrap {
     fn put(&self, info: Arc<AgentInfoSigned>) {
-        match info.encode() {
-            Ok(json) => {
-                self.node.set_my_agent_info(
-                    self.space_id.clone(),
-                    bytes::Bytes::from(json.into_bytes()),
-                );
-                debug!(
-                    agent = ?info.agent,
-                    space = ?self.space_id,
-                    "ReticulumBootstrap: staged AgentInfoSigned for next announce"
-                );
-            }
+        let json = match info.encode() {
+            Ok(j) => j,
             Err(e) => {
                 warn!(
                     ?e,
                     space = ?self.space_id,
                     "ReticulumBootstrap::put: failed to encode AgentInfoSigned",
                 );
+                return;
+            }
+        };
+        match compress_app_data(json.as_bytes()) {
+            Ok(compressed) => {
+                debug!(
+                    agent = ?info.agent,
+                    space = ?self.space_id,
+                    json_size = json.len(),
+                    compressed_size = compressed.len(),
+                    "ReticulumBootstrap: staged compressed AgentInfoSigned for next announce"
+                );
+                self.node
+                    .set_my_agent_info(self.space_id.clone(), compressed);
+            }
+            Err(e) => {
+                warn!(
+                    ?e,
+                    space = ?self.space_id,
+                    "ReticulumBootstrap::put: compression failed",
+                );
             }
         }
     }
+}
+
+/// Deflate-compress the AgentInfoSigned JSON so it fits in a single
+/// Reticulum announce packet.
+///
+/// An rns announce packet has ~316 bytes for app_data (after the
+/// pub_key / verifying_key / name_hash / rand_hash / signature /
+/// header overhead). A canonical-JSON `AgentInfoSigned` with real
+/// Ed25519 signatures is 400-600 bytes and doesn't fit raw.
+pub fn compress_app_data(input: &[u8]) -> std::io::Result<bytes::Bytes> {
+    use flate2::{write::DeflateEncoder, Compression};
+    use std::io::Write;
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(input)?;
+    Ok(bytes::Bytes::from(enc.finish()?))
+}
+
+/// Inverse of [`compress_app_data`].
+fn decompress_app_data(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+    let mut dec = DeflateDecoder::new(input);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 impl Drop for ReticulumBootstrap {
@@ -114,8 +150,20 @@ pub fn spawn_bootstrap_drain(
                 }
             };
 
+            // Inverse of `compress_app_data` in `Bootstrap::put`.
+            let decompressed = match decompress_app_data(&app_data) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        ?e,
+                        ?space_id,
+                        "bootstrap drain: failed to decompress app_data",
+                    );
+                    continue;
+                }
+            };
             let decoded =
-                AgentInfoSigned::decode(&binding.verifier, &app_data);
+                AgentInfoSigned::decode(&binding.verifier, &decompressed);
             let signed = match decoded {
                 Ok(s) => s,
                 Err(e) => {

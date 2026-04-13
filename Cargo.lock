@@ -2561,6 +2561,8 @@ dependencies = [
  "kitsune2_transport_iroh",
  "kitsune2_transport_reticulum",
  "kitsune2_transport_tx5",
+ "rand_core 0.6.4",
+ "reticulum-rs-transport",
  "sbd-server",
  "schemars",
  "serde",
@@ -2775,6 +2777,7 @@ name = "kitsune2_transport_reticulum"
 version = "0.5.0-dev.0"
 dependencies = [
  "bytes",
+ "flate2",
  "kitsune2_api",
  "kitsune2_core",
  "kitsune2_test_utils",
@@ -2785,7 +2788,6 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "url",
 ]
 

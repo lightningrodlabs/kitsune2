@@ -100,6 +100,7 @@ async fn links_router_inserts_peer_on_first_inbound_link() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
 
     // Inject a new inbound link to our 0x77 destination from peer 0xbb.
@@ -158,6 +159,7 @@ async fn links_router_drops_link_for_unknown_destination() {
         state.clone(),
         hnd,
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
 
     let link = FakeLink::new(0x11, 0xbb, 0x99);
@@ -182,6 +184,7 @@ async fn data_router_drops_frames_before_preflight_ready() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
     let link = FakeLink::new(0x11, 0xbb, 0x77);
     endpoint.inject_link(link.clone()).await;
@@ -220,6 +223,7 @@ async fn data_router_flips_preflight_state_to_ready() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
     let link = FakeLink::new(0x11, 0xbb, 0x77);
     endpoint.inject_link(link.clone()).await;
@@ -240,7 +244,12 @@ async fn data_router_flips_preflight_state_to_ready() {
     }
     .encode_to_vec();
     let encoded = encode_frame(
-        &ReticulumFrame::Preflight(Bytes::from(inner)),
+        &ReticulumFrame::Preflight {
+            // A's main identity (0xbb in this fixture — same as the
+            // link's peer_identity_hash on B's side, so no re-keying).
+            sender_main_identity: AddressHash::new([0xbb; 16]),
+            payload: Bytes::from(inner),
+        },
         1024,
     )
     .unwrap();
@@ -272,6 +281,7 @@ async fn remove_link_fires_peer_disconnect_on_last_close() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
     let link = FakeLink::new(0x11, 0xbb, 0x77);
     endpoint.inject_link(link.clone()).await;
@@ -310,6 +320,7 @@ async fn remove_link_penultimate_does_not_disconnect() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
 
     // Two links to the SAME peer, different spaces.
@@ -341,6 +352,7 @@ async fn close_router_fires_peer_disconnect_on_last_close() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
     let close_rx = endpoint.recv_link_closures().await.unwrap();
     let _hc = spawn_close_router(close_rx, state.clone(), hnd.clone());
@@ -373,6 +385,7 @@ async fn close_router_holds_peer_when_other_links_still_open() {
         state.clone(),
         hnd.clone(),
         endpoint.clone(),
+        AddressHash::new([0u8; 16]),
     );
     let close_rx = endpoint.recv_link_closures().await.unwrap();
     let _hc = spawn_close_router(close_rx, state.clone(), hnd.clone());

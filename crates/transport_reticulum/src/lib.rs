@@ -91,6 +91,7 @@ pub mod internal_testing {
     use super::*;
 
     pub use crate::bootstrap::ReticulumBootstrap;
+    pub use crate::bootstrap::compress_app_data;
 
     /// Spawn the announce listener + bootstrap drain for a standalone
     /// `ReticulumNode` that isn't running under a full
@@ -293,6 +294,7 @@ impl ReticulumTransport {
             router_state.clone(),
             handler.clone(),
             node.endpoint().clone(),
+            node.local_identity_hash(),
         );
 
         let data_rx = node.endpoint().recv_resource_data().await?;
@@ -464,6 +466,7 @@ impl TxImp for ReticulumTransport {
                     if first_link {
                         routers::start_preflight(
                             &remote_url,
+                            node.local_identity_hash(),
                             &link,
                             &peer_state,
                             &handler,

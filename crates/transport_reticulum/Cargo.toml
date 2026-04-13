@@ -16,6 +16,7 @@ bytes = { workspace = true }
 reticulum-rs-transport = { workspace = true }
 rand_core = { workspace = true }
 kitsune2_api = { workspace = true }
+flate2 = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "io-util"] }

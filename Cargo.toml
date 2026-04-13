@@ -89,6 +89,9 @@ rand = "0.8.5"
 rand_core = "0.6"
 # Reticulum network stack implementation.
 reticulum-rs-transport = "0.2.0"
+# compression for transport_reticulum announce app_data (real kitsune2
+# AgentInfoSigned JSON doesn't fit in the ~316-byte app_data budget).
+flate2 = "1.0"
 # kitsune types need to be serializable for network transmission.
 serde = { version = "1.0", features = ["derive"] }
 # kitsune2 agent info is serialized as json to improve debugability of
