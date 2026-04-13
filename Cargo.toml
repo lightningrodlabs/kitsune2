@@ -175,3 +175,4 @@ jsonschema = "0.30.0"
 #sbd-e2e-crypto-client = { path = "../sbd/rust/sbd-e2e-crypto-client" }
 #tx5-core = { path = "../tx5/crates/tx5-core" }
 #tx5 = { path = "../tx5/crates/tx5" }
+reticulum-rs-transport = { git = "https://github.com/lightningrodlabs/LXMF-rs", branch = "bump-rusqlite-0.37" }
