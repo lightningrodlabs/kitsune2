@@ -1,3 +1,5 @@
-//! Test utilities for the Reticulum transport.
+//! In-memory fakes for unit-testing. See [`harness`].
 
-pub mod harness;
+pub(crate) mod harness;
+
+pub(crate) use harness::{fake_announce, fake_identity, FakeEndpoint};

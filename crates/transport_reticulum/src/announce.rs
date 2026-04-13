@@ -31,7 +31,7 @@ pub(crate) fn spawn_announce_publisher(
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(interval_s as u64);
         loop {
-            match dest.announce(None) {
+            match dest.announce(None).await {
                 Ok(_packet) => {
                     debug!(
                         dest_hash = ?dest.address_hash(),

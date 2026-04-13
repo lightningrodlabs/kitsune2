@@ -449,6 +449,23 @@ pub trait TxImp: 'static + Send + Sync + std::fmt::Debug {
 
     /// Dump network stats.
     fn dump_network_stats(&self) -> BoxFut<'_, K2Result<TransportStats>>;
+
+    /// Notify the implementation that a space has been registered.
+    ///
+    /// Implementations that need to do per-space setup (e.g. the Reticulum
+    /// transport, which owns one destination per joined space) can override
+    /// this hook. The default is a no-op, appropriate for peer-centric
+    /// transports like iroh or tx5.
+    ///
+    /// Called synchronously by `DefaultTransport::register_space_handler`
+    /// after the space handler has been stored. Implementations that need
+    /// to do async work should spawn their own task from inside this hook.
+    fn register_space(&self, _space_id: SpaceId) {}
+
+    /// Notify the implementation that a space has been unregistered.
+    ///
+    /// Counterpart to [`TxImp::register_space`]. Default no-op.
+    fn unregister_space(&self, _space_id: SpaceId) {}
 }
 
 /// Trait-object [TxImp].
@@ -587,7 +604,15 @@ impl Transport for DefaultTransport {
             panic!("Attempted to register duplicate space handler! {space_id}");
         }
         // keep the lock locked while we fetch the url for atomicity.
-        self.imp.url()
+        let url = self.imp.url();
+        drop(lock);
+
+        // Fire the per-space hook. Transports that don't need this (iroh,
+        // tx5) use the default no-op impl; transports that do (reticulum)
+        // spawn their own tasks inside the hook.
+        self.imp.register_space(space_id);
+
+        url
     }
 
     fn register_module_handler(
@@ -715,6 +740,9 @@ impl Transport for DefaultTransport {
                 .lock()
                 .unwrap()
                 .retain(|(s, _), _| s != &space_id);
+
+            // Notify the implementation so it can tear down per-space state.
+            self.imp.unregister_space(space_id);
         })
     }
 

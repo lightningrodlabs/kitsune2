@@ -55,7 +55,13 @@ pub(crate) trait Destination: Send + Sync + std::fmt::Debug {
     fn name(&self) -> DestinationName;
 
     /// Create and return an announce packet.
-    fn announce(&self, app_data: Option<&[u8]>) -> K2Result<Vec<u8>>;
+    ///
+    /// Async because the real impl needs to acquire a `tokio::Mutex` on
+    /// the underlying `SingleInputDestination`.
+    fn announce<'a>(
+        &'a self,
+        app_data: Option<&'a [u8]>,
+    ) -> BoxFut<'a, K2Result<Vec<u8>>>;
 }
 
 /// Announce event received from the network.

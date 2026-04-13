@@ -30,6 +30,7 @@
 //! mirroring the Iroh transport's endpoint abstraction. This allows unit
 //! tests to swap in fakes without a real Reticulum network.
 
+mod backend;
 mod config;
 mod destination;
 mod frame;
@@ -41,8 +42,8 @@ mod link;
 mod node;
 mod peer_state;
 
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils;
+#[cfg(test)]
+mod test_utils;
 
 #[cfg(test)]
 mod tests;
@@ -57,7 +58,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 use tokio::task::AbortHandle;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 pub use config::{
     ReticulumInterfaceConfig, ReticulumTransportConfig,
@@ -158,17 +159,23 @@ struct ReticulumTransport {
     config: ReticulumTransportConfig,
     /// Per-space task abort handles, cleaned up on drop.
     space_tasks: Arc<Mutex<HashMap<SpaceId, Vec<AbortHandle>>>>,
+    /// Global (transport-scoped) task abort handles.
+    global_tasks: Mutex<Vec<AbortHandle>>,
 }
 
 impl Drop for ReticulumTransport {
     fn drop(&mut self) {
         info!(local_url = ?self.local_url, "Dropping Reticulum transport");
-        // Abort all per-space tasks.
         if let Ok(tasks) = self.space_tasks.lock() {
             for (_, handles) in tasks.iter() {
                 for h in handles {
                     h.abort();
                 }
+            }
+        }
+        if let Ok(tasks) = self.global_tasks.lock() {
+            for h in tasks.iter() {
+                h.abort();
             }
         }
     }
@@ -188,6 +195,17 @@ impl ReticulumTransport {
         // Emit our listening address immediately -- it is deterministic.
         handler.new_listening_address(local_url).await;
 
+        // Spawn the global announce listener. This runs for the lifetime of
+        // the transport, populating the identity cache and pushing matches
+        // into the per-space peer-discovered queue for the bootstrap layer.
+        let announce_rx = node.endpoint().recv_announces().await?;
+        let announce_listener_handle = announce::spawn_announce_listener(
+            announce_rx,
+            node.identity_cache().clone(),
+            node.space_name_hashes().clone(),
+            node.peer_discovered_tx().clone(),
+        );
+
         let out: DynTxImp = Arc::new(Self {
             node,
             handler,
@@ -195,9 +213,11 @@ impl ReticulumTransport {
             peer_states: Arc::new(RwLock::new(HashMap::new())),
             config,
             space_tasks: Arc::new(Mutex::new(HashMap::new())),
+            global_tasks: Mutex::new(vec![announce_listener_handle]),
         });
         Ok(out)
     }
+
 }
 
 impl TxImp for ReticulumTransport {
@@ -287,6 +307,59 @@ impl TxImp for ReticulumTransport {
                 connections: Vec::new(),
             })
         })
+    }
+
+    fn register_space(&self, space_id: SpaceId) {
+        // We need `Arc<Self>` so our spawned task can call
+        // `spawn_space_tasks`. The hook is called from
+        // `DefaultTransport::register_space_handler`, which holds us as
+        // `DynTxImp = Arc<dyn TxImp>` already; reaching back to a concrete
+        // `Arc<Self>` from here isn't possible through the trait. Instead,
+        // clone the fields we actually need and spawn a detached task.
+        let node = self.node.clone();
+        let space_tasks = self.space_tasks.clone();
+        let interval = self.config.announce_interval_s;
+        tokio::spawn(async move {
+            match node.register_space(&space_id).await {
+                Ok(dest) => {
+                    let h =
+                        announce::spawn_announce_publisher(dest, interval);
+                    space_tasks
+                        .lock()
+                        .expect("poisoned")
+                        .entry(space_id.clone())
+                        .or_default()
+                        .push(h);
+                    debug!(
+                        ?space_id,
+                        "Started Reticulum per-space tasks"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        ?e,
+                        ?space_id,
+                        "Failed to register Reticulum destination for space"
+                    );
+                }
+            }
+        });
+    }
+
+    fn unregister_space(&self, space_id: SpaceId) {
+        let node = self.node.clone();
+        // Abort any per-space tasks we spawned.
+        if let Some(tasks) = self
+            .space_tasks
+            .lock()
+            .expect("poisoned")
+            .remove(&space_id)
+        {
+            for h in tasks {
+                h.abort();
+            }
+        }
+        node.unregister_space(&space_id);
     }
 }
 
