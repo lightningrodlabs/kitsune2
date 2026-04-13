@@ -23,7 +23,7 @@
 
 use crate::destination::{DynEndpoint, DynLink, LinkId, LinkStatus};
 use crate::frame::{decode_frame, encode_frame, ReticulumFrame};
-use crate::peer_state::{PeerState, PreflightState};
+use crate::peer_state::PeerState;
 use crate::url::identity_hash_to_url;
 use bytes::Bytes;
 use kitsune2_api::{SpaceId, TxImpHnd, Url};
@@ -190,16 +190,19 @@ pub(crate) async fn start_preflight(
     endpoint: &DynEndpoint,
     max_frame_bytes: usize,
 ) -> kitsune2_api::K2Result<()> {
-    // Only move from `None` -> `Sent`. Concurrent callers would see
-    // a Sent/Ready state and bail.
+    // Guard against concurrent callers: only the first caller to
+    // flip `local_sent` from false→true actually sends the preflight.
+    // Note: we do NOT check `remote_received` here — the remote may
+    // have already sent its preflight before we reached this point
+    // (races against `wait_for_link_active`), but we still need to
+    // send ours so the remote can mark its own state Ready.
     {
         let mut pf = peer_state.preflight_state.lock().expect("poisoned");
-        if *pf != PreflightState::None {
-            let state = *pf;
-            trace!(?peer_url, ?state, "preflight already in flight");
+        if pf.local_sent {
+            trace!(?peer_url, "preflight already sent");
             return Ok(());
         }
-        *pf = PreflightState::Sent;
+        pf.local_sent = true;
     }
 
     let preflight_bytes = handler.peer_connect(peer_url.clone()).await?;
@@ -331,21 +334,19 @@ async fn route_data(
             {
                 let mut pf =
                     peer_state.preflight_state.lock().expect("poisoned");
-                *pf = PreflightState::Ready;
+                pf.remote_received = true;
             }
-            debug!(?peer_url, "preflight received, peer ready");
+            debug!(?peer_url, "preflight received");
         }
         ReticulumFrame::Data(bytes) => {
             // Gate on preflight readiness. Frames received before
             // preflight completes are dropped (the remote shouldn't
             // have sent them).
-            let ready = matches!(
-                *peer_state
-                    .preflight_state
-                    .lock()
-                    .expect("poisoned"),
-                PreflightState::Ready
-            );
+            let ready = peer_state
+                .preflight_state
+                .lock()
+                .expect("poisoned")
+                .is_ready();
             if !ready {
                 warn!(?peer_url, "data frame before preflight ready -- dropping");
                 return Ok(());
@@ -415,10 +416,12 @@ pub(crate) async fn wait_for_preflight_ready(
 ) -> kitsune2_api::K2Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if matches!(
-            *peer_state.preflight_state.lock().expect("poisoned"),
-            PreflightState::Ready
-        ) {
+        if peer_state
+            .preflight_state
+            .lock()
+            .expect("poisoned")
+            .is_ready()
+        {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {

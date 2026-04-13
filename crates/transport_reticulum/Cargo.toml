@@ -27,8 +27,5 @@ schemars = { workspace = true }
 kitsune2_core = { workspace = true, optional = true }
 kitsune2_test_utils = { workspace = true, optional = true }
 
-[dev-dependencies]
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-
 [features]
 test-utils = ["dep:kitsune2_core", "dep:kitsune2_test_utils"]

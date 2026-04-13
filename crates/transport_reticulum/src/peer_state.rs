@@ -17,15 +17,26 @@ pub(crate) struct LinkContext {
     pub space_id: SpaceId,
 }
 
-/// Preflight state for a peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreflightState {
-    /// Preflight exchange has not started.
-    None,
-    /// We have sent our preflight, waiting for remote's.
-    Sent,
-    /// Preflight exchange is complete.
-    Ready,
+/// Per-direction preflight status for a peer.
+///
+/// The preflight handshake is bidirectional: each side sends one,
+/// each side receives one. We track both independently so that the
+/// "we already received remote's preflight" case doesn't suppress
+/// sending our own (which was the old `None → Ready` path bug —
+/// `start_preflight` was gated on `== None`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PreflightState {
+    /// We have sent our preflight to the remote.
+    pub local_sent: bool,
+    /// We have received the remote's preflight.
+    pub remote_received: bool,
+}
+
+impl PreflightState {
+    /// Both directions complete — safe to exchange data frames.
+    pub fn is_ready(&self) -> bool {
+        self.local_sent && self.remote_received
+    }
 }
 
 /// Per-peer state, containing preflight status and per-space links.
@@ -41,7 +52,7 @@ impl PeerState {
     /// Create a new PeerState with no links and no preflight.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            preflight_state: Mutex::new(PreflightState::None),
+            preflight_state: Mutex::new(PreflightState::default()),
             links: Mutex::new(HashMap::new()),
         })
     }
@@ -178,22 +189,18 @@ mod tests {
     #[test]
     fn preflight_state_transitions() {
         let state = PeerState::new();
-        assert_eq!(
-            *state.preflight_state.lock().unwrap(),
-            PreflightState::None
-        );
+        // Fresh: neither direction set.
+        let pf = *state.preflight_state.lock().unwrap();
+        assert!(!pf.local_sent && !pf.remote_received);
+        assert!(!pf.is_ready());
 
-        *state.preflight_state.lock().unwrap() = PreflightState::Sent;
-        assert_eq!(
-            *state.preflight_state.lock().unwrap(),
-            PreflightState::Sent
-        );
+        // After sending ours: half-ready.
+        state.preflight_state.lock().unwrap().local_sent = true;
+        assert!(!state.preflight_state.lock().unwrap().is_ready());
 
-        *state.preflight_state.lock().unwrap() = PreflightState::Ready;
-        assert_eq!(
-            *state.preflight_state.lock().unwrap(),
-            PreflightState::Ready
-        );
+        // After also receiving theirs: fully ready.
+        state.preflight_state.lock().unwrap().remote_received = true;
+        assert!(state.preflight_state.lock().unwrap().is_ready());
     }
 
     #[test]

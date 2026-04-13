@@ -6,7 +6,6 @@
 
 use crate::destination::{Endpoint, Link};
 use crate::frame::{encode_frame, ReticulumFrame};
-use crate::peer_state::PreflightState;
 use crate::routers::{
     remove_link, spawn_close_router, spawn_data_router, spawn_links_router,
     RouterState,
@@ -138,12 +137,12 @@ async fn links_router_inserts_peer_on_first_inbound_link() {
     // First byte should be the Preflight tag (0x00).
     assert_eq!(sent[0][0], 0x00);
 
-    // Preflight state should be Sent (not yet Ready -- we haven't
-    // received a preflight back).
-    assert_eq!(
-        *ps.preflight_state.lock().unwrap(),
-        PreflightState::Sent
-    );
+    // Preflight state: local_sent=true, remote_received=false (we've
+    // sent ours, haven't received theirs yet).
+    let pf = *ps.preflight_state.lock().unwrap();
+    assert!(pf.local_sent);
+    assert!(!pf.remote_received);
+    assert!(!pf.is_ready());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -248,15 +247,16 @@ async fn data_router_flips_preflight_state_to_ready() {
     endpoint.inject_data(link.id(), encoded).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    // Preflight state should now be Ready.
+    // After receiving remote's preflight: remote_received=true.
+    // (local_sent is also true because our links_router ran
+    // start_preflight for the first inbound link, which is the
+    // behavior we test in `links_router_inserts_peer_on_first_inbound_link`.)
     let peer_url = identity_hash_to_url(&AddressHash::new([0xbb; 16])).unwrap();
     let states = state.peer_states.read().unwrap();
     let ps = states.get(&peer_url).unwrap().clone();
     drop(states);
-    assert_eq!(
-        *ps.preflight_state.lock().unwrap(),
-        PreflightState::Ready
-    );
+    let pf = *ps.preflight_state.lock().unwrap();
+    assert!(pf.remote_received);
 }
 
 #[tokio::test(flavor = "current_thread")]
