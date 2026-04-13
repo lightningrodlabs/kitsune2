@@ -12,6 +12,7 @@ use crate::routers::{
 };
 use crate::test_utils::FakeEndpoint;
 use crate::test_utils::harness::FakeLink;
+use crate::types::AddressHash;
 use crate::url::identity_hash_to_url;
 use bytes::Bytes;
 use kitsune2_api::{
@@ -19,7 +20,6 @@ use kitsune2_api::{
     TxHandler, TxImpHnd, Url,
 };
 use prost::Message;
-use rns_transport::hash::AddressHash;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

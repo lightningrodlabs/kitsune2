@@ -33,7 +33,7 @@ serde_json = { workspace = true, optional = true }
 kitsune2_gossip = { workspace = true }
 kitsune2_test_utils = { workspace = true }
 kitsune2_transport_iroh = { workspace = true, features = ["test-utils"] }
-kitsune2_transport_reticulum = { workspace = true }
+kitsune2_transport_reticulum = { workspace = true, features = ["backend-lxmf"] }
 reticulum-rs-transport = { workspace = true }
 rand_core = { workspace = true }
 sbd-server = { workspace = true }
@@ -58,7 +58,18 @@ transport-iroh = ["dep:kitsune2_transport_iroh"]
 # This does not change the default builder; applications that want the
 # Reticulum transport must call the `reticulum_builder` helper directly
 # and wire in both the transport and bootstrap factories together.
-transport-reticulum = ["dep:kitsune2_transport_reticulum"]
+transport-reticulum = [
+  "dep:kitsune2_transport_reticulum",
+  "kitsune2_transport_reticulum/backend-lxmf",
+]
+
+# Use the reticulum transport with the Beechat backend instead of the
+# LXMF-rs default. Mutually exclusive with `transport-reticulum` (the
+# transport_reticulum crate's compile-time check enforces this).
+transport-reticulum-beechat = [
+  "dep:kitsune2_transport_reticulum",
+  "kitsune2_transport_reticulum/backend-beechat",
+]
 
 schema = [
   "dep:schemars",

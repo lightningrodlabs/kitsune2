@@ -13,23 +13,132 @@
 //! stream, one `(link_id, bytes)` data stream. [`RealEndpoint`] spawns
 //! bridge tasks on construction that perform that fan-in.
 
+use crate::config::{ReticulumInterfaceConfig, ReticulumTransportConfig};
 use crate::destination::{
-    AnnounceInfo, Destination, DynDestination, DynLink, Endpoint, Link, LinkId,
-    LinkStatus,
+    AnnounceInfo, Destination, DynDestination, DynEndpoint, DynLink, Endpoint,
+    Link, LinkId, LinkStatus,
 };
+use crate::types::{AddressHash, DestinationName, Identity, PrivateIdentity};
 use bytes::Bytes;
 use kitsune2_api::{BoxFut, K2Error, K2Result};
 use rand_core::OsRng;
-use rns_transport::destination::{DestinationName, new_out};
-use rns_transport::hash::AddressHash;
-use rns_transport::identity::{Identity, PrivateIdentity};
+use rns_transport::destination::new_out;
 use std::sync::Arc;
 use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Shared handle to a live `rns_transport::Transport`.
 pub(crate) type SharedTransport =
     Arc<TokioMutex<rns_transport::transport::Transport>>;
+
+/// Build a `DynEndpoint` for the LXMF-rs backend from a
+/// `ReticulumTransportConfig` and a caller-supplied identity.
+///
+/// Constructs the underlying `rns_transport::Transport`, applies the
+/// subset of its `TransportConfig` that kitsune2 cares about, brings up
+/// the configured interfaces, and wraps the result in a `RealEndpoint`.
+/// Called from [`crate::node::ReticulumNode::from_config`] so the
+/// backend choice is confined to this crate.
+pub(crate) async fn create_endpoint_from_config(
+    config: &ReticulumTransportConfig,
+    identity: PrivateIdentity,
+) -> K2Result<DynEndpoint> {
+    let identity_hash = identity.as_identity().address_hash;
+
+    // `broadcast: true` is load-bearing. rns's internal `path_table`
+    // only populates routes for Link IDs once an announce has been
+    // observed for that destination; link establishment alone does not
+    // add a route. With `broadcast: false`,
+    // `Transport::send_packet_with_outcome` hits `DroppedNoRoute`
+    // (surfaced to callers as `RnsError::ConnectionError`) whenever
+    // it's asked to send a Data packet to a Link ID that hasn't been
+    // advertised by announce yet — which is the normal case for
+    // resource-manager traffic like our preflight frames on a
+    // freshly-Active link. Setting `broadcast: true` makes the
+    // fallback branch send the packet on all interfaces, which for a
+    // point-to-point TCP interface just means "deliver to the one peer
+    // on the other end." See `tests/two_node_tcp_preflight.rs` for the
+    // regression target.
+    let mut transport_config = rns_transport::transport::TransportConfig::new(
+        format!("kitsune2-{}", identity_hash.to_hex_string()),
+        &identity,
+        true,
+    );
+    transport_config
+        .set_link_idle_timeout_secs(config.link_idle_timeout_s as u64);
+    transport_config
+        .set_link_proof_timeout_secs(config.connect_timeout_s as u64);
+
+    let transport = rns_transport::transport::Transport::new(transport_config);
+    let transport = Arc::new(TokioMutex::new(transport));
+
+    start_interfaces(&transport, &config.interfaces).await?;
+
+    Ok(Arc::new(RealEndpoint::new(transport, identity).await))
+}
+
+/// Serialize a `PrivateIdentity` to bytes for on-disk persistence.
+///
+/// Uses `rns_transport`'s raw-key format — 64 bytes: 32-byte private
+/// key followed by 32-byte signing key. Back-compatible with the
+/// `identity_path` files written before the backend split.
+pub(crate) fn save_identity_bytes(identity: &PrivateIdentity) -> Vec<u8> {
+    identity.to_private_key_bytes().to_vec()
+}
+
+/// Deserialize a `PrivateIdentity` from bytes written by
+/// [`save_identity_bytes`].
+pub(crate) fn load_identity_bytes(bytes: &[u8]) -> K2Result<PrivateIdentity> {
+    PrivateIdentity::from_private_key_bytes(bytes).map_err(|e| {
+        K2Error::other(format!("invalid LXMF-rs identity bytes: {e:?}"))
+    })
+}
+
+/// Spawn each configured interface on the Transport's `InterfaceManager`.
+async fn start_interfaces(
+    transport: &SharedTransport,
+    interfaces: &[ReticulumInterfaceConfig],
+) -> K2Result<()> {
+    let iface_manager = {
+        let t = transport.lock().await;
+        t.iface_manager()
+    };
+    let mut mgr = iface_manager.lock().await;
+    for iface in interfaces {
+        match iface {
+            ReticulumInterfaceConfig::TcpClient { target } => {
+                let client = rns_transport::iface::tcp_client::TcpClient::new(
+                    target.clone(),
+                );
+                mgr.spawn(
+                    client,
+                    rns_transport::iface::tcp_client::TcpClient::spawn,
+                );
+                info!(%target, "Started Reticulum TCP client interface");
+            }
+            ReticulumInterfaceConfig::TcpServer { bind } => {
+                let server = rns_transport::iface::tcp_server::TcpServer::new(
+                    bind.clone(),
+                    iface_manager.clone(),
+                );
+                mgr.spawn(
+                    server,
+                    rns_transport::iface::tcp_server::TcpServer::spawn,
+                );
+                info!(%bind, "Started Reticulum TCP server interface");
+            }
+            ReticulumInterfaceConfig::Udp { bind, group } => {
+                let udp = rns_transport::iface::udp::UdpInterface::new(
+                    bind.clone(),
+                    group.clone(),
+                );
+                mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
+                info!(%bind, ?group, "Started Reticulum UDP interface");
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Buffer size for the bridge channels. Large enough to absorb short
 /// bursts without dropping; an MPSC pressure dropping is worse than

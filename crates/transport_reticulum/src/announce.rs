@@ -6,10 +6,9 @@
 
 use crate::destination::{AnnounceInfo, DynDestination};
 use crate::node::PeerDiscovery;
+use crate::types::{AddressHash, Identity};
 use bytes::Bytes;
 use kitsune2_api::SpaceId;
-use rns_transport::hash::AddressHash;
-use rns_transport::identity::Identity;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;

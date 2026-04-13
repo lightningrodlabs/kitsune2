@@ -1,6 +1,10 @@
 //! Functional test: two `rns_transport::Transport` instances wired
 //! together via an in-process loopback bridge.
 //!
+//! LXMF-rs backend only — this test drives `rns_transport` directly
+//! through an in-process `InterfaceChannel` bridge. The Beechat
+//! backend has a separate TCP-loopback-based functional test.
+//!
 //! The goal here is to exercise the real `RealEndpoint` bridges
 //! (announce, in_link_events, received_data, resource, link closures)
 //! against actual `rns_transport` state — not the in-memory fake —
@@ -28,6 +32,8 @@
 //! one side's tx-receiver and pushes `RxMessage`s (with the peer's
 //! interface address) into the other side's rx-sender. No network, no
 //! TCP — just tokio mpsc.
+
+#![cfg(feature = "backend-lxmf")]
 
 use rand_core::OsRng;
 use rns_transport::destination::DestinationName;

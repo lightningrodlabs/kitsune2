@@ -79,9 +79,60 @@ pub struct ReticulumTransportConfig {
     /// other per-space Links may still be active.
     ///
     /// Default: 600 seconds.
+    ///
+    /// Note: this is honoured by the LXMF-rs backend. The Beechat
+    /// backend uses compile-time constants for link timing and
+    /// silently ignores this value.
     #[serde(default = "default_link_idle_timeout_s")]
     #[schemars(default)]
     pub link_idle_timeout_s: u32,
+
+    /// Beechat-backend-specific tuning.
+    ///
+    /// Fields here only take effect when the `backend-beechat` feature
+    /// is enabled; the LXMF-rs backend ignores them. Each flag is
+    /// `Option<bool>`: `None` leaves the Beechat default in place.
+    #[serde(default)]
+    #[schemars(default)]
+    pub beechat: ReticulumBeechatConfig,
+}
+
+/// Beechat-backend-only `TransportConfig` extras.
+///
+/// The Beechat crate's `TransportConfig` exposes a handful of knobs
+/// — retransmit/broadcast/reroute/restart/announce-forever — that
+/// have no equivalent in the LXMF-rs backend. This struct carries
+/// them through `ReticulumTransportConfig`; `None` means "leave the
+/// Beechat default in place" (all default to `false` upstream).
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct ReticulumBeechatConfig {
+    /// Act as a transport node, forwarding packets for others.
+    #[schemars(default)]
+    pub retransmit: Option<bool>,
+    /// Enable broadcast mode.
+    #[schemars(default)]
+    pub broadcast: Option<bool>,
+    /// Replace known routes to distant destinations with equally-long
+    /// newer routes (not just shorter ones). Prefers newer over older.
+    #[schemars(default)]
+    pub reroute_eager: Option<bool>,
+    /// Auto-restart closed outbound links.
+    #[schemars(default)]
+    pub restart_outlinks: Option<bool>,
+    /// Keep retransmitting announces indefinitely at a slower pace
+    /// after the initial round.
+    #[schemars(default)]
+    pub announce_forever: Option<bool>,
 }
 
 fn default_max_frame_bytes() -> usize {
@@ -137,6 +188,7 @@ impl Default for ReticulumTransportConfig {
             connect_timeout_s: 30,
             announce_interval_s: 300,
             link_idle_timeout_s: 600,
+            beechat: ReticulumBeechatConfig::default(),
         }
     }
 }

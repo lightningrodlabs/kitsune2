@@ -3,11 +3,9 @@
 //! These traits mirror the pattern from `transport_iroh/src/endpoint.rs`,
 //! wrapping `rns_transport` types so unit tests can swap in fakes.
 
+use crate::types::{AddressHash, DestinationName, Identity};
 use bytes::Bytes;
 use kitsune2_api::{BoxFut, K2Result};
-use rns_transport::destination::DestinationName;
-use rns_transport::hash::AddressHash;
-use rns_transport::identity::Identity;
 use std::sync::Arc;
 
 /// LinkId alias -- `rns_transport` uses `AddressHash` directly.
