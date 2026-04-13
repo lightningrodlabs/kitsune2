@@ -153,6 +153,29 @@ impl ReticulumNode {
         Ok(Self::new(endpoint, identity_hash))
     }
 
+    /// Build a `ReticulumNode` around a caller-owned
+    /// `rns_transport::Transport`.
+    ///
+    /// This bypasses the interface startup done by
+    /// [`Self::from_config`] and is useful when the rns `Transport`
+    /// is managed externally — either to share it with other
+    /// rns-stack tooling, or to wire a test harness (see the
+    /// `tests/` integration tests).
+    pub async fn from_rns_transport(
+        transport: Arc<tokio::sync::Mutex<rns_transport::transport::Transport>>,
+        identity: PrivateIdentity,
+    ) -> K2Result<Arc<Self>> {
+        let identity_hash = identity.as_identity().address_hash;
+        let endpoint: DynEndpoint = Arc::new(
+            crate::backend::RealEndpoint::new(transport, identity).await,
+        );
+        info!(
+            ?identity_hash,
+            "ReticulumNode built from caller-owned rns_transport"
+        );
+        Ok(Self::new(endpoint, identity_hash))
+    }
+
     /// Get our local identity address hash.
     pub fn local_identity_hash(&self) -> AddressHash {
         self.local_identity_hash
@@ -171,19 +194,19 @@ impl ReticulumNode {
     }
 
     /// Get the identity cache (shared reference).
-    pub(crate) fn identity_cache(&self) -> &IdentityCache {
+    #[doc(hidden)] pub fn identity_cache(&self) -> &IdentityCache {
         &self.identity_cache
     }
 
     /// Get the space name hashes map (for announce filtering).
-    pub(crate) fn space_name_hashes(
+    #[doc(hidden)] pub fn space_name_hashes(
         &self,
     ) -> &Arc<RwLock<HashMap<[u8; 10], Bytes>>> {
         &self.space_name_hashes
     }
 
     /// Get a sender for peer discovery notifications.
-    pub(crate) fn peer_discovered_tx(
+    #[doc(hidden)] pub fn peer_discovered_tx(
         &self,
     ) -> &tokio::sync::mpsc::Sender<PeerDiscovery> {
         &self.peer_discovered_tx
@@ -191,7 +214,7 @@ impl ReticulumNode {
 
     /// Take the peer discovery receiver (can only be called once).
     /// Consumed by the transport's bootstrap drain task.
-    pub(crate) async fn take_peer_discovered_rx(
+    #[doc(hidden)] pub async fn take_peer_discovered_rx(
         &self,
     ) -> Option<tokio::sync::mpsc::Receiver<PeerDiscovery>> {
         self.peer_discovered_rx.lock().await.take()
@@ -214,7 +237,7 @@ impl ReticulumNode {
 
     /// Get the current `AgentInfoSigned` bytes to include as `app_data`
     /// in announces for the given space, if one has been set.
-    pub(crate) fn get_my_agent_info(&self, space_id: &SpaceId) -> Option<Bytes> {
+    #[doc(hidden)] pub fn get_my_agent_info(&self, space_id: &SpaceId) -> Option<Bytes> {
         self.my_agent_infos
             .read()
             .expect("poisoned")
@@ -262,6 +285,18 @@ impl ReticulumNode {
     /// Get a reference to the endpoint.
     pub(crate) fn endpoint(&self) -> &DynEndpoint {
         &self.endpoint
+    }
+
+    /// Public: register a space without exposing the internal
+    /// `Destination` trait. Returns the destination's `AddressHash`
+    /// so the caller can correlate it back to a SpaceId.
+    #[doc(hidden)]
+    pub async fn register_space_for_test(
+        &self,
+        space_id: &SpaceId,
+    ) -> K2Result<AddressHash> {
+        let dest = self.register_space(space_id).await?;
+        Ok(dest.address_hash())
     }
 
     /// Register a space: create a Reticulum destination for it

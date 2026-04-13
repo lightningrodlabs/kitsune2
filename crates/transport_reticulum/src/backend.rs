@@ -302,14 +302,29 @@ fn spawn_outbound_link_close_bridge(
 /// rns_transport's internal forwarder sets `ReceivedData.destination =
 /// link_id` for data received via a Link::Data event (`data_packet`
 /// traffic), so we can use that field directly as the LinkId.
+///
+/// **Important:** `received_data_events` also sees individual resource
+/// fragments (`PacketContext::Resource` and friends) — those must be
+/// filtered out, otherwise the data router would see fragments
+/// in addition to the assembled `ResourceEvent::Complete` payloads
+/// the resource bridge forwards. We let through only generic-data
+/// (`PacketContext::None`) packets — the framing the kitsune2 data
+/// router expects.
 fn spawn_received_data_bridge(
     mut rx: broadcast::Receiver<rns_transport::transport::ReceivedData>,
     tx: mpsc::Sender<(LinkId, Bytes)>,
 ) {
+    use rns_transport::packet::PacketContext;
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(ev) => {
+                    // Skip resource fragments — the resource bridge
+                    // delivers the reassembled whole.
+                    if !matches!(ev.context, Some(PacketContext::None) | None)
+                    {
+                        continue;
+                    }
                     let link_id = ev.destination;
                     let data = Bytes::copy_from_slice(ev.data.as_slice());
                     if tx.send((link_id, data)).await.is_err() {

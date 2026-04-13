@@ -75,7 +75,7 @@ pub(crate) fn filter_announce_by_space(
 /// filters by name_hash, updates the identity cache, and pushes
 /// matching announces (with their `app_data`) to the peer-discovered
 /// drain.
-pub(crate) fn spawn_announce_listener(
+pub fn spawn_announce_listener(
     mut rx: broadcast::Receiver<AnnounceInfo>,
     identity_cache: IdentityCache,
     space_name_hashes: Arc<RwLock<HashMap<[u8; 10], Bytes>>>,

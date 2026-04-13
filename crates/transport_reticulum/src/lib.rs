@@ -68,6 +68,44 @@ pub use config::{
 };
 pub use node::ReticulumNode;
 
+/// Internals re-exported for this crate's `tests/` integration tests.
+///
+/// This module is **not** part of the stable public API. It exists so
+/// the crate's own integration tests can wire the bootstrap pipeline
+/// by hand — consumers should never depend on these symbols.
+#[doc(hidden)]
+pub mod internal_testing {
+    use super::*;
+
+    pub use crate::bootstrap::ReticulumBootstrap;
+
+    /// Spawn the announce listener + bootstrap drain for a standalone
+    /// `ReticulumNode` that isn't running under a full
+    /// `ReticulumTransport`. Mirrors the wiring done inside
+    /// `ReticulumTransport::create`. Returns handles the caller must
+    /// retain until the test finishes.
+    pub async fn wire_bootstrap_pipeline(
+        node: Arc<ReticulumNode>,
+    ) -> K2Result<Vec<tokio::task::AbortHandle>> {
+        let ann_rx = node.endpoint().recv_announces().await?;
+        let listener = crate::announce::spawn_announce_listener(
+            ann_rx,
+            node.identity_cache().clone(),
+            node.space_name_hashes().clone(),
+            node.peer_discovered_tx().clone(),
+        );
+        let drain_rx =
+            node.take_peer_discovered_rx().await.ok_or_else(|| {
+                K2Error::other("peer_discovered rx already taken")
+            })?;
+        let drain = crate::bootstrap::spawn_bootstrap_drain(
+            drain_rx,
+            node.clone(),
+        );
+        Ok(vec![listener, drain])
+    }
+}
+
 /// Kitsune2 transport factory backed by Reticulum.
 #[derive(Debug)]
 pub struct ReticulumTransportFactory {

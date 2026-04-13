@@ -3,7 +3,7 @@
 use kitsune2_api::{K2Error, K2Result};
 
 /// Configuration for the Reticulum transport.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ReticulumTransportConfig {
@@ -63,7 +63,7 @@ pub struct ReticulumTransportConfig {
 }
 
 /// Configuration for a single Reticulum interface.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ReticulumInterfaceConfig {
@@ -132,7 +132,7 @@ impl ReticulumTransportConfig {
 }
 
 /// Module-level config wrapper, matching the `ModConfig` pattern.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ReticulumTransportModConfig {

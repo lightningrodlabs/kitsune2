@@ -45,6 +45,10 @@ use kitsune2_transport_tx5::Tx5TransportFactory;
 /// - `publish` - The default publish module is [factories::CorePublishFactory].
 /// - `blocks` - The default blocks module is [factories::MemBlocksFactory].
 ///   Note: you will likely want to implement your own [`Blocks`] module.
+#[cfg(any(
+    feature = "transport-tx5-backend-go-pion",
+    feature = "transport-iroh"
+))]
 pub fn default_builder() -> Builder {
     Builder {
         config: Config::default(),

@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 /// Bootstrap implementation backed by Reticulum announces.
 #[derive(Debug)]
-pub(crate) struct ReticulumBootstrap {
+pub struct ReticulumBootstrap {
     node: Arc<ReticulumNode>,
     space_id: SpaceId,
 }
@@ -89,7 +89,7 @@ impl Drop for ReticulumBootstrap {
 ///
 /// Events for unbound spaces, or with empty / invalid app_data, are
 /// logged and dropped.
-pub(crate) fn spawn_bootstrap_drain(
+pub fn spawn_bootstrap_drain(
     mut rx: tokio::sync::mpsc::Receiver<crate::node::PeerDiscovery>,
     node: Arc<ReticulumNode>,
 ) -> tokio::task::AbortHandle {
