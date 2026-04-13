@@ -6,15 +6,12 @@
 //! hold an `Arc<ReticulumNode>`.
 
 use crate::announce::{self, IdentityCache};
-use crate::backend::RealEndpoint;
-use crate::config::{ReticulumInterfaceConfig, ReticulumTransportConfig};
+use crate::config::ReticulumTransportConfig;
 use crate::destination::{DynDestination, DynEndpoint};
+use crate::types::{AddressHash, DestinationName, Identity, PrivateIdentity};
 use bytes::Bytes;
 use kitsune2_api::{DynPeerStore, DynVerifier, K2Error, K2Result, SpaceId};
 use rand_core::OsRng;
-use rns_transport::destination::DestinationName;
-use rns_transport::hash::AddressHash;
-use rns_transport::identity::{Identity, PrivateIdentity};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
@@ -122,46 +119,12 @@ impl ReticulumNode {
         let identity = load_or_generate_identity(&config).await?;
         let identity_hash = identity.as_identity().address_hash;
 
-        // Tune the rns transport with config values we care about.
-        //
-        // `broadcast: true` is load-bearing. rns's internal
-        // `path_table` only populates routes for Link IDs once an
-        // announce has been observed for that destination; link
-        // establishment alone does not add a route. With
-        // `broadcast: false`, `Transport::send_packet_with_outcome`
-        // hits `DroppedNoRoute` (surfaced to callers as
-        // `RnsError::ConnectionError`) whenever it's asked to send a
-        // Data packet to a Link ID that hasn't been advertised by
-        // announce yet — which is the normal case for resource-manager
-        // traffic like our preflight frames on a freshly-Active link.
-        //
-        // Setting `broadcast: true` makes the fallback branch send the
-        // packet on all interfaces, which for a point-to-point TCP
-        // interface just means "deliver to the one peer on the other
-        // end." It matches the pattern the in-process loopback
-        // integration tests use (see `two_node_data.rs`) and is what
-        // unblocks real-TCP deployments. See
-        // `tests/two_node_tcp_preflight.rs` for the regression target.
-        let mut transport_config =
-            rns_transport::transport::TransportConfig::new(
-                format!("kitsune2-{}", identity_hash.to_hex_string()),
-                &identity,
-                true,
-            );
-        transport_config
-            .set_link_idle_timeout_secs(config.link_idle_timeout_s as u64);
-        transport_config
-            .set_link_proof_timeout_secs(config.connect_timeout_s as u64);
-
-        let transport =
-            rns_transport::transport::Transport::new(transport_config);
-        let transport = Arc::new(tokio::sync::Mutex::new(transport));
-
-        // Bring up each configured interface.
-        start_interfaces(&transport, &config.interfaces).await?;
-
-        let endpoint: DynEndpoint =
-            Arc::new(RealEndpoint::new(transport, identity).await);
+        // Backend-specific endpoint construction: builds the underlying
+        // Reticulum transport, starts configured interfaces, and wraps
+        // everything in a `RealEndpoint`.
+        let endpoint =
+            crate::backend::create_endpoint_from_config(&config, identity)
+                .await?;
 
         info!(
             ?identity_hash,
@@ -180,6 +143,7 @@ impl ReticulumNode {
     /// is managed externally — either to share it with other
     /// rns-stack tooling, or to wire a test harness (see the
     /// `tests/` integration tests).
+    #[cfg(feature = "backend-lxmf")]
     pub async fn from_rns_transport(
         transport: Arc<tokio::sync::Mutex<rns_transport::transport::Transport>>,
         identity: PrivateIdentity,
@@ -376,7 +340,7 @@ async fn load_or_generate_identity(
                         e,
                     )
                 })?;
-                PrivateIdentity::from_private_key_bytes(&bytes).map_err(|e| {
+                crate::backend::load_identity_bytes(&bytes).map_err(|e| {
                     K2Error::other(format!(
                         "Invalid identity file {}: {e:?}",
                         path.display()
@@ -384,7 +348,7 @@ async fn load_or_generate_identity(
                 })
             } else {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
-                let bytes = identity.to_private_key_bytes();
+                let bytes = crate::backend::save_identity_bytes(&identity);
                 tokio::fs::write(path, bytes).await.map_err(|e| {
                     K2Error::other_src(
                         format!(
@@ -403,52 +367,6 @@ async fn load_or_generate_identity(
             Ok(PrivateIdentity::new_from_rand(OsRng))
         }
     }
-}
-
-/// Spawn each configured interface on the Transport's `InterfaceManager`.
-async fn start_interfaces(
-    transport: &Arc<tokio::sync::Mutex<rns_transport::transport::Transport>>,
-    interfaces: &[ReticulumInterfaceConfig],
-) -> K2Result<()> {
-    let iface_manager = {
-        let t = transport.lock().await;
-        t.iface_manager()
-    };
-    let mut mgr = iface_manager.lock().await;
-    for iface in interfaces {
-        match iface {
-            ReticulumInterfaceConfig::TcpClient { target } => {
-                let client = rns_transport::iface::tcp_client::TcpClient::new(
-                    target.clone(),
-                );
-                mgr.spawn(
-                    client,
-                    rns_transport::iface::tcp_client::TcpClient::spawn,
-                );
-                info!(%target, "Started Reticulum TCP client interface");
-            }
-            ReticulumInterfaceConfig::TcpServer { bind } => {
-                let server = rns_transport::iface::tcp_server::TcpServer::new(
-                    bind.clone(),
-                    iface_manager.clone(),
-                );
-                mgr.spawn(
-                    server,
-                    rns_transport::iface::tcp_server::TcpServer::spawn,
-                );
-                info!(%bind, "Started Reticulum TCP server interface");
-            }
-            ReticulumInterfaceConfig::Udp { bind, group } => {
-                let udp = rns_transport::iface::udp::UdpInterface::new(
-                    bind.clone(),
-                    group.clone(),
-                );
-                mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
-                info!(%bind, ?group, "Started Reticulum UDP interface");
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Helper to hex-encode a space ID for use as a Reticulum aspect.

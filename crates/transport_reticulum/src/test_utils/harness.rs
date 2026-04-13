@@ -17,11 +17,9 @@ use crate::destination::{
     AnnounceInfo, Destination, DynDestination, DynLink, Endpoint, Link, LinkId,
     LinkStatus,
 };
+use crate::types::{AddressHash, DestinationName, Identity};
 use bytes::Bytes;
 use kitsune2_api::{BoxFut, K2Result};
-use rns_transport::destination::DestinationName;
-use rns_transport::hash::AddressHash;
-use rns_transport::identity::Identity;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 
@@ -336,6 +334,6 @@ pub fn fake_announce(
 /// and reuse the returned value.
 pub fn fake_identity() -> Identity {
     use rand_core::OsRng;
-    let pi = rns_transport::identity::PrivateIdentity::new_from_rand(OsRng);
+    let pi = crate::types::PrivateIdentity::new_from_rand(OsRng);
     *pi.as_identity()
 }

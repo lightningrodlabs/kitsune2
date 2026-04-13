@@ -150,7 +150,7 @@ impl PeerState {
 mod tests {
     use super::*;
     use crate::destination::{LinkId, LinkStatus};
-    use rns_transport::hash::AddressHash;
+    use crate::types::AddressHash;
 
     /// A fake link for testing peer_state logic.
     #[derive(Debug)]

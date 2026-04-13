@@ -6,8 +6,8 @@
 //! by destination hash, not by IP. The path carries the peer's stable
 //! Identity address hash as a lowercase hex string.
 
+use crate::types::AddressHash;
 use kitsune2_api::{K2Error, K2Result, Url};
-use rns_transport::hash::AddressHash;
 
 /// The constant authority used in `ret://` URLs.
 const RET_AUTHORITY: &str = "reticulum:1";

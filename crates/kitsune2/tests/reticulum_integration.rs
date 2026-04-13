@@ -147,6 +147,7 @@ async fn make_kitsune_node(node: Arc<ReticulumNode>) -> DynKitsune {
                 // Tight so peers discover each other quickly in-test.
                 announce_interval_s: 1,
                 link_idle_timeout_s: 60,
+                beechat: Default::default(),
             },
         })
         .unwrap();

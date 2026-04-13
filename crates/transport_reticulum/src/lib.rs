@@ -30,10 +30,35 @@
 //! mirroring the Iroh transport's endpoint abstraction. This allows unit
 //! tests to swap in fakes without a real Reticulum network.
 
-mod backend;
+// Exactly one Reticulum backend must be enabled. The feature-propagation
+// chain mirrors `transport_tx5`'s backend selection: the consuming crate
+// flips a `backend-*` feature, which this crate re-exports to the right
+// upstream dependency. See `PLAN-beechat-backend.md` §1 for details.
+#[cfg(all(feature = "backend-lxmf", feature = "backend-beechat"))]
+compile_error!(
+    "Only one Reticulum backend may be enabled at a time \
+     (backend-lxmf and backend-beechat are mutually exclusive)"
+);
+
+#[cfg(not(any(feature = "backend-lxmf", feature = "backend-beechat")))]
+compile_error!(
+    "A Reticulum backend must be enabled: either backend-lxmf or backend-beechat"
+);
+
+#[cfg(feature = "backend-lxmf")]
+mod backend_lxmf;
+#[cfg(feature = "backend-lxmf")]
+use backend_lxmf as backend;
+
+#[cfg(feature = "backend-beechat")]
+mod backend_beechat;
+#[cfg(feature = "backend-beechat")]
+use backend_beechat as backend;
+
 mod config;
 mod destination;
 mod frame;
+mod types;
 mod url;
 
 mod announce;
@@ -130,10 +155,10 @@ pub mod internal_testing {
         super::create_reticulum_transport(config, handler, node).await
     }
 
-    /// Convert an rns Identity address hash into the canonical
+    /// Convert a Reticulum Identity address hash into the canonical
     /// `ret://reticulum:1/<hex>` URL used to address a peer.
     pub fn identity_hash_to_url(
-        hash: &rns_transport::hash::AddressHash,
+        hash: &crate::types::AddressHash,
     ) -> K2Result<Url> {
         crate::url::identity_hash_to_url(hash)
     }
@@ -274,10 +299,8 @@ impl ReticulumTransport {
 
         // Build the shared RouterState that both routers and TxImp::send
         // consult.
-        let router_state = RouterState::new(
-            config.max_frame_bytes,
-            config.connect_timeout_s,
-        );
+        let router_state =
+            RouterState::new(config.max_frame_bytes, config.connect_timeout_s);
 
         // Spawn the global announce listener (identity cache + bootstrap
         // candidate queue), the inbound-link router, and the data router.
@@ -564,11 +587,8 @@ impl TxImp for ReticulumTransport {
                 if ps.link_count() == 0 {
                     continue;
                 }
-                let ready = ps
-                    .preflight_state
-                    .lock()
-                    .expect("poisoned")
-                    .is_ready();
+                let ready =
+                    ps.preflight_state.lock().expect("poisoned").is_ready();
                 if !ready {
                     // Skip mid-setup peers so a "ready" count is
                     // meaningful, but also log so we can see stuck

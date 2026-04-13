@@ -6,6 +6,11 @@
 //! This is the end-to-end smoke test for the announce + bootstrap
 //! pipeline against real `rns_transport` state — wired through an
 //! in-process interface loopback rather than over TCP.
+//!
+//! LXMF-rs backend only — the Beechat backend has a separate
+//! TCP-loopback-based functional test.
+
+#![cfg(feature = "backend-lxmf")]
 
 use bytes::Bytes;
 use kitsune2_api::{

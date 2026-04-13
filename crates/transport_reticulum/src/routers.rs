@@ -24,10 +24,10 @@
 use crate::destination::{DynEndpoint, DynLink, LinkId, LinkStatus};
 use crate::frame::{ReticulumFrame, decode_frame, encode_frame};
 use crate::peer_state::PeerState;
+use crate::types::AddressHash;
 use crate::url::identity_hash_to_url;
 use bytes::Bytes;
 use kitsune2_api::{SpaceId, TxImpHnd, Url};
-use rns_transport::hash::AddressHash;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::task::AbortHandle;
@@ -184,9 +184,8 @@ async fn route_new_link(
         // First link to this peer: wait for the rns link proof
         // round-trip to settle, then kick off preflight so the peer
         // knows it can start sending to us.
-        let wait_timeout = std::time::Duration::from_secs(
-            state.connect_timeout_s as u64,
-        );
+        let wait_timeout =
+            std::time::Duration::from_secs(state.connect_timeout_s as u64);
         if let Err(e) = wait_for_link_active(link, wait_timeout).await {
             warn!(
                 ?e,

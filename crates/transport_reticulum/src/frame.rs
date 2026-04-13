@@ -29,9 +29,9 @@
 //! store has the agent under another, and kitsune2's block check
 //! filters them all out.
 
+use crate::types::AddressHash;
 use bytes::Bytes;
 use kitsune2_api::{K2Error, K2Result};
-use rns_transport::hash::AddressHash;
 
 /// Tag byte for preflight frames.
 const TAG_PREFLIGHT: u8 = 0x00;

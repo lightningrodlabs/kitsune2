@@ -24,6 +24,12 @@
 //! This is the test that surfaces the remaining step-15 risks
 //! (event ordering between activation and find_in_link, single-
 //! fragment Resource for tiny preflight frames, link-close cleanup).
+//!
+//! LXMF-rs backend only — this test drives `rns_transport` directly
+//! through an in-process interface loopback. The Beechat backend
+//! has a separate TCP-loopback test (`two_node_beechat.rs`).
+
+#![cfg(feature = "backend-lxmf")]
 
 use bytes::Bytes;
 use kitsune2_api::{
@@ -162,6 +168,7 @@ fn k2_config() -> ReticulumTransportConfig {
         // of cycles, slow enough not to flood the bridge.
         announce_interval_s: 1,
         link_idle_timeout_s: 60,
+        beechat: Default::default(),
     }
 }
 

@@ -9,14 +9,12 @@ use crate::bootstrap::{ReticulumBootstrap, spawn_bootstrap_drain};
 use crate::destination::Endpoint;
 use crate::node::ReticulumNode;
 use crate::test_utils::{FakeEndpoint, fake_announce};
+use crate::types::{AddressHash, DestinationName, PrivateIdentity};
 use bytes::Bytes;
 use kitsune2_api::{
     AgentId, AgentInfo, AgentInfoSigned, Bootstrap, DhtArc, DynPeerStore,
     DynVerifier, K2Result, SpaceId, Timestamp, Url, Verifier,
 };
-use rns_transport::destination::DestinationName;
-use rns_transport::hash::AddressHash;
-use rns_transport::identity::PrivateIdentity;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;

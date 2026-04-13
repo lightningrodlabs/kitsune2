@@ -1,3 +1,5 @@
+#![cfg(feature = "backend-lxmf")]
+
 //! Regression test for the "freshly-Active link" `send_resource` race.
 //!
 //! # Why this test exists
@@ -38,8 +40,8 @@ use kitsune2_api::{
     TxSpaceHandler, Url,
 };
 use kitsune2_transport_reticulum::{
-    internal_testing, ReticulumInterfaceConfig, ReticulumNode,
-    ReticulumTransportConfig,
+    ReticulumInterfaceConfig, ReticulumNode, ReticulumTransportConfig,
+    internal_testing,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -118,6 +120,7 @@ fn cfg_with_interface(
         connect_timeout_s: 10,
         announce_interval_s: 1,
         link_idle_timeout_s: 60,
+        beechat: Default::default(),
     }
 }
 
@@ -162,14 +165,20 @@ async fn preflight_roundtrip_over_tcp() {
     let dyn_a: DynTxHandler = h_a.clone();
     let dyn_b: DynTxHandler = h_b.clone();
 
-    let trans_a =
-        internal_testing::create_transport(cfg_a.clone(), dyn_a, node_a.clone())
-            .await
-            .unwrap();
-    let trans_b =
-        internal_testing::create_transport(cfg_b.clone(), dyn_b, node_b.clone())
-            .await
-            .unwrap();
+    let trans_a = internal_testing::create_transport(
+        cfg_a.clone(),
+        dyn_a,
+        node_a.clone(),
+    )
+    .await
+    .unwrap();
+    let trans_b = internal_testing::create_transport(
+        cfg_b.clone(),
+        dyn_b,
+        node_b.clone(),
+    )
+    .await
+    .unwrap();
 
     // Register space handlers — this kicks off per-space destinations
     // and their announce publishers, enabling cross-node discovery.
