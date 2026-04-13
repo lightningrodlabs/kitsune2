@@ -209,14 +209,15 @@ impl Destination for FakeDestination {
 }
 
 /// Fake link — records sends, exposes a controllable status.
-pub struct FakeLink {
+pub(crate) struct FakeLink {
     id: LinkId,
     peer_hash: AddressHash,
+    local_dest_hash: AddressHash,
     status: Mutex<LinkStatus>,
     /// Every `data_packet(data)` call's bytes.
-    pub sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub(crate) sent: Arc<Mutex<Vec<Vec<u8>>>>,
     /// True if `teardown()` was called.
-    pub torn_down: Arc<Mutex<bool>>,
+    pub(crate) torn_down: Arc<Mutex<bool>>,
 }
 
 impl std::fmt::Debug for FakeLink {
@@ -229,11 +230,12 @@ impl std::fmt::Debug for FakeLink {
 }
 
 impl FakeLink {
-    /// Create a fake link with given id bytes and peer hash bytes.
-    pub fn new(id: u8, peer: u8) -> Arc<Self> {
+    /// Create a fake link with given id / peer / local destination seed bytes.
+    pub(crate) fn new(id: u8, peer: u8, local_dest: u8) -> Arc<Self> {
         Arc::new(Self {
             id: AddressHash::new([id; 16]),
             peer_hash: AddressHash::new([peer; 16]),
+            local_dest_hash: AddressHash::new([local_dest; 16]),
             status: Mutex::new(LinkStatus::Active),
             sent: Arc::new(Mutex::new(Vec::new())),
             torn_down: Arc::new(Mutex::new(false)),
@@ -241,7 +243,8 @@ impl FakeLink {
     }
 
     /// Change the link status (e.g. to simulate a disconnect).
-    pub fn set_status(&self, status: LinkStatus) {
+    #[allow(dead_code)]
+    pub(crate) fn set_status(&self, status: LinkStatus) {
         *self.status.lock().unwrap() = status;
     }
 }
@@ -253,6 +256,10 @@ impl Link for FakeLink {
 
     fn peer_identity_hash(&self) -> AddressHash {
         self.peer_hash
+    }
+
+    fn local_destination_hash(&self) -> AddressHash {
+        self.local_dest_hash
     }
 
     fn status(&self) -> LinkStatus {

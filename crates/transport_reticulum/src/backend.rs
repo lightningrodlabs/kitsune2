@@ -265,6 +265,7 @@ pub(crate) struct RealLink {
     inner: Arc<TokioMutex<rns_transport::destination::link::Link>>,
     id: LinkId,
     peer_hash: AddressHash,
+    local_dest_hash: AddressHash,
 }
 
 impl std::fmt::Debug for RealLink {
@@ -283,6 +284,10 @@ impl Link for RealLink {
 
     fn peer_identity_hash(&self) -> AddressHash {
         self.peer_hash
+    }
+
+    fn local_destination_hash(&self) -> AddressHash {
+        self.local_dest_hash
     }
 
     fn status(&self) -> LinkStatus {

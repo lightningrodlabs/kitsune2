@@ -36,6 +36,16 @@ pub(crate) trait Link: Send + Sync + std::fmt::Debug {
     /// Get the peer's public Identity address hash.
     fn peer_identity_hash(&self) -> AddressHash;
 
+    /// Get the address hash of the **local** destination this link
+    /// terminates at.
+    ///
+    /// For inbound links, this tells us *which of our per-space
+    /// destinations* the peer linked to, so the links router can map
+    /// the link to a SpaceId. For outbound links we already know the
+    /// destination, but exposing it here uniformly keeps the router
+    /// logic symmetric.
+    fn local_destination_hash(&self) -> AddressHash;
+
     /// Get the current link status.
     fn status(&self) -> LinkStatus;
 

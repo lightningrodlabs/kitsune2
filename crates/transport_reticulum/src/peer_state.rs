@@ -18,7 +18,7 @@ pub(crate) struct LinkContext {
 }
 
 /// Preflight state for a peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreflightState {
     /// Preflight exchange has not started.
     None,
@@ -121,6 +121,9 @@ mod tests {
             self.id
         }
         fn peer_identity_hash(&self) -> AddressHash {
+            AddressHash::new([0u8; 16])
+        }
+        fn local_destination_hash(&self) -> AddressHash {
             AddressHash::new([0u8; 16])
         }
         fn status(&self) -> LinkStatus {

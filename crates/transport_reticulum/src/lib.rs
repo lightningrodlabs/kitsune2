@@ -41,6 +41,7 @@ mod bootstrap;
 mod link;
 mod node;
 mod peer_state;
+mod routers;
 
 #[cfg(test)]
 mod test_utils;
@@ -49,6 +50,7 @@ mod test_utils;
 mod tests;
 
 use crate::peer_state::*;
+use crate::routers::RouterState;
 use crate::url::*;
 
 use bytes::Bytes;
@@ -155,8 +157,10 @@ struct ReticulumTransport {
     node: Arc<ReticulumNode>,
     handler: Arc<TxImpHnd>,
     local_url: Arc<RwLock<Option<Url>>>,
-    peer_states: Arc<RwLock<HashMap<Url, Arc<PeerState>>>>,
     config: ReticulumTransportConfig,
+    /// Routers' shared state: dest-hash→space map, peer-state map,
+    /// link registry.
+    router_state: RouterState,
     /// Per-space task abort handles, cleaned up on drop.
     space_tasks: Arc<Mutex<HashMap<SpaceId, Vec<AbortHandle>>>>,
     /// Global (transport-scoped) task abort handles.
@@ -195,9 +199,12 @@ impl ReticulumTransport {
         // Emit our listening address immediately -- it is deterministic.
         handler.new_listening_address(local_url).await;
 
-        // Spawn the global announce listener. This runs for the lifetime of
-        // the transport, populating the identity cache and pushing matches
-        // into the per-space peer-discovered queue for the bootstrap layer.
+        // Build the shared RouterState that both routers and TxImp::send
+        // consult.
+        let router_state = RouterState::new(config.max_frame_bytes);
+
+        // Spawn the global announce listener (identity cache + bootstrap
+        // candidate queue), the inbound-link router, and the data router.
         let announce_rx = node.endpoint().recv_announces().await?;
         let announce_listener_handle = announce::spawn_announce_listener(
             announce_rx,
@@ -206,18 +213,36 @@ impl ReticulumTransport {
             node.peer_discovered_tx().clone(),
         );
 
+        let links_rx = node.endpoint().recv_links().await?;
+        let links_router_handle = routers::spawn_links_router(
+            links_rx,
+            router_state.clone(),
+            handler.clone(),
+            node.endpoint().clone(),
+        );
+
+        let data_rx = node.endpoint().recv_resource_data().await?;
+        let data_router_handle = routers::spawn_data_router(
+            data_rx,
+            router_state.clone(),
+            handler.clone(),
+        );
+
         let out: DynTxImp = Arc::new(Self {
             node,
             handler,
             local_url: url_holder,
-            peer_states: Arc::new(RwLock::new(HashMap::new())),
             config,
+            router_state,
             space_tasks: Arc::new(Mutex::new(HashMap::new())),
-            global_tasks: Mutex::new(vec![announce_listener_handle]),
+            global_tasks: Mutex::new(vec![
+                announce_listener_handle,
+                links_router_handle,
+                data_router_handle,
+            ]),
         });
         Ok(out)
     }
-
 }
 
 impl TxImp for ReticulumTransport {
@@ -230,52 +255,128 @@ impl TxImp for ReticulumTransport {
         peer: Url,
         _payload: Option<(String, Bytes)>,
     ) -> BoxFut<'_, ()> {
-        if let Some(state) =
-            self.peer_states.write().expect("poisoned").remove(&peer)
+        if let Some(state) = self
+            .router_state
+            .peer_states
+            .write()
+            .expect("poisoned")
+            .remove(&peer)
         {
             state.teardown_all_links();
         }
+        // Drop any link registry entries pointing at this peer.
+        self.router_state
+            .link_registry
+            .write()
+            .expect("poisoned")
+            .retain(|_, (url, _)| url != &peer);
         Box::pin(async {})
     }
 
     fn send(&self, remote_url: Url, data: Bytes) -> BoxFut<'_, K2Result<()>> {
         let node = self.node.clone();
         let handler = self.handler.clone();
-        let peer_states = self.peer_states.clone();
+        let router_state = self.router_state.clone();
         let config = self.config.clone();
 
         Box::pin(async move {
-            // Extract space_id from the K2Proto payload for per-space link routing.
-            let space_id_bytes = extract_space_id(&data)?;
-
-            let space_id = match space_id_bytes {
+            // Extract space_id from the encoded K2Proto so we know which
+            // per-space link to route over.
+            let space_id = match extract_space_id(&data)? {
                 Some(id) => SpaceId::from(id),
                 None => {
-                    // Preflight messages have no space_id.
-                    // Route over the first available per-space link.
+                    // Preflight messages carry space_id=None. They are
+                    // emitted by TxImpHnd::peer_connect as a response to
+                    // an inbound peer_connect trigger -- but here in
+                    // `send`, kitsune2's high-level callers only emit
+                    // Notify/Module frames, which always carry space_id.
+                    // If we hit this branch it's a bug in the caller.
                     return Err(K2Error::other(
-                        "Cannot route message without space_id and no existing link",
+                        "TxImp::send called with no space_id (bug in caller)",
                     ));
                 }
             };
 
             // Resolve the remote identity from our announce cache.
             let identity_hash = url_to_identity_hash(&remote_url)?;
-
-            let peer_identity =
-                node.get_peer_identity(&identity_hash).ok_or_else(|| {
-                    K2Error::other(format!(
+            let peer_identity = match node.get_peer_identity(&identity_hash) {
+                Some(id) => id,
+                None => {
+                    // Peer not yet discovered via announce. Mark unresponsive
+                    // so kitsune2 doesn't keep retrying on the same URL.
+                    let _ = handler
+                        .set_unresponsive(remote_url.clone(), Timestamp::now())
+                        .await;
+                    return Err(K2Error::other(format!(
                         "No known identity for peer {remote_url}"
-                    ))
-                })?;
+                    )));
+                }
+            };
 
-            // Suppress unused warnings while send path is scaffolded.
-            let _ = (peer_states, handler, config.max_frame_bytes);
+            // Get (or create) an outbound link for this (peer, space).
+            let peer_state = {
+                let mut states =
+                    router_state.peer_states.write().expect("poisoned");
+                states
+                    .entry(remote_url.clone())
+                    .or_insert_with(PeerState::new)
+                    .clone()
+            };
 
-            node.send_to_peer(
-                &peer_identity,
-                &space_id,
-                &data,
+            let link = match peer_state.get_link(&space_id) {
+                Some(l) => l,
+                None => {
+                    // Open a new link to this peer's per-space destination.
+                    let space_hash = hex_encode_space(&space_id);
+                    let link = node
+                        .endpoint()
+                        .link_to(
+                            peer_identity,
+                            "kitsune2".to_string(),
+                            space_hash,
+                        )
+                        .await?;
+
+                    let first_link = peer_state
+                        .insert_link(space_id.clone(), link.clone());
+                    router_state
+                        .link_registry
+                        .write()
+                        .expect("poisoned")
+                        .insert(
+                            link.id(),
+                            (remote_url.clone(), space_id.clone()),
+                        );
+
+                    if first_link {
+                        routers::start_preflight(
+                            &remote_url,
+                            &link,
+                            &peer_state,
+                            &handler,
+                            node.endpoint(),
+                            config.max_frame_bytes,
+                        )
+                        .await?;
+                    }
+                    link
+                }
+            };
+
+            // Encode as a Data frame and send. The data router on the
+            // remote side will gate on preflight readiness; locally we
+            // fire-and-forget -- any queued data before preflight
+            // completes will be sent now and the remote may drop it.
+            // This matches the plan's §3 shape: kitsune2's send layer
+            // doesn't retry, the sender is expected to know the link
+            // is ready before calling.
+            let frame = frame::ReticulumFrame::Data(data);
+            let encoded =
+                frame::encode_frame(&frame, config.max_frame_bytes)?;
+            routers::send_over_link(
+                &link,
+                &encoded,
+                node.endpoint(),
                 config.max_frame_bytes,
             )
             .await
@@ -285,6 +386,7 @@ impl TxImp for ReticulumTransport {
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
         Box::pin(async {
             Ok(self
+                .router_state
                 .peer_states
                 .read()
                 .expect("poisoned")
@@ -310,18 +412,20 @@ impl TxImp for ReticulumTransport {
     }
 
     fn register_space(&self, space_id: SpaceId) {
-        // We need `Arc<Self>` so our spawned task can call
-        // `spawn_space_tasks`. The hook is called from
-        // `DefaultTransport::register_space_handler`, which holds us as
-        // `DynTxImp = Arc<dyn TxImp>` already; reaching back to a concrete
-        // `Arc<Self>` from here isn't possible through the trait. Instead,
-        // clone the fields we actually need and spawn a detached task.
+        // The hook is synchronous, but destination creation is async.
+        // Clone fields and spawn a detached task that creates the
+        // destination, registers its address hash with the router
+        // state (so inbound links for this space can be matched), and
+        // starts the per-space announce publisher.
         let node = self.node.clone();
         let space_tasks = self.space_tasks.clone();
+        let router_state = self.router_state.clone();
         let interval = self.config.announce_interval_s;
         tokio::spawn(async move {
             match node.register_space(&space_id).await {
                 Ok(dest) => {
+                    router_state
+                        .register_dest(dest.address_hash(), space_id.clone());
                     let h =
                         announce::spawn_announce_publisher(dest, interval);
                     space_tasks
@@ -359,8 +463,16 @@ impl TxImp for ReticulumTransport {
                 h.abort();
             }
         }
+        self.router_state.unregister_space(&space_id);
         node.unregister_space(&space_id);
     }
+}
+
+/// Hex-encode a SpaceId for use as a Reticulum aspect string
+/// (matches the encoding used in `ReticulumNode::register_space`).
+fn hex_encode_space(space_id: &SpaceId) -> String {
+    let bytes: &[u8] = space_id.as_ref();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Extract the `space_id` field from an encoded `K2Proto` message
