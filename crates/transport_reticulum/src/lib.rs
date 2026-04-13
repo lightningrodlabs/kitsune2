@@ -138,14 +138,16 @@ impl BootstrapFactory for ReticulumBootstrapFactory {
 
     fn create(
         &self,
-        _builder: Arc<Builder>,
+        builder: Arc<Builder>,
         peer_store: DynPeerStore,
         space_id: SpaceId,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         let node = self.node.clone();
         Box::pin(async move {
-            let bootstrap =
-                bootstrap::ReticulumBootstrap::new(node, peer_store, space_id);
+            let verifier = builder.verifier.clone();
+            let bootstrap = bootstrap::ReticulumBootstrap::new(
+                node, peer_store, verifier, space_id,
+            );
             Ok(Arc::new(bootstrap) as DynBootstrap)
         })
     }
@@ -235,6 +237,19 @@ impl ReticulumTransport {
             handler.clone(),
         );
 
+        // Spawn the bootstrap drain that decodes incoming announce
+        // app_data into AgentInfoSigned records and inserts them into
+        // each space's peer store (via the PeerBinding registered by
+        // its ReticulumBootstrap instance).
+        let drain_rx =
+            node.take_peer_discovered_rx().await.ok_or_else(|| {
+                K2Error::other(
+                    "peer_discovered receiver already taken",
+                )
+            })?;
+        let bootstrap_drain_handle =
+            bootstrap::spawn_bootstrap_drain(drain_rx, node.clone());
+
         let out: DynTxImp = Arc::new(Self {
             node,
             handler,
@@ -247,6 +262,7 @@ impl ReticulumTransport {
                 links_router_handle,
                 data_router_handle,
                 close_router_handle,
+                bootstrap_drain_handle,
             ]),
         });
         Ok(out)
@@ -434,8 +450,16 @@ impl TxImp for ReticulumTransport {
                 Ok(dest) => {
                     router_state
                         .register_dest(dest.address_hash(), space_id.clone());
-                    let h =
-                        announce::spawn_announce_publisher(dest, interval);
+                    // Publisher pulls the current app_data for the
+                    // space from the node on each tick; empty until
+                    // ReticulumBootstrap::put stages an AgentInfoSigned.
+                    let pub_node = node.clone();
+                    let pub_space = space_id.clone();
+                    let h = announce::spawn_announce_publisher(
+                        dest,
+                        interval,
+                        move || pub_node.get_my_agent_info(&pub_space),
+                    );
                     space_tasks
                         .lock()
                         .expect("poisoned")

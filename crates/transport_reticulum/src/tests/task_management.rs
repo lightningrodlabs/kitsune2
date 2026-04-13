@@ -132,7 +132,7 @@ async fn announce_listener_notifies_only_matching_spaces() {
     endpoint.inject_announce(fake_announce(other, fake_identity()));
 
     // First recv should be the matching announce.
-    let (space_id, _identity) = tokio::time::timeout(
+    let (space_id, _identity, _app_data) = tokio::time::timeout(
         Duration::from_millis(200),
         rx.recv(),
     )

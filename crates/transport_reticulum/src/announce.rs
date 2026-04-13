@@ -5,6 +5,9 @@
 //! - A listener that filters incoming `AnnounceEvent`s by `name_hash`.
 
 use crate::destination::{AnnounceInfo, DynDestination};
+use crate::node::PeerDiscovery;
+use bytes::Bytes;
+use kitsune2_api::SpaceId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::Identity;
 use std::collections::HashMap;
@@ -23,18 +26,27 @@ pub(crate) fn new_identity_cache() -> IdentityCache {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Spawn a task that periodically announces a destination.
-pub(crate) fn spawn_announce_publisher(
+/// Spawn a task that periodically announces a destination, fetching the
+/// current `app_data` via a user-supplied callback on each tick. The
+/// callback typically looks up the node's stored `AgentInfoSigned`
+/// bytes for the space.
+pub(crate) fn spawn_announce_publisher<F>(
     dest: DynDestination,
     interval_s: u32,
-) -> tokio::task::AbortHandle {
+    get_app_data: F,
+) -> tokio::task::AbortHandle
+where
+    F: Fn() -> Option<Bytes> + Send + 'static,
+{
     tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(interval_s as u64);
         loop {
-            match dest.announce(None).await {
+            let app_data = get_app_data();
+            match dest.announce(app_data.as_deref()).await {
                 Ok(_packet) => {
                     debug!(
                         dest_hash = ?dest.address_hash(),
+                        has_app_data = app_data.is_some(),
                         "Published announce for destination"
                     );
                 }
@@ -60,12 +72,14 @@ pub(crate) fn filter_announce_by_space(
 }
 
 /// Spawn a task that consumes announces from the broadcast channel,
-/// filters by name_hash, and updates the identity cache.
+/// filters by name_hash, updates the identity cache, and pushes
+/// matching announces (with their `app_data`) to the peer-discovered
+/// drain.
 pub(crate) fn spawn_announce_listener(
     mut rx: broadcast::Receiver<AnnounceInfo>,
     identity_cache: IdentityCache,
-    space_name_hashes: Arc<RwLock<HashMap<[u8; 10], bytes::Bytes>>>,
-    peer_discovered_tx: tokio::sync::mpsc::Sender<(bytes::Bytes, Identity)>,
+    space_name_hashes: Arc<RwLock<HashMap<[u8; 10], Bytes>>>,
+    peer_discovered_tx: tokio::sync::mpsc::Sender<PeerDiscovery>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         loop {
@@ -86,14 +100,19 @@ pub(crate) fn spawn_announce_listener(
                             space_name_hashes.read().expect("poisoned");
                         filter_announce_by_space(&announce, &hashes)
                     };
-                    if let Some(space_id) = matched_space {
+                    if let Some(space_bytes) = matched_space {
+                        let space_id = SpaceId::from(space_bytes);
                         debug!(
                             ?addr_hash,
                             ?space_id,
                             "Received announce for joined space"
                         );
                         let _ = peer_discovered_tx
-                            .send((space_id, announce.identity))
+                            .send((
+                                space_id,
+                                announce.identity,
+                                announce.app_data,
+                            ))
                             .await;
                     } else {
                         trace!(

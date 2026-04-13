@@ -10,7 +10,7 @@ use crate::backend::RealEndpoint;
 use crate::config::{ReticulumInterfaceConfig, ReticulumTransportConfig};
 use crate::destination::{DynDestination, DynEndpoint};
 use bytes::Bytes;
-use kitsune2_api::{K2Error, K2Result, SpaceId};
+use kitsune2_api::{DynPeerStore, DynVerifier, K2Error, K2Result, SpaceId};
 use rand_core::OsRng;
 use rns_transport::destination::DestinationName;
 use rns_transport::hash::AddressHash;
@@ -18,6 +18,21 @@ use rns_transport::identity::{Identity, PrivateIdentity};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
+
+/// Discovery event pushed from the announce listener to the bootstrap
+/// drain task: the space the announce is for, the announcer's
+/// Identity, and whatever app_data was attached (expected to be a
+/// canonical-JSON `AgentInfoSigned` under the current protocol).
+pub(crate) type PeerDiscovery = (SpaceId, Identity, Bytes);
+
+/// Per-space binding registered by a `ReticulumBootstrap` instance:
+/// where to `insert` discovered peers, and which `Verifier` to use
+/// when decoding the app_data.
+#[derive(Clone)]
+pub(crate) struct PeerBinding {
+    pub peer_store: DynPeerStore,
+    pub verifier: DynVerifier,
+}
 
 /// Shared state between the transport and bootstrap factories.
 pub struct ReticulumNode {
@@ -32,11 +47,17 @@ pub struct ReticulumNode {
     /// Map of name_hash -> space ID, for announce filtering.
     space_name_hashes: Arc<RwLock<HashMap<[u8; 10], Bytes>>>,
     /// Channel for notifying the bootstrap layer about discovered peers.
-    peer_discovered_tx: tokio::sync::mpsc::Sender<(Bytes, Identity)>,
-    /// Receiver side, consumed by bootstrap instances.
-    peer_discovered_rx: tokio::sync::Mutex<
-        Option<tokio::sync::mpsc::Receiver<(Bytes, Identity)>>,
-    >,
+    peer_discovered_tx: tokio::sync::mpsc::Sender<PeerDiscovery>,
+    /// Receiver side, consumed by the bootstrap drain task.
+    peer_discovered_rx:
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<PeerDiscovery>>>,
+    /// Per-space local agent info to include in outbound announces
+    /// (canonical-JSON-encoded `AgentInfoSigned` bytes).
+    my_agent_infos: RwLock<HashMap<SpaceId, Bytes>>,
+    /// Per-space binding registered by each `ReticulumBootstrap`
+    /// instance — where discovered peers get inserted, and the
+    /// `Verifier` used to decode announce app_data.
+    peer_space_bindings: RwLock<HashMap<SpaceId, PeerBinding>>,
 }
 
 impl std::fmt::Debug for ReticulumNode {
@@ -66,6 +87,8 @@ impl ReticulumNode {
             space_name_hashes: Arc::new(RwLock::new(HashMap::new())),
             peer_discovered_tx: tx,
             peer_discovered_rx: tokio::sync::Mutex::new(Some(rx)),
+            my_agent_infos: RwLock::new(HashMap::new()),
+            peer_space_bindings: RwLock::new(HashMap::new()),
         })
     }
 
@@ -162,15 +185,78 @@ impl ReticulumNode {
     /// Get a sender for peer discovery notifications.
     pub(crate) fn peer_discovered_tx(
         &self,
-    ) -> &tokio::sync::mpsc::Sender<(Bytes, Identity)> {
+    ) -> &tokio::sync::mpsc::Sender<PeerDiscovery> {
         &self.peer_discovered_tx
     }
 
     /// Take the peer discovery receiver (can only be called once).
+    /// Consumed by the transport's bootstrap drain task.
     pub(crate) async fn take_peer_discovered_rx(
         &self,
-    ) -> Option<tokio::sync::mpsc::Receiver<(Bytes, Identity)>> {
+    ) -> Option<tokio::sync::mpsc::Receiver<PeerDiscovery>> {
         self.peer_discovered_rx.lock().await.take()
+    }
+
+    /// Set the `AgentInfoSigned` bytes that the per-space announce
+    /// publisher should include as `app_data`.
+    ///
+    /// Called by `ReticulumBootstrap::put`.
+    pub(crate) fn set_my_agent_info(
+        &self,
+        space_id: SpaceId,
+        bytes: Bytes,
+    ) {
+        self.my_agent_infos
+            .write()
+            .expect("poisoned")
+            .insert(space_id, bytes);
+    }
+
+    /// Get the current `AgentInfoSigned` bytes to include as `app_data`
+    /// in announces for the given space, if one has been set.
+    pub(crate) fn get_my_agent_info(&self, space_id: &SpaceId) -> Option<Bytes> {
+        self.my_agent_infos
+            .read()
+            .expect("poisoned")
+            .get(space_id)
+            .cloned()
+    }
+
+    /// Register a `ReticulumBootstrap` instance's binding for a space.
+    /// Called when the bootstrap factory creates a new instance.
+    pub(crate) fn bind_space(
+        &self,
+        space_id: SpaceId,
+        binding: PeerBinding,
+    ) {
+        self.peer_space_bindings
+            .write()
+            .expect("poisoned")
+            .insert(space_id, binding);
+    }
+
+    /// Look up the `PeerBinding` registered for a space.
+    pub(crate) fn get_space_binding(
+        &self,
+        space_id: &SpaceId,
+    ) -> Option<PeerBinding> {
+        self.peer_space_bindings
+            .read()
+            .expect("poisoned")
+            .get(space_id)
+            .cloned()
+    }
+
+    /// Unbind a space — drop any stored agent info and peer-store binding.
+    pub(crate) fn unbind_space(&self, space_id: &SpaceId) {
+        self.my_agent_infos
+            .write()
+            .expect("poisoned")
+            .remove(space_id);
+        self.peer_space_bindings
+            .write()
+            .expect("poisoned")
+            .remove(space_id);
     }
 
     /// Get a reference to the endpoint.

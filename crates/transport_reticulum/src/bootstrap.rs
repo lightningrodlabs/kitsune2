@@ -2,47 +2,142 @@
 //!
 //! Uses Reticulum's announce system for peer discovery instead of
 //! an HTTP bootstrap server.
+//!
+//! # Protocol
+//!
+//! - **Outbound.** `Bootstrap::put(info)` encodes the `AgentInfoSigned`
+//!   to canonical JSON and stores the bytes on the node as the
+//!   per-space `app_data` to include in the next announce. The
+//!   per-space announce publisher picks up the latest value on each
+//!   tick — one announce per interval carries whatever info was most
+//!   recently put.
+//! - **Inbound.** The transport's bootstrap drain task consumes
+//!   discovery events pushed by the announce listener, looks up the
+//!   `PeerBinding` for the announcing space, and decodes the app_data
+//!   through the registered `Verifier`. On success the
+//!   `AgentInfoSigned` is inserted into the space's peer store.
 
+use crate::node::{PeerBinding, ReticulumNode};
 use kitsune2_api::*;
 use std::sync::Arc;
-use tracing::debug;
-
-use crate::node::ReticulumNode;
+use tracing::{debug, warn};
 
 /// Bootstrap implementation backed by Reticulum announces.
 #[derive(Debug)]
 pub(crate) struct ReticulumBootstrap {
     node: Arc<ReticulumNode>,
-    peer_store: DynPeerStore,
     space_id: SpaceId,
 }
 
 impl ReticulumBootstrap {
     /// Create a new bootstrap instance for a specific space.
+    ///
+    /// Registers the given peer store + verifier with the node under
+    /// the space id so the drain task can route inbound discoveries.
     pub fn new(
         node: Arc<ReticulumNode>,
         peer_store: DynPeerStore,
+        verifier: DynVerifier,
         space_id: SpaceId,
     ) -> Self {
-        Self {
-            node,
-            peer_store,
-            space_id,
-        }
+        node.bind_space(
+            space_id.clone(),
+            PeerBinding {
+                peer_store,
+                verifier,
+            },
+        );
+        Self { node, space_id }
     }
 }
 
 impl Bootstrap for ReticulumBootstrap {
     fn put(&self, info: Arc<AgentInfoSigned>) {
-        debug!(
-            agent = ?info.agent,
-            space = ?self.space_id,
-            "ReticulumBootstrap::put (announce-driven, info cached locally)"
-        );
-        // In the Reticulum model, `put` is a no-op for outbound announces:
-        // our announces are driven by the periodic publisher task in the
-        // transport layer. This method is called by kitsune2 core when it
-        // wants to "publish" an agent info to the bootstrap service --
-        // for Reticulum, that already happens via destination announces.
+        match info.encode() {
+            Ok(json) => {
+                self.node.set_my_agent_info(
+                    self.space_id.clone(),
+                    bytes::Bytes::from(json.into_bytes()),
+                );
+                debug!(
+                    agent = ?info.agent,
+                    space = ?self.space_id,
+                    "ReticulumBootstrap: staged AgentInfoSigned for next announce"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    ?e,
+                    space = ?self.space_id,
+                    "ReticulumBootstrap::put: failed to encode AgentInfoSigned",
+                );
+            }
+        }
     }
+}
+
+impl Drop for ReticulumBootstrap {
+    fn drop(&mut self) {
+        self.node.unbind_space(&self.space_id);
+    }
+}
+
+/// Spawn the bootstrap drain. Consumes `(space_id, identity, app_data)`
+/// events and, for each space that has a [`PeerBinding`] registered,
+/// decodes the app_data as an `AgentInfoSigned` via the binding's
+/// `Verifier` and inserts it into the space's peer store.
+///
+/// Events for unbound spaces, or with empty / invalid app_data, are
+/// logged and dropped.
+pub(crate) fn spawn_bootstrap_drain(
+    mut rx: tokio::sync::mpsc::Receiver<crate::node::PeerDiscovery>,
+    node: Arc<ReticulumNode>,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        while let Some((space_id, identity, app_data)) = rx.recv().await {
+            if app_data.is_empty() {
+                debug!(
+                    ?space_id,
+                    identity_hash = ?identity.address_hash,
+                    "bootstrap drain: empty app_data, skipping",
+                );
+                continue;
+            }
+            let binding = match node.get_space_binding(&space_id) {
+                Some(b) => b,
+                None => {
+                    debug!(
+                        ?space_id,
+                        "bootstrap drain: no binding for space (yet?)",
+                    );
+                    continue;
+                }
+            };
+
+            let decoded =
+                AgentInfoSigned::decode(&binding.verifier, &app_data);
+            let signed = match decoded {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        ?e,
+                        ?space_id,
+                        identity_hash = ?identity.address_hash,
+                        "bootstrap drain: failed to decode AgentInfoSigned",
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = binding.peer_store.insert(vec![signed]).await {
+                warn!(
+                    ?e,
+                    ?space_id,
+                    "bootstrap drain: peer_store.insert failed",
+                );
+            }
+        }
+        debug!("bootstrap drain: channel closed");
+    })
+    .abort_handle()
 }
