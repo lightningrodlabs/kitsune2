@@ -13,13 +13,13 @@
 //!   `LinkEvent::Data(LinkPayload)` on the in/out link event streams.
 //!   The `PACKET_MDU` is 2048 bytes, so payloads above that bound error
 //!   out for now — a chunking layer is tracked as Phase 4 of the plan.
-//! - `Link::peer_identity` is private; for outbound links we read
-//!   `Link::destination().identity.address_hash` (the remote peer's
-//!   identity set at construction). For inbound links the same field
-//!   is the **local** destination's identity, which is a known risk
-//!   documented in `PLAN-beechat-backend.md` §Risks-1; resolving it
-//!   requires either a Beechat fork adding a `peer_identity()` getter
-//!   or a workaround at the router layer.
+//! - Peer identity on a `Link` is read via `Link::peer_identity()` —
+//!   a getter exposed by our Beechat fork
+//!   (`../Reticulum-rs-lrl`). Upstream keeps the field private,
+//!   which forced an unreliable `destination().identity` reading
+//!   that was wrong for inbound links (§Risks-1 of
+//!   `PLAN-beechat-backend.md`). The fork adds one small getter and
+//!   this backend uses it uniformly for inbound and outbound links.
 //! - `TransportConfig` in Beechat has no link-idle / link-proof timeout
 //!   setters; those values are compile-time constants in the crate.
 //!   Beechat-specific knobs (`set_retransmit`, `set_announce_forever`,
@@ -702,12 +702,11 @@ impl Destination for RealDestination {
 /// Real `Link` implementation. Caches immutable fields so trait
 /// methods can answer without acquiring the link's mutex.
 ///
-/// **Known limitation (tracked in PLAN-beechat-backend.md §Risks-1):**
-/// for inbound links, `peer_hash` is currently the address hash of
-/// the **local** destination, not the remote peer — Beechat's `Link`
-/// doesn't expose `peer_identity` publicly. Verify in functional
-/// testing (Phase 3) and patch with a Beechat fork if this breaks
-/// peer tracking.
+/// `peer_hash` is read via `Link::peer_identity()` — a getter added
+/// by our Beechat fork (`reticulum = { path = "../Reticulum-rs-lrl" }`
+/// in the workspace root). Upstream keeps that field private, which
+/// would force a fragile `destination().identity` reading that's
+/// wrong for inbound links.
 pub(crate) struct RealLink {
     inner: Arc<TokioMutex<reticulum::destination::link::Link>>,
     id: LinkId,
@@ -738,10 +737,11 @@ impl RealLink {
         let (id, peer_hash, local_dest_hash, status) = {
             let link = inner.lock().await;
             let id = *link.id();
-            // See the struct-level note: for outbound links this is
-            // the remote peer's identity; for inbound links it is the
-            // local destination's identity.
-            let peer_hash = link.destination().identity.address_hash;
+            // Read the peer identity via the fork-added getter. This
+            // is correct for both inbound links (peer identity
+            // extracted from the link request) and outbound links
+            // (populated during handshake when the proof arrives).
+            let peer_hash = link.peer_identity().address_hash;
             let local_dest_hash = link.destination().address_hash;
             let status = map_status(link.status());
             (id, peer_hash, local_dest_hash, status)

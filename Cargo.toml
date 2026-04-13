@@ -94,9 +94,11 @@ reticulum-rs-transport = "0.2.0"
 # AgentInfoSigned JSON doesn't fit in the ~316-byte app_data budget).
 flate2 = "1.0"
 # Alternative Reticulum stack implementation from Beechat — the
-# `backend-beechat` arm of `kitsune2_transport_reticulum`. Pinned to a
-# git revision because the upstream is pre-1.0 and API-unstable.
-reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", branch = "main" }
+# `backend-beechat` arm of `kitsune2_transport_reticulum`. Pointed at
+# our fork (path dep) which adds a `Link::peer_identity()` getter
+# required for inbound-link peer tracking — see §Risks-1 of
+# `PLAN-beechat-backend.md`.
+reticulum = { path = "../Reticulum-rs-lrl" }
 # kitsune types need to be serializable for network transmission.
 serde = { version = "1.0", features = ["derive"] }
 # kitsune2 agent info is serialized as json to improve debugability of
