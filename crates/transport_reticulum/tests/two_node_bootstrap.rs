@@ -14,8 +14,8 @@ use kitsune2_api::{
 };
 use kitsune2_transport_reticulum::ReticulumNode;
 use rand_core::OsRng;
-use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::transport::{Transport, TransportConfig};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -125,7 +125,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = a_tx_recv.recv().await {
             let _ = b_rx_send_clone
-                .send(RxMessage { address: b_iface_addr, packet })
+                .send(RxMessage {
+                    address: b_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -133,7 +136,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = b_tx_recv.recv().await {
             let _ = a_rx_send_clone
-                .send(RxMessage { address: a_iface_addr, packet })
+                .send(RxMessage {
+                    address: a_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -156,10 +162,8 @@ async fn mk_signed(agent: u8, space: SpaceId) -> Arc<AgentInfoSigned> {
         expires_at: Timestamp::now() + Duration::from_secs(3600),
         is_tombstone: false,
         url: Some(
-            Url::from_str(
-                "ret://reticulum:1/00112233445566778899aabbccddeeff",
-            )
-            .unwrap(),
+            Url::from_str("ret://reticulum:1/00112233445566778899aabbccddeeff")
+                .unwrap(),
         ),
         storage_arc: DhtArc::FULL,
     };
@@ -173,7 +177,7 @@ async fn mk_signed(agent: u8, space: SpaceId) -> Arc<AgentInfoSigned> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn announce_flows_through_real_endpoint_and_bootstrap_drain() {
     use kitsune2_transport_reticulum::internal_testing::{
-        wire_bootstrap_pipeline, ReticulumBootstrap,
+        ReticulumBootstrap, wire_bootstrap_pipeline,
     };
     use rns_transport::destination::DestinationName;
 
@@ -184,16 +188,14 @@ async fn announce_flows_through_real_endpoint_and_bootstrap_drain() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Node B uses the full `ReticulumNode` stack (receive side).
-    let node_b =
-        ReticulumNode::from_rns_transport(tp_b.clone(), id_b.clone())
-            .await
-            .unwrap();
+    let node_b = ReticulumNode::from_rns_transport(tp_b.clone(), id_b.clone())
+        .await
+        .unwrap();
 
     let space = SpaceId::from(Bytes::from_static(b"alpha"));
 
     // B registers the space so its announce filter matches.
-    let _dest_hash_b =
-        node_b.register_space_for_test(&space).await.unwrap();
+    let _dest_hash_b = node_b.register_space_for_test(&space).await.unwrap();
 
     // B's bootstrap drain + peer store binding.
     let b_store = Arc::new(FakePeerStore::default());
@@ -217,11 +219,11 @@ async fn announce_flows_through_real_endpoint_and_bootstrap_drain() {
     // don't need A to run the full node stack — we just want it to
     // emit an announce whose app_data carries a signed AgentInfo.
     let signed = mk_signed(1, space.clone()).await;
-    // The bootstrap drain expects compressed app_data (to fit in the
-    // announce packet's ~316-byte budget with real Ed25519 sigs).
+    // Pack into the compact announce wire format — the drain on B
+    // decodes back via `announce_wire::decode_announce_wire`.
     let encoded: Vec<u8> =
-        kitsune2_transport_reticulum::internal_testing::compress_app_data(
-            signed.encode().unwrap().as_bytes(),
+        kitsune2_transport_reticulum::internal_testing::encode_announce_wire(
+            &signed,
         )
         .unwrap()
         .to_vec();
@@ -229,8 +231,7 @@ async fn announce_flows_through_real_endpoint_and_bootstrap_drain() {
     // A registers the same space destination name B is filtering on.
     // `register_space` uses the hex-encoded space id as the aspect,
     // so we mirror that here.
-    let space_hash: String =
-        space.iter().map(|b| format!("{b:02x}")).collect();
+    let space_hash: String = space.iter().map(|b| format!("{b:02x}")).collect();
     let name = DestinationName::new("kitsune2", &space_hash);
     let dest_a = {
         let mut tp = tp_a.lock().await;

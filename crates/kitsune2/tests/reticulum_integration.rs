@@ -23,10 +23,7 @@ use kitsune2_api::{
     BoxFut, Config, DhtArc, DynKitsune, DynSpace, DynSpaceHandler, K2Result,
     KitsuneHandler, LocalAgent, OpId, SpaceHandler, SpaceId, Timestamp,
 };
-use kitsune2_core::{
-    Ed25519LocalAgent,
-    factories::MemoryOp,
-};
+use kitsune2_core::{Ed25519LocalAgent, factories::MemoryOp};
 use kitsune2_gossip::{K2GossipConfig, K2GossipModConfig};
 use kitsune2_test_utils::{
     enable_tracing, iter_check, random_bytes, space::TEST_SPACE_ID,
@@ -36,8 +33,8 @@ use kitsune2_transport_reticulum::{
     ReticulumTransportModConfig,
 };
 use rand_core::OsRng;
-use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::transport::{
     Transport as RnsTransport, TransportConfig as RnsTransportConfig,
 };
@@ -57,9 +54,7 @@ impl KitsuneHandler for TestKitsuneHandler {
         _space_id: SpaceId,
         _config_override: Option<&Config>,
     ) -> BoxFut<'_, K2Result<DynSpaceHandler>> {
-        Box::pin(async {
-            Ok(Arc::new(TestSpaceHandler) as DynSpaceHandler)
-        })
+        Box::pin(async { Ok(Arc::new(TestSpaceHandler) as DynSpaceHandler) })
     }
 }
 
@@ -107,7 +102,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = a_tx_recv.recv().await {
             let _ = b_rx_send_clone
-                .send(RxMessage { address: b_iface_addr, packet })
+                .send(RxMessage {
+                    address: b_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -115,7 +113,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = b_tx_recv.recv().await {
             let _ = a_rx_send_clone
-                .send(RxMessage { address: a_iface_addr, packet })
+                .send(RxMessage {
+                    address: a_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });

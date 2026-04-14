@@ -5,13 +5,13 @@
 //! `PeerStore::insert`.
 
 use crate::announce::{new_identity_cache, spawn_announce_listener};
-use crate::bootstrap::{spawn_bootstrap_drain, ReticulumBootstrap};
+use crate::bootstrap::{ReticulumBootstrap, spawn_bootstrap_drain};
 use crate::destination::Endpoint;
 use crate::node::ReticulumNode;
-use crate::test_utils::{fake_announce, FakeEndpoint};
+use crate::test_utils::{FakeEndpoint, fake_announce};
 use bytes::Bytes;
 use kitsune2_api::{
-    AgentInfo, AgentInfoSigned, AgentId, Bootstrap, DhtArc, DynPeerStore,
+    AgentId, AgentInfo, AgentInfoSigned, Bootstrap, DhtArc, DynPeerStore,
     DynVerifier, K2Result, SpaceId, Timestamp, Url, Verifier,
 };
 use rns_transport::destination::DestinationName;
@@ -110,10 +110,8 @@ async fn mk_signed(agent: u8, space: SpaceId) -> Arc<AgentInfoSigned> {
         expires_at: Timestamp::now() + std::time::Duration::from_secs(3600),
         is_tombstone: false,
         url: Some(
-            Url::from_str(
-                "ret://reticulum:1/00112233445566778899aabbccddeeff",
-            )
-            .unwrap(),
+            Url::from_str("ret://reticulum:1/00112233445566778899aabbccddeeff")
+                .unwrap(),
         ),
         storage_arc: DhtArc::FULL,
     };
@@ -122,36 +120,26 @@ async fn mk_signed(agent: u8, space: SpaceId) -> Arc<AgentInfoSigned> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn put_stages_agent_info_for_announce() {
+    use crate::announce_wire::encode_announce_wire;
+
     let endpoint = FakeEndpoint::new();
     let node = ReticulumNode::new(endpoint, AddressHash::new([0; 16]));
     let store: DynPeerStore = Arc::new(FakePeerStore::default());
     let verifier: DynVerifier = Arc::new(YesVerifier);
     let space = SpaceId::from(Bytes::from_static(b"alpha"));
 
-    let bs = ReticulumBootstrap::new(
-        node.clone(),
-        store,
-        verifier,
-        space.clone(),
-    );
+    let bs =
+        ReticulumBootstrap::new(node.clone(), store, verifier, space.clone());
 
     let signed = mk_signed(1, space.clone()).await;
     bs.put(signed.clone());
 
-    // The node now has compressed bytes staged for that space; the
-    // drain decompresses before decoding, so mirror that here.
+    // The node now has wire-encoded bytes staged for that space. The
+    // encoding is deterministic, so a fresh encode of the same
+    // AgentInfoSigned must match what `put` stored.
     let staged = node.get_my_agent_info(&space).expect("staged");
-    let decompressed = {
-        use flate2::read::DeflateDecoder;
-        use std::io::Read;
-        let mut dec = DeflateDecoder::new(&staged[..]);
-        let mut out = Vec::new();
-        dec.read_to_end(&mut out).unwrap();
-        out
-    };
-    let decoded =
-        AgentInfoSigned::decode(&YesVerifier, &decompressed).unwrap();
-    assert_eq!(decoded.agent, signed.agent);
+    let expected = encode_announce_wire(&signed).unwrap();
+    assert_eq!(staged, expected, "staged bytes must match wire-encoded");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -166,12 +154,8 @@ async fn drain_inserts_decoded_agent_info_into_peer_store() {
     let space = SpaceId::from(Bytes::from_static(b"alpha"));
 
     // Bootstrap registers its peer_store + verifier on the node.
-    let _bs = ReticulumBootstrap::new(
-        node.clone(),
-        store,
-        verifier,
-        space.clone(),
-    );
+    let _bs =
+        ReticulumBootstrap::new(node.clone(), store, verifier, space.clone());
 
     // Bind the space's announce name_hash so the listener's filter matches.
     let name = DestinationName::new("kitsune2", "somespace");
@@ -200,11 +184,8 @@ async fn drain_inserts_decoded_agent_info_into_peer_store() {
 
     // Fabricate a signed AgentInfo and encode it as the announce app_data.
     let signed = mk_signed(2, space.clone()).await;
-    // Announce app_data is compressed -- the drain decompresses.
-    let encoded_bytes: Bytes = crate::bootstrap::compress_app_data(
-        signed.encode().unwrap().as_bytes(),
-    )
-    .unwrap();
+    let encoded_bytes: Bytes =
+        crate::announce_wire::encode_announce_wire(&signed).unwrap();
 
     // Inject an announce carrying the signed AgentInfo in app_data.
     let identity =
@@ -218,11 +199,7 @@ async fn drain_inserts_decoded_agent_info_into_peer_store() {
 
     // The peer_store should have our signed AgentInfo inserted.
     let inserted = concrete_store.inserted.lock().unwrap();
-    assert_eq!(
-        inserted.len(),
-        1,
-        "expected one AgentInfoSigned inserted"
-    );
+    assert_eq!(inserted.len(), 1, "expected one AgentInfoSigned inserted");
     assert_eq!(inserted[0].agent, signed.agent);
 }
 
@@ -236,12 +213,8 @@ async fn drain_skips_empty_app_data() {
     let verifier: DynVerifier = Arc::new(YesVerifier);
     let space = SpaceId::from(Bytes::from_static(b"alpha"));
 
-    let _bs = ReticulumBootstrap::new(
-        node.clone(),
-        store,
-        verifier,
-        space.clone(),
-    );
+    let _bs =
+        ReticulumBootstrap::new(node.clone(), store, verifier, space.clone());
 
     let name = DestinationName::new("kitsune2", "somespace");
     let mut name_hash = [0u8; 10];

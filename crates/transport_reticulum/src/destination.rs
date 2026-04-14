@@ -57,10 +57,7 @@ pub(crate) trait Link: Send + Sync + std::fmt::Debug {
     /// gets it via `Endpoint::recv_resource_data` (which the
     /// `RealEndpoint` bridges from `received_data_events` for
     /// `data_packet` traffic).
-    fn send_small<'a>(
-        &'a self,
-        data: &'a [u8],
-    ) -> BoxFut<'a, K2Result<()>>;
+    fn send_small<'a>(&'a self, data: &'a [u8]) -> BoxFut<'a, K2Result<()>>;
 
     /// Tear down the link, returning a teardown packet if applicable.
     fn teardown(&self) -> Option<Vec<u8>>;

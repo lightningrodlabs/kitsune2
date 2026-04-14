@@ -7,7 +7,7 @@
 use crate::announce::{new_identity_cache, spawn_announce_listener};
 use crate::destination::{AnnounceInfo, Destination, Endpoint};
 use crate::node::ReticulumNode;
-use crate::test_utils::{fake_announce, fake_identity, FakeEndpoint};
+use crate::test_utils::{FakeEndpoint, fake_announce, fake_identity};
 use bytes::Bytes;
 use kitsune2_api::SpaceId;
 use rns_transport::destination::DestinationName;
@@ -77,12 +77,8 @@ async fn announce_listener_populates_identity_cache() {
         Arc::new(RwLock::new(HashMap::new()));
 
     let rx_ann = endpoint.recv_announces().await.unwrap();
-    let _handle = spawn_announce_listener(
-        rx_ann,
-        cache.clone(),
-        hashes.clone(),
-        tx,
-    );
+    let _handle =
+        spawn_announce_listener(rx_ann, cache.clone(), hashes.clone(), tx);
 
     let id = fake_identity();
     let name = DestinationName::new("kitsune2", "somespace");
@@ -118,12 +114,8 @@ async fn announce_listener_notifies_only_matching_spaces() {
         .insert(joined_hash, Bytes::from_static(b"joined"));
 
     let rx_ann = endpoint.recv_announces().await.unwrap();
-    let _handle = spawn_announce_listener(
-        rx_ann,
-        cache.clone(),
-        hashes.clone(),
-        tx,
-    );
+    let _handle =
+        spawn_announce_listener(rx_ann, cache.clone(), hashes.clone(), tx);
 
     // Matching announce -- should flow through to peer_discovered.
     endpoint.inject_announce(fake_announce(joined_name, fake_identity()));
@@ -132,18 +124,20 @@ async fn announce_listener_notifies_only_matching_spaces() {
     endpoint.inject_announce(fake_announce(other, fake_identity()));
 
     // First recv should be the matching announce.
-    let (space_id, _identity, _app_data) = tokio::time::timeout(
-        Duration::from_millis(200),
-        rx.recv(),
-    )
-    .await
-    .expect("timed out waiting for matching announce")
-    .expect("channel closed");
+    let (space_id, _identity, _app_data) =
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timed out waiting for matching announce")
+            .expect("channel closed");
     assert_eq!(space_id.as_ref(), b"joined");
 
     // Nothing else should be queued.
-    let second = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
-    assert!(second.is_err(), "non-matching announce should have been filtered");
+    let second =
+        tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+    assert!(
+        second.is_err(),
+        "non-matching announce should have been filtered"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -14,8 +14,8 @@
 //!   [`FakeEndpoint::destinations_added`].
 
 use crate::destination::{
-    AnnounceInfo, Destination, DynDestination, DynLink, Endpoint, Link,
-    LinkId, LinkStatus,
+    AnnounceInfo, Destination, DynDestination, DynLink, Endpoint, Link, LinkId,
+    LinkStatus,
 };
 use bytes::Bytes;
 use kitsune2_api::{BoxFut, K2Result};
@@ -300,10 +300,7 @@ impl Link for FakeLink {
         *self.status.lock().unwrap()
     }
 
-    fn send_small<'a>(
-        &'a self,
-        data: &'a [u8],
-    ) -> BoxFut<'a, K2Result<()>> {
+    fn send_small<'a>(&'a self, data: &'a [u8]) -> BoxFut<'a, K2Result<()>> {
         let bytes = data.to_vec();
         Box::pin(async move {
             self.sent.lock().unwrap().push(bytes);

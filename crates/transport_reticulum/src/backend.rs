@@ -14,17 +14,17 @@
 //! bridge tasks on construction that perform that fan-in.
 
 use crate::destination::{
-    AnnounceInfo, Destination, DynDestination, DynLink, Endpoint, Link,
-    LinkId, LinkStatus,
+    AnnounceInfo, Destination, DynDestination, DynLink, Endpoint, Link, LinkId,
+    LinkStatus,
 };
 use bytes::Bytes;
 use kitsune2_api::{BoxFut, K2Error, K2Result};
 use rand_core::OsRng;
-use rns_transport::destination::{new_out, DestinationName};
+use rns_transport::destination::{DestinationName, new_out};
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::{Identity, PrivateIdentity};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
+use tokio::sync::{Mutex as TokioMutex, broadcast, mpsc};
 use tracing::{debug, warn};
 
 /// Shared handle to a live `rns_transport::Transport`.
@@ -84,8 +84,7 @@ impl RealEndpoint {
             mpsc::channel::<DynLink>(BRIDGE_CHANNEL_SIZE);
         let (data_tx, data_rx) =
             mpsc::channel::<(LinkId, Bytes)>(BRIDGE_CHANNEL_SIZE);
-        let (close_tx, close_rx) =
-            mpsc::channel::<LinkId>(BRIDGE_CHANNEL_SIZE);
+        let (close_tx, close_rx) = mpsc::channel::<LinkId>(BRIDGE_CHANNEL_SIZE);
 
         // Subscribe to the underlying streams once, then let each bridge
         // task own its receiver. We subscribe to `out_link_events` too
@@ -247,10 +246,7 @@ fn spawn_inbound_link_bridge(
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(
-                                        ?e,
-                                        "Failed to wrap activated link"
-                                    );
+                                    warn!(?e, "Failed to wrap activated link");
                                 }
                             }
                         }
@@ -365,8 +361,7 @@ fn spawn_received_data_bridge(
                 Ok(ev) => {
                     // Skip resource fragments — the resource bridge
                     // delivers the reassembled whole.
-                    if !matches!(ev.context, Some(PacketContext::None) | None)
-                    {
+                    if !matches!(ev.context, Some(PacketContext::None) | None) {
                         continue;
                     }
                     let link_id = ev.destination;
@@ -501,7 +496,13 @@ impl Endpoint for RealEndpoint {
     }
 
     fn packet_mdu(&self) -> usize {
-        rns_transport::packet::PACKET_MDU
+        // `Link::data_packet` wraps the plaintext in fernet, which adds
+        // `FERNET_OVERHEAD_SIZE` (IV + HMAC = 48 bytes) plus up to
+        // `FERNET_MAX_PADDING_SIZE` (AES block = 16 bytes). The
+        // resulting ciphertext has to fit in `PACKET_MDU` (464). So the
+        // real plaintext ceiling for data_packet is `LXMF_MAX_PAYLOAD`
+        // (400). Anything larger must go via `send_resource`.
+        rns_transport::packet::LXMF_MAX_PAYLOAD
     }
 
     fn recv_announces(
@@ -523,9 +524,7 @@ impl Endpoint for RealEndpoint {
         })
     }
 
-    fn recv_links(
-        &self,
-    ) -> BoxFut<'_, K2Result<mpsc::Receiver<DynLink>>> {
+    fn recv_links(&self) -> BoxFut<'_, K2Result<mpsc::Receiver<DynLink>>> {
         Box::pin(async move {
             let mut slot = self.links_rx.lock().await;
             slot.take().ok_or_else(|| {
@@ -552,9 +551,7 @@ impl Endpoint for RealEndpoint {
 
 /// Real `Destination` implementation.
 struct RealDestination {
-    inner: Arc<
-        TokioMutex<rns_transport::destination::SingleInputDestination>,
-    >,
+    inner: Arc<TokioMutex<rns_transport::destination::SingleInputDestination>>,
     name: DestinationName,
     address_hash: AddressHash,
     /// Handle back to the owning Transport so `announce()` can call
@@ -713,10 +710,7 @@ impl Link for RealLink {
             .unwrap_or(LinkStatus::Pending)
     }
 
-    fn send_small<'a>(
-        &'a self,
-        data: &'a [u8],
-    ) -> BoxFut<'a, K2Result<()>> {
+    fn send_small<'a>(&'a self, data: &'a [u8]) -> BoxFut<'a, K2Result<()>> {
         Box::pin(async move {
             // Build the rns Packet under the link's lock, then drop
             // the lock before calling Transport::send_packet (which

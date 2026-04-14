@@ -22,7 +22,7 @@
 //! can exercise the full flow against the in-memory fake.
 
 use crate::destination::{DynEndpoint, DynLink, LinkId, LinkStatus};
-use crate::frame::{decode_frame, encode_frame, ReticulumFrame};
+use crate::frame::{ReticulumFrame, decode_frame, encode_frame};
 use crate::peer_state::PeerState;
 use crate::url::identity_hash_to_url;
 use bytes::Bytes;
@@ -35,8 +35,7 @@ use tracing::{debug, trace, warn};
 
 /// Maps an inbound `LinkId` → `(peer_url, space_id)` so the data
 /// router can find the right `PeerState` without iterating every peer.
-pub(crate) type LinkRegistry =
-    Arc<RwLock<HashMap<LinkId, (Url, SpaceId)>>>;
+pub(crate) type LinkRegistry = Arc<RwLock<HashMap<LinkId, (Url, SpaceId)>>>;
 
 /// Shared state accessed by both router tasks plus `TxImp::send`.
 #[derive(Clone, Debug)]
@@ -151,8 +150,7 @@ async fn route_new_link(
             .or_insert_with(PeerState::new)
             .clone()
     };
-    let first_link =
-        peer_state.insert_link(space_id.clone(), link.clone());
+    let first_link = peer_state.insert_link(space_id.clone(), link.clone());
 
     // Index the link so the data router can find (peer, space) fast.
     state
@@ -193,7 +191,9 @@ async fn route_new_link(
 /// `ReticulumFrame::Preflight` (carrying our main identity so the
 /// receiver can re-key its `PeerState` under the URL kitsune2
 /// advertises in `AgentInfoSigned.url`), sends it over the link, and
-/// flips `local_sent`.
+/// flips `local_sent`. If flipping `local_sent` now makes the peer
+/// ready (remote preflight already arrived), drains any buffered
+/// Data frames up to the handler.
 pub(crate) async fn start_preflight(
     peer_url: &Url,
     local_main_identity: AddressHash,
@@ -209,14 +209,16 @@ pub(crate) async fn start_preflight(
     // have already sent its preflight before we reached this point
     // (races against `wait_for_link_active`), but we still need to
     // send ours so the remote can mark its own state Ready.
-    {
+    let newly_ready = {
         let mut pf = peer_state.preflight_state.lock().expect("poisoned");
         if pf.local_sent {
             trace!(?peer_url, "preflight already sent");
             return Ok(());
         }
+        let was_ready = pf.is_ready();
         pf.local_sent = true;
-    }
+        !was_ready && pf.is_ready()
+    };
 
     let preflight_bytes = handler.peer_connect(peer_url.clone()).await?;
     let frame = ReticulumFrame::Preflight {
@@ -227,7 +229,47 @@ pub(crate) async fn start_preflight(
     send_over_link(link, &encoded, endpoint, max_frame_bytes).await?;
 
     debug!(?peer_url, "preflight sent");
+
+    if newly_ready {
+        drain_pending_data(peer_url, peer_state, handler).await;
+    }
     Ok(())
+}
+
+/// Drain any Data frames buffered while preflight was incomplete and
+/// dispatch them to the handler in FIFO order. Called from whichever
+/// task flipped the final bit of `PreflightState`.
+///
+/// Dispatched under `peer_url`, which at the Preflight-arm call site
+/// is the *main* URL after re-keying; at the `start_preflight` call
+/// site, re-keying has not happened yet (the remote preflight is what
+/// triggers it), so `peer_url` is still the ephemeral URL — but in
+/// that path nothing is queued yet anyway (the queue is only written
+/// in the data-router's Data arm, which runs on a `peer_state` that
+/// has already been re-keyed if a Preflight was seen).
+async fn drain_pending_data(
+    peer_url: &Url,
+    peer_state: &Arc<PeerState>,
+    handler: &Arc<TxImpHnd>,
+) {
+    let queued = peer_state.drain_pending();
+    if queued.is_empty() {
+        return;
+    }
+    debug!(
+        ?peer_url,
+        count = queued.len(),
+        "draining buffered data frames now that preflight is ready"
+    );
+    for bytes in queued {
+        if let Err(e) = handler.recv_data(peer_url.clone(), bytes).await {
+            warn!(
+                ?e,
+                ?peer_url,
+                "recv_data failed while draining buffered frame"
+            );
+        }
+    }
 }
 
 /// Send one encoded frame over a link, picking the right path for
@@ -270,8 +312,7 @@ pub(crate) fn spawn_data_router(
 ) -> AbortHandle {
     tokio::spawn(async move {
         while let Some((link_id, data)) = rx.recv().await {
-            if let Err(e) = route_data(&link_id, data, &state, &handler).await
-            {
+            if let Err(e) = route_data(&link_id, data, &state, &handler).await {
                 warn!(?e, ?link_id, "data router: dispatch failed");
             }
         }
@@ -358,19 +399,19 @@ async fn route_data(
             // hash for exactly this reason: re-key PeerState +
             // link_registry under the main URL before dispatching the
             // preflight up to TxImpHnd.
-            let main_url =
-                match crate::url::identity_hash_to_url(&sender_main_identity)
-                {
-                    Ok(u) => u,
-                    Err(e) => {
-                        warn!(
-                            ?e,
-                            ?peer_url,
-                            "data router: invalid main-identity hash in preflight"
-                        );
-                        return Ok(());
-                    }
-                };
+            let main_url = match crate::url::identity_hash_to_url(
+                &sender_main_identity,
+            ) {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(
+                        ?e,
+                        ?peer_url,
+                        "data router: invalid main-identity hash in preflight"
+                    );
+                    return Ok(());
+                }
+            };
             let main_peer_url = if main_url == peer_url {
                 peer_url
             } else {
@@ -414,23 +455,42 @@ async fn route_data(
             };
 
             handler.recv_data(main_peer_url.clone(), payload).await?;
-            {
+            let newly_ready = {
                 let mut pf = ps.preflight_state.lock().expect("poisoned");
+                let was_ready = pf.is_ready();
                 pf.remote_received = true;
-            }
+                !was_ready && pf.is_ready()
+            };
             debug!(?main_peer_url, "preflight received");
+            if newly_ready {
+                drain_pending_data(&main_peer_url, &ps, handler).await;
+            }
         }
         ReticulumFrame::Data(bytes) => {
-            // Gate on preflight readiness. Frames received before
-            // preflight completes are dropped (the remote shouldn't
-            // have sent them).
+            // Gate on preflight readiness. The two router tasks run on
+            // independent tokio schedulers, so a Data frame genuinely
+            // can arrive before this side's links router has had a
+            // chance to flip `local_sent` in `start_preflight`. Buffer
+            // rather than drop — the drain runs when whichever task
+            // finally completes the handshake.
             let ready = peer_state
                 .preflight_state
                 .lock()
                 .expect("poisoned")
                 .is_ready();
             if !ready {
-                warn!(?peer_url, "data frame before preflight ready -- dropping");
+                if peer_state.push_pending(bytes) {
+                    debug!(
+                        ?peer_url,
+                        "data frame before preflight ready -- buffering"
+                    );
+                } else {
+                    warn!(
+                        ?peer_url,
+                        cap = crate::peer_state::MAX_PENDING_DATA_FRAMES,
+                        "pending-data cap hit -- dropping frame"
+                    );
+                }
                 return Ok(());
             }
             handler.recv_data(peer_url, bytes).await?;
@@ -452,7 +512,11 @@ pub(crate) async fn remove_link(
     state: &RouterState,
     handler: &Arc<TxImpHnd>,
 ) {
-    let entry = state.link_registry.write().expect("poisoned").remove(link_id);
+    let entry = state
+        .link_registry
+        .write()
+        .expect("poisoned")
+        .remove(link_id);
     let (peer_url, space_id) = match entry {
         Some(e) => e,
         None => return,

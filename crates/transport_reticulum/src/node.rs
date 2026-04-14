@@ -123,26 +123,26 @@ impl ReticulumNode {
         let identity_hash = identity.as_identity().address_hash;
 
         // Tune the rns transport with config values we care about.
-        let mut transport_config = rns_transport::transport::TransportConfig::new(
-            format!("kitsune2-{}", identity_hash.to_hex_string()),
-            &identity,
-            false,
-        );
+        let mut transport_config =
+            rns_transport::transport::TransportConfig::new(
+                format!("kitsune2-{}", identity_hash.to_hex_string()),
+                &identity,
+                false,
+            );
         transport_config
             .set_link_idle_timeout_secs(config.link_idle_timeout_s as u64);
         transport_config
             .set_link_proof_timeout_secs(config.connect_timeout_s as u64);
 
-        let transport = rns_transport::transport::Transport::new(transport_config);
         let transport =
-            Arc::new(tokio::sync::Mutex::new(transport));
+            rns_transport::transport::Transport::new(transport_config);
+        let transport = Arc::new(tokio::sync::Mutex::new(transport));
 
         // Bring up each configured interface.
         start_interfaces(&transport, &config.interfaces).await?;
 
-        let endpoint: DynEndpoint = Arc::new(
-            RealEndpoint::new(transport, identity).await,
-        );
+        let endpoint: DynEndpoint =
+            Arc::new(RealEndpoint::new(transport, identity).await);
 
         info!(
             ?identity_hash,
@@ -194,19 +194,20 @@ impl ReticulumNode {
     }
 
     /// Get the identity cache (shared reference).
-    #[doc(hidden)] pub fn identity_cache(&self) -> &IdentityCache {
+    #[doc(hidden)]
+    pub fn identity_cache(&self) -> &IdentityCache {
         &self.identity_cache
     }
 
     /// Get the space name hashes map (for announce filtering).
-    #[doc(hidden)] pub fn space_name_hashes(
-        &self,
-    ) -> &Arc<RwLock<HashMap<[u8; 10], Bytes>>> {
+    #[doc(hidden)]
+    pub fn space_name_hashes(&self) -> &Arc<RwLock<HashMap<[u8; 10], Bytes>>> {
         &self.space_name_hashes
     }
 
     /// Get a sender for peer discovery notifications.
-    #[doc(hidden)] pub fn peer_discovered_tx(
+    #[doc(hidden)]
+    pub fn peer_discovered_tx(
         &self,
     ) -> &tokio::sync::mpsc::Sender<PeerDiscovery> {
         &self.peer_discovered_tx
@@ -214,7 +215,8 @@ impl ReticulumNode {
 
     /// Take the peer discovery receiver (can only be called once).
     /// Consumed by the transport's bootstrap drain task.
-    #[doc(hidden)] pub async fn take_peer_discovered_rx(
+    #[doc(hidden)]
+    pub async fn take_peer_discovered_rx(
         &self,
     ) -> Option<tokio::sync::mpsc::Receiver<PeerDiscovery>> {
         self.peer_discovered_rx.lock().await.take()
@@ -224,11 +226,7 @@ impl ReticulumNode {
     /// publisher should include as `app_data`.
     ///
     /// Called by `ReticulumBootstrap::put`.
-    pub(crate) fn set_my_agent_info(
-        &self,
-        space_id: SpaceId,
-        bytes: Bytes,
-    ) {
+    pub(crate) fn set_my_agent_info(&self, space_id: SpaceId, bytes: Bytes) {
         self.my_agent_infos
             .write()
             .expect("poisoned")
@@ -237,7 +235,8 @@ impl ReticulumNode {
 
     /// Get the current `AgentInfoSigned` bytes to include as `app_data`
     /// in announces for the given space, if one has been set.
-    #[doc(hidden)] pub fn get_my_agent_info(&self, space_id: &SpaceId) -> Option<Bytes> {
+    #[doc(hidden)]
+    pub fn get_my_agent_info(&self, space_id: &SpaceId) -> Option<Bytes> {
         self.my_agent_infos
             .read()
             .expect("poisoned")
@@ -247,11 +246,7 @@ impl ReticulumNode {
 
     /// Register a `ReticulumBootstrap` instance's binding for a space.
     /// Called when the bootstrap factory creates a new instance.
-    pub(crate) fn bind_space(
-        &self,
-        space_id: SpaceId,
-        binding: PeerBinding,
-    ) {
+    pub(crate) fn bind_space(&self, space_id: SpaceId, binding: PeerBinding) {
         self.peer_space_bindings
             .write()
             .expect("poisoned")
@@ -441,10 +436,7 @@ async fn start_interfaces(
                     bind.clone(),
                     group.clone(),
                 );
-                mgr.spawn(
-                    udp,
-                    rns_transport::iface::udp::UdpInterface::spawn,
-                );
+                mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
                 info!(%bind, ?group, "Started Reticulum UDP interface");
             }
         }

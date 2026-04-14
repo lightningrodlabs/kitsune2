@@ -110,7 +110,9 @@ pub(crate) fn decode_frame(data: &[u8]) -> K2Result<ReticulumFrame> {
                 payload: Bytes::copy_from_slice(&data[17..]),
             })
         }
-        TAG_DATA => Ok(ReticulumFrame::Data(Bytes::copy_from_slice(&data[1..]))),
+        TAG_DATA => {
+            Ok(ReticulumFrame::Data(Bytes::copy_from_slice(&data[1..])))
+        }
         _ => Err(K2Error::other(format!(
             "Unknown Reticulum frame tag: 0x{tag:02x}"
         ))),

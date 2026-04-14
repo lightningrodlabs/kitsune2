@@ -4,9 +4,15 @@
 //! `TxImp` model onto Reticulum's per-(peer, space) Link model.
 
 use crate::destination::DynLink;
+use bytes::Bytes;
 use kitsune2_api::SpaceId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+
+/// Upper bound on Data frames buffered per peer while waiting for the
+/// preflight handshake. Exceeding this is almost certainly a stuck peer
+/// (or a buggy remote) — drop excess and log rather than leaking memory.
+pub(crate) const MAX_PENDING_DATA_FRAMES: usize = 64;
 
 /// State for a single per-space link to a peer.
 #[derive(Debug)]
@@ -46,6 +52,13 @@ pub(crate) struct PeerState {
     pub preflight_state: Mutex<PreflightState>,
     /// Per-space links. Key is the SpaceId.
     pub links: Mutex<HashMap<SpaceId, LinkContext>>,
+    /// Data frames received before the preflight handshake completed,
+    /// held until both `local_sent` and `remote_received` are set.
+    /// The two router tasks run on independent schedulers, so it is
+    /// possible for the peer's real `Data` frame to arrive at the data
+    /// router before the links router has run `start_preflight` on
+    /// this side — see the module docs in [`crate::routers`].
+    pub pending_data: Mutex<VecDeque<Bytes>>,
 }
 
 impl PeerState {
@@ -54,7 +67,25 @@ impl PeerState {
         Arc::new(Self {
             preflight_state: Mutex::new(PreflightState::default()),
             links: Mutex::new(HashMap::new()),
+            pending_data: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// Buffer a Data frame that arrived before preflight was ready.
+    /// Returns `true` if the frame was queued, `false` if the cap
+    /// ([`MAX_PENDING_DATA_FRAMES`]) was hit and the caller should drop + warn.
+    pub fn push_pending(&self, data: Bytes) -> bool {
+        let mut q = self.pending_data.lock().expect("poisoned");
+        if q.len() >= MAX_PENDING_DATA_FRAMES {
+            return false;
+        }
+        q.push_back(data);
+        true
+    }
+
+    /// Drain all pending Data frames. Called once preflight becomes ready.
+    pub fn drain_pending(&self) -> VecDeque<Bytes> {
+        std::mem::take(&mut *self.pending_data.lock().expect("poisoned"))
     }
 
     /// Insert a link for a given space. Returns true if this is the first

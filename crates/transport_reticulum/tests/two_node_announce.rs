@@ -32,8 +32,8 @@
 use rand_core::OsRng;
 use rns_transport::destination::DestinationName;
 use rns_transport::hash::AddressHash;
-use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::transport::{Transport, TransportConfig};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +65,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = a_tx_recv.recv().await {
             let _ = b_rx_send_clone
-                .send(RxMessage { address: b_iface_addr, packet })
+                .send(RxMessage {
+                    address: b_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -74,7 +77,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = b_tx_recv.recv().await {
             let _ = a_rx_send_clone
-                .send(RxMessage { address: a_iface_addr, packet })
+                .send(RxMessage {
+                    address: a_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -123,13 +129,10 @@ async fn two_transports_exchange_announces() {
     }
 
     // B should observe the announce within a reasonable window.
-    let ev = tokio::time::timeout(
-        Duration::from_secs(2),
-        b_announces.recv(),
-    )
-    .await
-    .expect("timed out waiting for announce on B")
-    .expect("announce broadcast closed");
+    let ev = tokio::time::timeout(Duration::from_secs(2), b_announces.recv())
+        .await
+        .expect("timed out waiting for announce on B")
+        .expect("announce broadcast closed");
 
     let got_hash = ev.destination.lock().await.desc.address_hash;
     assert_eq!(
@@ -158,9 +161,8 @@ async fn destination_hash_matches_offline_derivation() {
     cfg.set_link_proof_timeout_secs(5);
     let tp = Transport::new(cfg);
     let dest = {
-        let mut tp_guard = Transport::new(TransportConfig::new(
-            "owner", &identity, true,
-        ));
+        let mut tp_guard =
+            Transport::new(TransportConfig::new("owner", &identity, true));
         tp_guard.add_destination(identity.clone(), name).await
     };
     let actual = dest.lock().await.desc.address_hash;

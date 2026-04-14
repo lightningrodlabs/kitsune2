@@ -5,18 +5,18 @@
 //! / `FakeLink` harness -- no real Reticulum network, no sleeping.
 
 use crate::destination::{Endpoint, Link};
-use crate::frame::{encode_frame, ReticulumFrame};
+use crate::frame::{ReticulumFrame, encode_frame};
 use crate::routers::{
-    remove_link, spawn_close_router, spawn_data_router, spawn_links_router,
-    RouterState,
+    RouterState, remove_link, spawn_close_router, spawn_data_router,
+    spawn_links_router,
 };
-use crate::test_utils::harness::FakeLink;
 use crate::test_utils::FakeEndpoint;
+use crate::test_utils::harness::FakeLink;
 use crate::url::identity_hash_to_url;
 use bytes::Bytes;
 use kitsune2_api::{
-    AgentId, BoxFut, DynTxHandler, K2Result, SpaceId, Timestamp,
-    TxBaseHandler, TxHandler, TxImpHnd, Url,
+    AgentId, BoxFut, DynTxHandler, K2Result, SpaceId, Timestamp, TxBaseHandler,
+    TxHandler, TxImpHnd, Url,
 };
 use prost::Message;
 use rns_transport::hash::AddressHash;
@@ -57,9 +57,13 @@ impl TxHandler for RecordingHandler {
 
     fn preflight_validate_incoming(
         &self,
-        _peer_url: Url,
-        _data: Bytes,
+        peer_url: Url,
+        data: Bytes,
     ) -> BoxFut<'_, K2Result<()>> {
+        // `recv_data` funnels K2WireType::Preflight frames through
+        // here, so tests that assert on delivered payloads record
+        // here.
+        self.recvd.lock().unwrap().push((peer_url, data));
         Box::pin(async move { Ok(()) })
     }
 }
@@ -171,7 +175,7 @@ async fn links_router_drops_link_for_unknown_destination() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn data_router_drops_frames_before_preflight_ready() {
+async fn data_router_buffers_frames_until_preflight_ready() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
     let state = RouterState::new(1024 * 1024);
@@ -192,22 +196,206 @@ async fn data_router_drops_frames_before_preflight_ready() {
 
     // Now spawn the data router.
     let data_rx = endpoint.recv_resource_data().await.unwrap();
-    let _hd =
-        spawn_data_router(data_rx, state.clone(), hnd.clone());
+    let _hd = spawn_data_router(data_rx, state.clone(), hnd.clone());
 
-    // Inject a Data frame BEFORE preflight is ready. Router should drop it.
-    let encoded = encode_frame(
-        &ReticulumFrame::Data(Bytes::from_static(b"nope")),
+    // Inject a Data frame BEFORE remote's preflight has arrived —
+    // `local_sent` is true (links router ran start_preflight) but
+    // `remote_received` is still false, so the peer is not ready.
+    // The frame must be buffered, not delivered yet and not dropped.
+    //
+    // Payload is a valid K2Proto (shaped as a Preflight inner so the
+    // `RecordingHandler` records its delivery) — the outer
+    // `ReticulumFrame::Data` tag is what drives the buffer path.
+    let buffered_payload = Bytes::from_static(b"buffered-inner");
+    let buffered_k2proto = kitsune2_api::K2Proto {
+        ty: kitsune2_api::K2WireType::Preflight as i32,
+        data: buffered_payload.clone(),
+        space_id: None,
+        module_id: None,
+    }
+    .encode_to_vec();
+    let encoded_data = encode_frame(
+        &ReticulumFrame::Data(Bytes::from(buffered_k2proto)),
         1024,
     )
     .unwrap();
-    endpoint.inject_data(link.id(), encoded).await;
+    endpoint.inject_data(link.id(), encoded_data).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
+    let peer_url = identity_hash_to_url(&AddressHash::new([0xbb; 16])).unwrap();
+    let ps = state
+        .peer_states
+        .read()
+        .unwrap()
+        .get(&peer_url)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        ps.pending_data.lock().unwrap().len(),
+        1,
+        "data before preflight ready should have been buffered"
+    );
     assert!(
         rec.recvd.lock().unwrap().is_empty(),
-        "data before preflight should have been dropped"
+        "nothing should have been delivered to the handler yet"
     );
+
+    // Now the remote's Preflight arrives. Flipping `remote_received`
+    // makes the peer ready, and the drain should fire: preflight
+    // dispatched first, then the buffered Data.
+    let inner = kitsune2_api::K2Proto {
+        ty: kitsune2_api::K2WireType::Preflight as i32,
+        data: Bytes::from_static(b"preflight-in"),
+        space_id: None,
+        module_id: None,
+    }
+    .encode_to_vec();
+    let encoded_pf = encode_frame(
+        &ReticulumFrame::Preflight {
+            sender_main_identity: AddressHash::new([0xbb; 16]),
+            payload: Bytes::from(inner),
+        },
+        1024,
+    )
+    .unwrap();
+    endpoint.inject_data(link.id(), encoded_pf).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let recvd = rec.recvd.lock().unwrap().clone();
+    assert_eq!(
+        recvd.len(),
+        2,
+        "preflight + buffered data should both dispatch"
+    );
+    // Preflight is dispatched before the drain runs.
+    assert_eq!(recvd[0].0, peer_url);
+    assert_eq!(recvd[0].1, Bytes::from_static(b"preflight-in"));
+    assert_eq!(recvd[1].0, peer_url);
+    assert_eq!(recvd[1].1, buffered_payload);
+    assert!(ps.pending_data.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn data_router_buffer_cap_drops_excess() {
+    use crate::peer_state::MAX_PENDING_DATA_FRAMES;
+    let endpoint = FakeEndpoint::new();
+    let (_rec, hnd) = mk_handler();
+    let state = RouterState::new(1024 * 1024);
+    state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
+
+    let links_rx = endpoint.recv_links().await.unwrap();
+    let _hl = spawn_links_router(
+        links_rx,
+        state.clone(),
+        hnd.clone(),
+        endpoint.clone(),
+        AddressHash::new([0u8; 16]),
+    );
+    let link = FakeLink::new(0x11, 0xbb, 0x77);
+    endpoint.inject_link(link.clone()).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let data_rx = endpoint.recv_resource_data().await.unwrap();
+    let _hd = spawn_data_router(data_rx, state.clone(), hnd.clone());
+
+    // Inject cap + 5 Data frames; only MAX_PENDING_DATA_FRAMES should
+    // land in the queue.
+    for _ in 0..(MAX_PENDING_DATA_FRAMES + 5) {
+        let encoded =
+            encode_frame(&ReticulumFrame::Data(Bytes::from_static(b"x")), 1024)
+                .unwrap();
+        endpoint.inject_data(link.id(), encoded).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let peer_url = identity_hash_to_url(&AddressHash::new([0xbb; 16])).unwrap();
+    let ps = state
+        .peer_states
+        .read()
+        .unwrap()
+        .get(&peer_url)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        ps.pending_data.lock().unwrap().len(),
+        MAX_PENDING_DATA_FRAMES,
+        "queue must not exceed its cap"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn data_router_drains_buffered_frames_under_main_url_after_rekey() {
+    // Simulates the production race: remote's Preflight + Data arrive
+    // under the ephemeral peer URL, but carry a different main identity
+    // so the data router re-keys PeerState to the main URL. Any Data
+    // buffered before Preflight must drain under the main URL, not the
+    // ephemeral one.
+    let endpoint = FakeEndpoint::new();
+    let (rec, hnd) = mk_handler();
+    let state = RouterState::new(1024 * 1024);
+    state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
+
+    let links_rx = endpoint.recv_links().await.unwrap();
+    let _hl = spawn_links_router(
+        links_rx,
+        state.clone(),
+        hnd.clone(),
+        endpoint.clone(),
+        AddressHash::new([0u8; 16]),
+    );
+    // Ephemeral peer hash is 0xbb; main identity is 0xaa.
+    let link = FakeLink::new(0x11, 0xbb, 0x77);
+    endpoint.inject_link(link.clone()).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let data_rx = endpoint.recv_resource_data().await.unwrap();
+    let _hd = spawn_data_router(data_rx, state.clone(), hnd.clone());
+
+    // Buffer a Data frame first (arrives under ephemeral URL).
+    // Shape the inner as a K2Proto::Preflight so the recording handler
+    // will observe the delivery when the drain runs.
+    let buffered_payload = Bytes::from_static(b"rekey-me");
+    let buffered_k2proto = kitsune2_api::K2Proto {
+        ty: kitsune2_api::K2WireType::Preflight as i32,
+        data: buffered_payload.clone(),
+        space_id: None,
+        module_id: None,
+    }
+    .encode_to_vec();
+    let encoded_data = encode_frame(
+        &ReticulumFrame::Data(Bytes::from(buffered_k2proto)),
+        1024,
+    )
+    .unwrap();
+    endpoint.inject_data(link.id(), encoded_data).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Now Preflight with a different main identity → triggers re-key +
+    // drain under the main URL.
+    let inner = kitsune2_api::K2Proto {
+        ty: kitsune2_api::K2WireType::Preflight as i32,
+        data: Bytes::from_static(b"preflight-in"),
+        space_id: None,
+        module_id: None,
+    }
+    .encode_to_vec();
+    let encoded_pf = encode_frame(
+        &ReticulumFrame::Preflight {
+            sender_main_identity: AddressHash::new([0xaa; 16]),
+            payload: Bytes::from(inner),
+        },
+        1024,
+    )
+    .unwrap();
+    endpoint.inject_data(link.id(), encoded_pf).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let main_url = identity_hash_to_url(&AddressHash::new([0xaa; 16])).unwrap();
+    let recvd = rec.recvd.lock().unwrap().clone();
+    assert_eq!(recvd.len(), 2);
+    assert_eq!(recvd[0].0, main_url, "preflight dispatched under main URL");
+    assert_eq!(recvd[1].0, main_url, "buffered data drained under main URL");
+    assert_eq!(recvd[1].1, buffered_payload);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -230,8 +418,7 @@ async fn data_router_flips_preflight_state_to_ready() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let data_rx = endpoint.recv_resource_data().await.unwrap();
-    let _hd =
-        spawn_data_router(data_rx, state.clone(), hnd.clone());
+    let _hd = spawn_data_router(data_rx, state.clone(), hnd.clone());
 
     // Inject an incoming Preflight frame. The inner bytes must be a
     // valid encoded K2Proto with ty=Preflight; handler.recv_data
@@ -288,13 +475,7 @@ async fn remove_link_fires_peer_disconnect_on_last_close() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Close the only link -- should fire peer_disconnect.
-    remove_link(
-        &link.id(),
-        Some("test close".into()),
-        &state,
-        &hnd,
-    )
-    .await;
+    remove_link(&link.id(), Some("test close".into()), &state, &hnd).await;
 
     let peer_url = identity_hash_to_url(&AddressHash::new([0xbb; 16])).unwrap();
     let disconnects = rec.peer_disconnects.lock().unwrap();

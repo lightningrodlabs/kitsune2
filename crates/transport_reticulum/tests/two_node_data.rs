@@ -31,12 +31,12 @@ use kitsune2_api::{
     TxSpaceHandler, Url,
 };
 use kitsune2_transport_reticulum::{
-    internal_testing, ReticulumInterfaceConfig, ReticulumNode,
-    ReticulumTransportConfig,
+    ReticulumInterfaceConfig, ReticulumNode, ReticulumTransportConfig,
+    internal_testing,
 };
 use rand_core::OsRng;
-use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::iface::{RxMessage, TxMessage};
 use rns_transport::transport::{Transport as RnsTransport, TransportConfig};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,10 +78,7 @@ impl TxSpaceHandler for RecSpaceHandler {
         space_id: SpaceId,
         data: Bytes,
     ) -> K2Result<()> {
-        self.notifies
-            .lock()
-            .unwrap()
-            .push((peer, space_id, data));
+        self.notifies.lock().unwrap().push((peer, space_id, data));
         Ok(())
     }
     fn is_any_agent_at_url_blocked(&self, _peer_url: &Url) -> K2Result<bool> {
@@ -119,7 +116,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = a_tx_recv.recv().await {
             let _ = b_rx_send_clone
-                .send(RxMessage { address: b_iface_addr, packet })
+                .send(RxMessage {
+                    address: b_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -127,7 +127,10 @@ async fn wire_loopback(
     tokio::spawn(async move {
         while let Some(TxMessage { packet, .. }) = b_tx_recv.recv().await {
             let _ = a_rx_send_clone
-                .send(RxMessage { address: a_iface_addr, packet })
+                .send(RxMessage {
+                    address: a_iface_addr,
+                    packet,
+                })
                 .await;
         }
     });
@@ -189,14 +192,12 @@ async fn data_roundtrip_a_to_b() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Wrap each in a ReticulumNode.
-    let node_a =
-        ReticulumNode::from_rns_transport(tp_a.clone(), id_a.clone())
-            .await
-            .unwrap();
-    let node_b =
-        ReticulumNode::from_rns_transport(tp_b.clone(), id_b.clone())
-            .await
-            .unwrap();
+    let node_a = ReticulumNode::from_rns_transport(tp_a.clone(), id_a.clone())
+        .await
+        .unwrap();
+    let node_b = ReticulumNode::from_rns_transport(tp_b.clone(), id_b.clone())
+        .await
+        .unwrap();
 
     // Per-node TxHandlers for the kitsune2-side recording.
     let h_a = Arc::new(RecHandler::default());
@@ -206,20 +207,14 @@ async fn data_roundtrip_a_to_b() {
 
     // Build full DynTransports — kicks off announce listener + routers.
     let cfg = k2_config();
-    let trans_a = internal_testing::create_transport(
-        cfg.clone(),
-        dyn_a,
-        node_a.clone(),
-    )
-    .await
-    .unwrap();
-    let trans_b = internal_testing::create_transport(
-        cfg.clone(),
-        dyn_b,
-        node_b.clone(),
-    )
-    .await
-    .unwrap();
+    let trans_a =
+        internal_testing::create_transport(cfg.clone(), dyn_a, node_a.clone())
+            .await
+            .unwrap();
+    let trans_b =
+        internal_testing::create_transport(cfg.clone(), dyn_b, node_b.clone())
+            .await
+            .unwrap();
 
     // Register space + space handlers on both sides. This triggers
     // the per-space announce publisher tasks.

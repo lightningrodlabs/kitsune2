@@ -37,6 +37,7 @@ mod frame;
 mod url;
 
 mod announce;
+mod announce_wire;
 mod bootstrap;
 mod link;
 mod node;
@@ -76,8 +77,7 @@ async fn create_reticulum_transport(
     node: Arc<ReticulumNode>,
 ) -> K2Result<DynTransport> {
     let handler = TxImpHnd::new(handler);
-    let imp =
-        ReticulumTransport::create(config, handler.clone(), node).await?;
+    let imp = ReticulumTransport::create(config, handler.clone(), node).await?;
     Ok(DefaultTransport::create(&handler, imp))
 }
 
@@ -90,8 +90,8 @@ async fn create_reticulum_transport(
 pub mod internal_testing {
     use super::*;
 
+    pub use crate::announce_wire::encode_announce_wire;
     pub use crate::bootstrap::ReticulumBootstrap;
-    pub use crate::bootstrap::compress_app_data;
 
     /// Spawn the announce listener + bootstrap drain for a standalone
     /// `ReticulumNode` that isn't running under a full
@@ -112,10 +112,8 @@ pub mod internal_testing {
             node.take_peer_discovered_rx().await.ok_or_else(|| {
                 K2Error::other("peer_discovered rx already taken")
             })?;
-        let drain = crate::bootstrap::spawn_bootstrap_drain(
-            drain_rx,
-            node.clone(),
-        );
+        let drain =
+            crate::bootstrap::spawn_bootstrap_drain(drain_rx, node.clone());
         Ok(vec![listener, drain])
     }
 
@@ -317,9 +315,7 @@ impl ReticulumTransport {
         // its ReticulumBootstrap instance).
         let drain_rx =
             node.take_peer_discovered_rx().await.ok_or_else(|| {
-                K2Error::other(
-                    "peer_discovered receiver already taken",
-                )
+                K2Error::other("peer_discovered receiver already taken")
             })?;
         let bootstrap_drain_handle =
             bootstrap::spawn_bootstrap_drain(drain_rx, node.clone());
@@ -435,8 +431,8 @@ impl TxImp for ReticulumTransport {
                         )
                         .await?;
 
-                    let first_link = peer_state
-                        .insert_link(space_id.clone(), link.clone());
+                    let first_link =
+                        peer_state.insert_link(space_id.clone(), link.clone());
                     router_state
                         .link_registry
                         .write()
@@ -491,16 +487,13 @@ impl TxImp for ReticulumTransport {
             // says "the link is bidirectionally ready."
             routers::wait_for_preflight_ready(
                 &peer_state,
-                std::time::Duration::from_secs(
-                    config.connect_timeout_s as u64,
-                ),
+                std::time::Duration::from_secs(config.connect_timeout_s as u64),
             )
             .await?;
 
             // Encode as a Data frame and send.
             let frame = frame::ReticulumFrame::Data(data);
-            let encoded =
-                frame::encode_frame(&frame, config.max_frame_bytes)?;
+            let encoded = frame::encode_frame(&frame, config.max_frame_bytes)?;
             routers::send_over_link(
                 &link,
                 &encoded,
@@ -570,10 +563,7 @@ impl TxImp for ReticulumTransport {
                         .entry(space_id.clone())
                         .or_default()
                         .push(h);
-                    debug!(
-                        ?space_id,
-                        "Started Reticulum per-space tasks"
-                    );
+                    debug!(?space_id, "Started Reticulum per-space tasks");
                 }
                 Err(e) => {
                     warn!(
@@ -589,11 +579,8 @@ impl TxImp for ReticulumTransport {
     fn unregister_space(&self, space_id: SpaceId) {
         let node = self.node.clone();
         // Abort any per-space tasks we spawned.
-        if let Some(tasks) = self
-            .space_tasks
-            .lock()
-            .expect("poisoned")
-            .remove(&space_id)
+        if let Some(tasks) =
+            self.space_tasks.lock().expect("poisoned").remove(&space_id)
         {
             for h in tasks {
                 h.abort();

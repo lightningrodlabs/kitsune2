@@ -253,7 +253,22 @@ impl AgentInfoSigned {
             .collect())
     }
 
-    fn inner_decode_one<V: Verifier>(
+    /// Decode directly from the raw signed-JSON string + raw signature
+    /// bytes, skipping the outer JSON wrapper used by [`Self::decode`].
+    ///
+    /// Intended for transports that carry announces in a denser wire
+    /// format than the `{"agentInfo":..,"signature":..}` envelope —
+    /// they can reconstruct an `AgentInfoSigned` without round-tripping
+    /// through JSON a second time.
+    pub fn decode_parts<V: Verifier + ?Sized>(
+        verifier: &V,
+        agent_info: String,
+        signature: bytes::Bytes,
+    ) -> K2Result<std::sync::Arc<Self>> {
+        Self::inner_decode_one(verifier, agent_info, signature)
+    }
+
+    fn inner_decode_one<V: Verifier + ?Sized>(
         verifier: &V,
         agent_info: String,
         signature: bytes::Bytes,

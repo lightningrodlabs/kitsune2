@@ -14,7 +14,13 @@ use kitsune2_api::{K2Error, K2Result};
 
 /// Configuration for the Reticulum transport.
 #[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ReticulumTransportConfig {
@@ -75,7 +81,13 @@ pub struct ReticulumTransportConfig {
 
 /// Configuration for a single Reticulum interface.
 #[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
 )]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ReticulumInterfaceConfig {
