@@ -5,10 +5,11 @@
 //! `PLAN-beechat-backend.md` §5 for the full design. The most important
 //! differences from LXMF-rs:
 //!
-//! - Beechat's `AnnounceEvent` has no `name_hash` / `hops`; we derive
-//!   `name_hash` by locking the `SingleOutputDestination` and reading
-//!   its `DestinationName`. `hops` is reported as `0` (Beechat does not
-//!   surface it).
+//! - Beechat's `AnnounceEvent` has no `name_hash`; we derive it by
+//!   locking the `SingleOutputDestination` and reading its
+//!   `DestinationName`. `hops` is surfaced by our fork
+//!   (`../Reticulum-rs-lrl`) — upstream doesn't carry it on the
+//!   event — so we forward the fork's `ev.hops` directly.
 //! - There is no Resource abstraction. Data flows only through
 //!   `LinkEvent::Data(LinkPayload)` on the in/out link event streams.
 //!   The `PACKET_MDU` is 2048 bytes, so payloads above that bound error
@@ -295,8 +296,9 @@ fn spawn_announce_bridge(
                         identity,
                         app_data,
                         name_hash,
-                        // Beechat doesn't surface hops on AnnounceEvent.
-                        hops: 0,
+                        // `hops` is surfaced by our fork; upstream
+                        // Beechat doesn't expose it on `AnnounceEvent`.
+                        hops: ev.hops,
                     };
                     let _ = tx.send(info);
                 }
@@ -512,16 +514,22 @@ impl Endpoint for RealEndpoint {
     }
 
     fn send_packet(&self, _packet: &[u8]) -> BoxFut<'_, K2Result<()>> {
-        // Beechat's `Transport::send_packet` takes a fully-constructed
-        // `Packet`, and the `Link::data_packet` encrypt-and-frame step
-        // is what produces that `Packet`. The current trait hands us
-        // opaque bytes produced by `Link::data_packet` (see below),
-        // so a faithful `send_packet` would need to re-decode them
-        // back into a `Packet` — work deferred until the ≤ MDU fast
-        // path is wired up at the router layer.
+        // NOTE: This is the `Endpoint::send_packet(&[u8])` trait
+        // method and is NOT the send path for announces or link data
+        // — don't confuse it with Beechat's
+        // `reticulum::transport::Transport::send_packet(Packet)`,
+        // which this backend DOES call from
+        // `RealDestination::announce` and `RealLink::send_small` to
+        // actually emit packets on the wire.
+        //
+        // This trait method takes opaque bytes (produced by a legacy
+        // `Link::data_packet` signature that no longer exists). Every
+        // real send path now goes through `send_small` (≤ MDU) or
+        // `send_resource` (> MDU). Leaving this stubbed is fine; it's
+        // not called from the router layer.
         Box::pin(async move {
             Err(K2Error::other(
-                "Beechat backend: send_packet not implemented (use send_resource for ≤ MDU sends)",
+                "Beechat backend: Endpoint::send_packet(&[u8]) is unused — send paths go through Link::send_small or Endpoint::send_resource",
             ))
         })
     }
