@@ -112,7 +112,7 @@ impl ReticulumNode {
     /// 4. Instantiate `rns_transport::Transport`.
     /// 5. Spawn every configured interface on the Transport's
     ///    `InterfaceManager`.
-    /// 6. Wrap the live Transport in a [`RealEndpoint`] and return a
+    /// 6. Wrap the live Transport in a `RealEndpoint` and return a
     ///    shared `ReticulumNode`.
     pub async fn from_config(
         config: ReticulumTransportConfig,
@@ -337,18 +337,6 @@ impl ReticulumNode {
         let mut hashes = self.space_name_hashes.write().expect("poisoned");
         hashes.retain(|_, v| *v != space_bytes);
         debug!(?space_id, "Unregistered Reticulum destination for space");
-    }
-
-    /// Send data to a peer on a specific space's link.
-    pub(crate) async fn send_to_peer(
-        &self,
-        _peer_identity: &Identity,
-        _space_id: &SpaceId,
-        _data: &[u8],
-        _max_frame_bytes: usize,
-    ) -> K2Result<()> {
-        // TODO: implement link management + send
-        Err(K2Error::other("send_to_peer not yet implemented"))
     }
 }
 

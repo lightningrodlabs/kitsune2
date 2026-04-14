@@ -26,7 +26,7 @@
 //!
 //! # Trait abstraction
 //!
-//! All I/O operations are behind traits in the [`destination`] module,
+//! All I/O operations are behind traits in the `destination` module,
 //! mirroring the Iroh transport's endpoint abstraction. This allows unit
 //! tests to swap in fakes without a real Reticulum network.
 
