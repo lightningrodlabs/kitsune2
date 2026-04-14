@@ -58,3 +58,10 @@ schema = ["dep:schemars"]
 test-utils = ["dep:kitsune2_core", "dep:kitsune2_test_utils", "iroh/test-utils"]
 
 metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+
+# Enable iroh's mDNS-based local swarm discovery. When set and the
+# `enable_lan_discovery` config flag is on, two nodes on the same LAN can
+# dial each other by iroh NodeId without a relay. This only provides
+# dialability — it does not distribute Kitsune2 AgentInfoSigned; that is the
+# job of the `kitsune2_bootstrap_mdns` crate.
+mdns = ["iroh/discovery-local-network"]

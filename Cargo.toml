@@ -2,6 +2,7 @@
 members = [
   "crates/api",
   "crates/bootstrap_client",
+  "crates/bootstrap_mdns",
   "crates/bootstrap_srv",
   "crates/core",
   "crates/dht",
@@ -42,6 +43,7 @@ kitsune2_gossip = { version = "0.4.0-dev.0", path = "crates/gossip" }
 kitsune2_transport_tx5 = { version = "0.4.0-dev.0", path = "crates/transport_tx5", default-features = false }
 kitsune2_transport_iroh = { version = "0.4.0-dev.0", path = "crates/transport_iroh" }
 kitsune2_bootstrap_client = { version = "0.4.0-dev.0", path = "crates/bootstrap_client" }
+kitsune2_bootstrap_mdns = { version = "0.4.0-dev.0", path = "crates/bootstrap_mdns" }
 
 # used by bootstrap_srv for mpmc worker queue pattern.
 async-channel = "2.3.1"

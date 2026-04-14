@@ -200,6 +200,7 @@ use url::*;
 mod connection;
 mod connection_context;
 mod endpoint;
+mod lan_discovery;
 mod stream;
 use connection_context::*;
 #[cfg(feature = "metrics")]
@@ -246,6 +247,18 @@ pub mod config {
         /// Defaults to 60 seconds.
         #[cfg_attr(feature = "schema", schemars(default))]
         pub connect_timeout_s: u32,
+
+        /// Enable iroh's mDNS-based LAN discovery so that two nodes on the
+        /// same local network can dial each other by iroh NodeId without a
+        /// relay. Requires the `mdns` cargo feature on
+        /// `kitsune2_transport_iroh`.
+        ///
+        /// Note: this only provides *dialability*. Agent-info distribution
+        /// over the LAN is the job of the `kitsune2_bootstrap_mdns` crate.
+        ///
+        /// Default: false.
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub enable_lan_discovery: bool,
     }
 
     impl Default for IrohTransportConfig {
@@ -255,6 +268,7 @@ pub mod config {
                 relay_allow_plain_text: false,
                 max_frame_bytes: 1024 * 1024,
                 connect_timeout_s: 60,
+                enable_lan_discovery: false,
             }
         }
     }
@@ -299,6 +313,11 @@ impl TransportFactory for IrohTransportFactory {
                 return Err(K2Error::other("Disallowed plaintext relay URL"));
             }
         }
+
+        lan_discovery::validate_lan_discovery_config(
+            config.iroh_transport.enable_lan_discovery,
+        )
+        .map_err(K2Error::other)?;
 
         Ok(())
     }
@@ -431,6 +450,11 @@ impl IrohTransport {
         {
             builder = builder.insecure_skip_relay_cert_verify(true);
         }
+
+        builder = lan_discovery::maybe_enable_lan_discovery(
+            builder,
+            config.enable_lan_discovery,
+        );
 
         let endpoint = builder.bind().await.map_err(|err| {
             K2Error::other_src("Failed to bind iroh endpoint", err)

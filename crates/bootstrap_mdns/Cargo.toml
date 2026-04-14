@@ -1,0 +1,41 @@
+[package]
+name = "kitsune2_bootstrap_mdns"
+version.workspace = true
+description = "mDNS-based LAN peer discovery/bootstrap for kitsune2"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/kitsune2_bootstrap_mdns"
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+kitsune2_api = { workspace = true }
+mdns-sd = "0.19"
+flume = { version = "0.11", default-features = false, features = ["async"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+rand = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tracing = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+[dev-dependencies]
+kitsune2_core = { workspace = true }
+kitsune2_test_utils = { workspace = true }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+
+[features]
+schema = ["dep:schemars"]
