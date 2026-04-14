@@ -214,6 +214,9 @@ pub use server::*;
 mod tls;
 pub use tls::*;
 
+mod stats;
+pub use stats::*;
+
 mod auth;
 pub use auth::*;
 

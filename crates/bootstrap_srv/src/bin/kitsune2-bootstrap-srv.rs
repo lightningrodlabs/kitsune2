@@ -68,6 +68,11 @@ pub struct Args {
     #[arg(long)]
     pub allowed_origins: Option<Vec<String>>,
 
+    /// If set, the /metrics endpoint will be enabled, returning current
+    /// and historical stats (last hour/day/week/month/all-time).
+    #[arg(long)]
+    pub metrics: bool,
+
     /// If specified, this will enable exporting metrics to an OpenTelemetry endpoint.
     #[arg(long)]
     pub otlp_endpoint: Option<String>,
@@ -169,6 +174,7 @@ fn main() {
     if let Some(allowed_origins) = args.allowed_origins {
         config.allowed_origins = Some(allowed_origins);
     }
+    config.metrics = args.metrics;
 
     // Setup opentelemetry metrics
     let meter_provider =

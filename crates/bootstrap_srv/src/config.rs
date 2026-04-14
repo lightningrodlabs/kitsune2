@@ -111,6 +111,14 @@ pub struct Config {
     /// If `None`, defaults to allowing any origin.
     pub allowed_origins: Option<Vec<String>>,
 
+    /// If true, the `/metrics` endpoint is enabled and returns current
+    /// plus historical stats (last hour/day/week/month/all-time).
+    ///
+    /// Defaults:
+    /// - `testing = false`
+    /// - `production = false`
+    pub metrics: bool,
+
     /// Authentication configuration.
     ///
     /// This is independent of the relay implementation.
@@ -138,6 +146,7 @@ impl Config {
             relay_client_rx_burst_bytes: None,
             no_relay_server: false,
             allowed_origins: None,
+            metrics: false,
             auth: crate::auth::AuthConfig::default(),
         }
     }
@@ -165,6 +174,7 @@ impl Config {
             relay_client_rx_burst_bytes: None,
             no_relay_server: false,
             allowed_origins: None,
+            metrics: false,
             auth: crate::auth::AuthConfig::default(),
         }
     }

@@ -93,6 +93,13 @@ impl BootstrapSrv {
         let addrs = server.server_addrs().to_vec();
         tracing::info!(?addrs, "Listening");
 
+        // Create metrics collector if enabled.
+        let metrics = if config.metrics {
+            Some(crate::MetricsCollector::new())
+        } else {
+            None
+        };
+
         // spawn our worker threads
         let mut workers = Vec::with_capacity(config.worker_thread_count + 1);
         for _ in 0..config.worker_thread_count {
@@ -101,8 +108,9 @@ impl BootstrapSrv {
             let store = store.clone();
             let recv = server.receiver().clone();
             let space_map = space_map.clone();
+            let metrics = metrics.clone();
             workers.push(std::thread::spawn(move || {
-                worker(config, cont, store, recv, space_map)
+                worker(config, cont, store, recv, space_map, metrics)
             }));
         }
 
@@ -143,6 +151,7 @@ impl BootstrapSrv {
                 prune_auth_tracker,
                 on_tokens_pruned,
                 live_relay_tokens,
+                metrics,
             )
         }));
 
@@ -199,6 +208,7 @@ fn prune_worker(
     auth_tracker: crate::auth::AuthTokenTracker,
     on_tokens_pruned: OnTokensPruned,
     live_relay_tokens: LiveRelayTokens,
+    metrics: Option<crate::MetricsCollector>,
 ) -> std::io::Result<()> {
     let _g = ThreadGuard("prune_worker thread has ended");
 
@@ -228,6 +238,12 @@ fn prune_worker(
             if let Some(cb) = &on_tokens_pruned {
                 cb(&expired_tokens);
             }
+
+            // Record a metrics snapshot if enabled.
+            if let Some(mc) = &metrics {
+                let (spaces, agents, min, max) = space_map.stats();
+                mc.record_snapshot(spaces, agents, min, max);
+            }
         }
     }
 
@@ -240,6 +256,7 @@ fn worker(
     store: Arc<crate::Store>,
     recv: HttpReceiver,
     space_map: crate::SpaceMap,
+    metrics: Option<crate::MetricsCollector>,
 ) -> std::io::Result<()> {
     let _g = ThreadGuard("worker thread has ended");
 
@@ -253,6 +270,7 @@ fn worker(
             config: &config,
             store: &store,
             space_map: &space_map,
+            metrics: &metrics,
             res,
         };
 
@@ -266,6 +284,7 @@ struct Handler<'lt> {
     config: &'lt Config,
     store: &'lt crate::Store,
     space_map: &'lt crate::SpaceMap,
+    metrics: &'lt Option<crate::MetricsCollector>,
     res: HttpRespondCb,
 }
 
@@ -293,6 +312,14 @@ impl Handler<'_> {
     ) -> std::io::Result<(u16, Vec<u8>)> {
         match req {
             HttpRequest::HealthGet => Ok((200, b"{}".to_vec())),
+            HttpRequest::MetricsGet => {
+                let current = self.space_map.stats();
+                let body = match &self.metrics {
+                    Some(mc) => serde_json::to_vec(&mc.to_json(current))?,
+                    None => b"{}".to_vec(),
+                };
+                Ok((200, body))
+            }
             HttpRequest::BootstrapGet { space } => self.handle_boot_get(space),
             HttpRequest::BootstrapPut { space, agent, body } => {
                 self.handle_boot_put(space, agent, body)

@@ -200,6 +200,7 @@ pub type HttpRespondCb = Box<dyn FnOnce(HttpResponse) + 'static + Send>;
 
 pub enum HttpRequest {
     HealthGet,
+    MetricsGet,
     BootstrapGet {
         space: bytes::Bytes,
     },
@@ -444,7 +445,7 @@ fn tokio_thread(
             let auth_tracker = crate::auth::AuthTokenTracker::default();
             let auth_config = Arc::new(config.auth.clone());
 
-            let app = Router::<AppState>::new()
+            let mut app = Router::<AppState>::new()
                 .route("/authenticate", routing::put(handle_auth))
                 .route("/health", routing::get(handle_health_get))
                 .route("/bootstrap/{space}", routing::get(handle_boot_get))
@@ -452,6 +453,10 @@ fn tokio_thread(
                     "/bootstrap/{space}/{agent}",
                     routing::put(handle_boot_put),
                 );
+
+            if config.metrics {
+                app = app.route("/metrics", routing::get(handle_metrics_get));
+            }
 
             let mut app = app
                 .layer(tower_http::cors::CorsLayer::new()
@@ -784,6 +789,12 @@ async fn handle_health_get(
     //        infrastructure maintainers can weigh the trade-offs.
 
     handle_dispatch(&state.h_send, HttpRequest::HealthGet).await
+}
+
+async fn handle_metrics_get(
+    extract::State(state): extract::State<AppState>,
+) -> response::Response {
+    handle_dispatch(&state.h_send, HttpRequest::MetricsGet).await
 }
 
 async fn handle_boot_get(
