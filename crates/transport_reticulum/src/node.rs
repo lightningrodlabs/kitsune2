@@ -123,11 +123,30 @@ impl ReticulumNode {
         let identity_hash = identity.as_identity().address_hash;
 
         // Tune the rns transport with config values we care about.
+        //
+        // `broadcast: true` is load-bearing. rns's internal
+        // `path_table` only populates routes for Link IDs once an
+        // announce has been observed for that destination; link
+        // establishment alone does not add a route. With
+        // `broadcast: false`, `Transport::send_packet_with_outcome`
+        // hits `DroppedNoRoute` (surfaced to callers as
+        // `RnsError::ConnectionError`) whenever it's asked to send a
+        // Data packet to a Link ID that hasn't been advertised by
+        // announce yet — which is the normal case for resource-manager
+        // traffic like our preflight frames on a freshly-Active link.
+        //
+        // Setting `broadcast: true` makes the fallback branch send the
+        // packet on all interfaces, which for a point-to-point TCP
+        // interface just means "deliver to the one peer on the other
+        // end." It matches the pattern the in-process loopback
+        // integration tests use (see `two_node_data.rs`) and is what
+        // unblocks real-TCP deployments. See
+        // `tests/two_node_tcp_preflight.rs` for the regression target.
         let mut transport_config =
             rns_transport::transport::TransportConfig::new(
                 format!("kitsune2-{}", identity_hash.to_hex_string()),
                 &identity,
-                false,
+                true,
             );
         transport_config
             .set_link_idle_timeout_secs(config.link_idle_timeout_s as u64);
