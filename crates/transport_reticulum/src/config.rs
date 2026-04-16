@@ -37,6 +37,7 @@ pub struct ReticulumTransportConfig {
     /// is strongly recommended for anything beyond ephemeral tests.
     ///
     /// Defaults to `None`.
+    #[serde(default)]
     #[schemars(default)]
     pub identity_path: Option<std::path::PathBuf>,
 
@@ -47,6 +48,7 @@ pub struct ReticulumTransportConfig {
     /// cap limits what we hand to `send_resource()`.
     ///
     /// Default: 1 MiB.
+    #[serde(default = "default_max_frame_bytes")]
     #[schemars(default)]
     pub max_frame_bytes: usize,
 
@@ -56,6 +58,7 @@ pub struct ReticulumTransportConfig {
     /// round-trip.
     ///
     /// Default: 30 seconds.
+    #[serde(default = "default_connect_timeout_s")]
     #[schemars(default)]
     pub connect_timeout_s: u32,
 
@@ -65,6 +68,7 @@ pub struct ReticulumTransportConfig {
     /// every interval.
     ///
     /// Default: 300 seconds.
+    #[serde(default = "default_announce_interval_s")]
     #[schemars(default)]
     pub announce_interval_s: u32,
 
@@ -75,8 +79,22 @@ pub struct ReticulumTransportConfig {
     /// other per-space Links may still be active.
     ///
     /// Default: 600 seconds.
+    #[serde(default = "default_link_idle_timeout_s")]
     #[schemars(default)]
     pub link_idle_timeout_s: u32,
+}
+
+fn default_max_frame_bytes() -> usize {
+    1024 * 1024
+}
+fn default_connect_timeout_s() -> u32 {
+    30
+}
+fn default_announce_interval_s() -> u32 {
+    300
+}
+fn default_link_idle_timeout_s() -> u32 {
+    600
 }
 
 /// Configuration for a single Reticulum interface.
