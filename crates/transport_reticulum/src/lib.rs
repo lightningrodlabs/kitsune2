@@ -274,7 +274,10 @@ impl ReticulumTransport {
 
         // Build the shared RouterState that both routers and TxImp::send
         // consult.
-        let router_state = RouterState::new(config.max_frame_bytes);
+        let router_state = RouterState::new(
+            config.max_frame_bytes,
+            config.connect_timeout_s,
+        );
 
         // Spawn the global announce listener (identity cache + bootstrap
         // candidate queue), the inbound-link router, and the data router.
@@ -408,14 +411,19 @@ impl TxImp for ReticulumTransport {
             };
 
             // Get (or create) an outbound link for this (peer, space).
-            let peer_state = {
+            let (peer_state, created_new) = {
                 let mut states =
                     router_state.peer_states.write().expect("poisoned");
-                states
+                let exists = states.contains_key(&remote_url);
+                let entry = states
                     .entry(remote_url.clone())
                     .or_insert_with(PeerState::new)
-                    .clone()
+                    .clone();
+                (entry, !exists)
             };
+            if created_new {
+                info!(%remote_url, "[pf] PeerState created (outbound)");
+            }
 
             let link = match peer_state.get_link(&space_id) {
                 Some(l) => l,
@@ -433,6 +441,15 @@ impl TxImp for ReticulumTransport {
 
                     let first_link =
                         peer_state.insert_link(space_id.clone(), link.clone());
+                    let link_count = peer_state.link_count();
+                    info!(
+                        %remote_url,
+                        ?space_id,
+                        link_id = ?link.id(),
+                        first_link,
+                        link_count,
+                        "[pf] outbound link registered"
+                    );
                     router_state
                         .link_registry
                         .write()
@@ -524,10 +541,63 @@ impl TxImp for ReticulumTransport {
             {
                 peer_urls.push(url);
             }
+
+            // Snapshot (url, peer_state) pairs under the lock, then
+            // assemble stats without holding it.
+            let peer_snapshot: Vec<(Url, Arc<PeerState>)> = {
+                let states =
+                    self.router_state.peer_states.read().expect("poisoned");
+                states
+                    .iter()
+                    .map(|(u, ps)| (u.clone(), ps.clone()))
+                    .collect()
+            };
+
+            let mut connections = Vec::new();
+            for (url, ps) in peer_snapshot {
+                // Report one entry per peer with at least one active
+                // per-space Link. `pub_key` must be just the peer_id so
+                // that holochain's app-level dumpNetworkStats filter
+                // (which checks `peer_store.get_all()` URL peer_ids
+                // against `pub_key`) can match entries back to known
+                // agent_infos.
+                if ps.link_count() == 0 {
+                    continue;
+                }
+                let ready = ps
+                    .preflight_state
+                    .lock()
+                    .expect("poisoned")
+                    .is_ready();
+                if !ready {
+                    // Skip mid-setup peers so a "ready" count is
+                    // meaningful, but also log so we can see stuck
+                    // preflight from the outside.
+                    debug!(
+                        %url,
+                        "dump_network_stats: skipping peer with incomplete preflight"
+                    );
+                    continue;
+                }
+                let pub_key = url
+                    .peer_id()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| url.to_string());
+                connections.push(TransportConnectionStats {
+                    pub_key,
+                    send_message_count: 0,
+                    send_bytes: 0,
+                    recv_message_count: 0,
+                    recv_bytes: 0,
+                    opened_at_s: ps.opened_at_s,
+                    is_direct: true,
+                });
+            }
+
             Ok(TransportStats {
                 backend: "reticulum".to_string(),
                 peer_urls,
-                connections: Vec::new(),
+                connections,
             })
         })
     }

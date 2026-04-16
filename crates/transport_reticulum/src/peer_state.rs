@@ -59,15 +59,23 @@ pub(crate) struct PeerState {
     /// router before the links router has run `start_preflight` on
     /// this side — see the module docs in [`crate::routers`].
     pub pending_data: Mutex<VecDeque<Bytes>>,
+    /// UNIX epoch seconds at which this PeerState was created. Surfaced
+    /// via `dump_network_stats` as the connection's `opened_at_s`.
+    pub opened_at_s: u64,
 }
 
 impl PeerState {
     /// Create a new PeerState with no links and no preflight.
     pub fn new() -> Arc<Self> {
+        let opened_at_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         Arc::new(Self {
             preflight_state: Mutex::new(PreflightState::default()),
             links: Mutex::new(HashMap::new()),
             pending_data: Mutex::new(VecDeque::new()),
+            opened_at_s,
         })
     }
 
