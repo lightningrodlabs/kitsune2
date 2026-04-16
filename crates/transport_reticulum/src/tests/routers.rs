@@ -92,7 +92,7 @@ async fn links_router_inserts_peer_on_first_inbound_link() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
 
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     // Register a destination hash so the router can find a SpaceId
     // for the inbound link.
     let dest_hash = AddressHash::new([0x77; 16]);
@@ -154,7 +154,7 @@ async fn links_router_inserts_peer_on_first_inbound_link() {
 async fn links_router_drops_link_for_unknown_destination() {
     let endpoint = FakeEndpoint::new();
     let (_rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     // No register_dest call -- router should ignore this link.
 
     let links_rx = endpoint.recv_links().await.unwrap();
@@ -178,7 +178,7 @@ async fn links_router_drops_link_for_unknown_destination() {
 async fn data_router_buffers_frames_until_preflight_ready() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
 
     // First: get a link into the system via the links router.
@@ -280,7 +280,7 @@ async fn data_router_buffer_cap_drops_excess() {
     use crate::peer_state::MAX_PENDING_DATA_FRAMES;
     let endpoint = FakeEndpoint::new();
     let (_rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
 
     let links_rx = endpoint.recv_links().await.unwrap();
@@ -332,7 +332,7 @@ async fn data_router_drains_buffered_frames_under_main_url_after_rekey() {
     // ephemeral one.
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
 
     let links_rx = endpoint.recv_links().await.unwrap();
@@ -402,7 +402,7 @@ async fn data_router_drains_buffered_frames_under_main_url_after_rekey() {
 async fn data_router_flips_preflight_state_to_ready() {
     let endpoint = FakeEndpoint::new();
     let (_rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
 
     let links_rx = endpoint.recv_links().await.unwrap();
@@ -459,7 +459,7 @@ async fn data_router_flips_preflight_state_to_ready() {
 async fn remove_link_fires_peer_disconnect_on_last_close() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
 
     let links_rx = endpoint.recv_links().await.unwrap();
@@ -489,7 +489,7 @@ async fn remove_link_fires_peer_disconnect_on_last_close() {
 async fn remove_link_penultimate_does_not_disconnect() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     let dest_a = AddressHash::new([0x77; 16]);
     let dest_b = AddressHash::new([0x88; 16]);
     state.register_dest(dest_a, space("alpha"));
@@ -524,7 +524,7 @@ async fn remove_link_penultimate_does_not_disconnect() {
 async fn close_router_fires_peer_disconnect_on_last_close() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
 
     let links_rx = endpoint.recv_links().await.unwrap();
@@ -556,7 +556,7 @@ async fn close_router_fires_peer_disconnect_on_last_close() {
 async fn close_router_holds_peer_when_other_links_still_open() {
     let endpoint = FakeEndpoint::new();
     let (rec, hnd) = mk_handler();
-    let state = RouterState::new(1024 * 1024);
+    let state = RouterState::new(1024 * 1024, 30);
     state.register_dest(AddressHash::new([0x77; 16]), space("alpha"));
     state.register_dest(AddressHash::new([0x88; 16]), space("beta"));
 

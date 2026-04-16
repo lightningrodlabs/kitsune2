@@ -31,7 +31,7 @@ use rns_transport::hash::AddressHash;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::task::AbortHandle;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Maps an inbound `LinkId` → `(peer_url, space_id)` so the data
 /// router can find the right `PeerState` without iterating every peer.
@@ -49,15 +49,21 @@ pub(crate) struct RouterState {
     pub link_registry: LinkRegistry,
     /// Max frame bytes for encoded sends.
     pub max_frame_bytes: usize,
+    /// How long to wait for an rns Link to reach `Active` before giving
+    /// up (applies to both outbound and inbound handshakes). Carried in
+    /// the router state so inbound handlers — which have no access to
+    /// the top-level `ReticulumTransportConfig` — can apply it too.
+    pub connect_timeout_s: u32,
 }
 
 impl RouterState {
-    pub(crate) fn new(max_frame_bytes: usize) -> Self {
+    pub(crate) fn new(max_frame_bytes: usize, connect_timeout_s: u32) -> Self {
         Self {
             dest_hash_to_space: Arc::new(RwLock::new(HashMap::new())),
             peer_states: Arc::new(RwLock::new(HashMap::new())),
             link_registry: Arc::new(RwLock::new(HashMap::new())),
             max_frame_bytes,
+            connect_timeout_s,
         }
     }
 
@@ -143,14 +149,20 @@ async fn route_new_link(
     };
 
     // Insert into PeerState.
-    let peer_state = {
+    let (peer_state, created_new) = {
         let mut states = state.peer_states.write().expect("poisoned");
-        states
+        let exists = states.contains_key(&peer_url);
+        let entry = states
             .entry(peer_url.clone())
             .or_insert_with(PeerState::new)
-            .clone()
+            .clone();
+        (entry, !exists)
     };
+    if created_new {
+        info!(%peer_url, "[pf] PeerState created (inbound)");
+    }
     let first_link = peer_state.insert_link(space_id.clone(), link.clone());
+    let link_count = peer_state.link_count();
 
     // Index the link so the data router can find (peer, space) fast.
     state
@@ -159,16 +171,30 @@ async fn route_new_link(
         .expect("poisoned")
         .insert(link.id(), (peer_url.clone(), space_id.clone()));
 
-    debug!(
-        ?peer_url,
+    info!(
+        %peer_url,
         ?space_id,
         link_id = ?link.id(),
         first_link,
-        "Inbound link registered"
+        link_count,
+        "[pf] inbound link registered"
     );
 
     if first_link {
-        // First link to this peer: kick off preflight.
+        // First link to this peer: wait for the rns link proof
+        // round-trip to settle, then kick off preflight so the peer
+        // knows it can start sending to us.
+        let wait_timeout = std::time::Duration::from_secs(
+            state.connect_timeout_s as u64,
+        );
+        if let Err(e) = wait_for_link_active(link, wait_timeout).await {
+            warn!(
+                ?e,
+                ?peer_url,
+                "inbound link did not reach Active before timeout"
+            );
+            return;
+        }
         if let Err(e) = start_preflight(
             &peer_url,
             local_main_identity,
@@ -180,7 +206,7 @@ async fn route_new_link(
         )
         .await
         {
-            warn!(?e, ?peer_url, "Failed to start preflight");
+            warn!(?e, ?peer_url, "inbound start_preflight failed");
         }
     }
 }
@@ -209,16 +235,19 @@ pub(crate) async fn start_preflight(
     // have already sent its preflight before we reached this point
     // (races against `wait_for_link_active`), but we still need to
     // send ours so the remote can mark its own state Ready.
-    let newly_ready = {
-        let mut pf = peer_state.preflight_state.lock().expect("poisoned");
+    // Claim the "sending preflight" role without committing
+    // `local_sent = true` yet — we only flip that after the send
+    // actually succeeds on the wire. If the send errors (e.g. the rns
+    // link isn't actually Active despite our earlier poll), we want
+    // the state machine to remain in a retryable shape rather than
+    // permanently stuck.
+    {
+        let pf = peer_state.preflight_state.lock().expect("poisoned");
         if pf.local_sent {
             trace!(?peer_url, "preflight already sent");
             return Ok(());
         }
-        let was_ready = pf.is_ready();
-        pf.local_sent = true;
-        !was_ready && pf.is_ready()
-    };
+    }
 
     let preflight_bytes = handler.peer_connect(peer_url.clone()).await?;
     let frame = ReticulumFrame::Preflight {
@@ -228,7 +257,27 @@ pub(crate) async fn start_preflight(
     let encoded = encode_frame(&frame, max_frame_bytes)?;
     send_over_link(link, &encoded, endpoint, max_frame_bytes).await?;
 
-    debug!(?peer_url, "preflight sent");
+    // Send succeeded — now commit the state flip and see if we just
+    // completed preflight (remote's frame may have arrived already).
+    let (newly_ready, pf_after_local_sent) = {
+        let mut pf = peer_state.preflight_state.lock().expect("poisoned");
+        if pf.local_sent {
+            // Another caller won the race between our lock release
+            // above and this one. They'll handle the post-send bits.
+            return Ok(());
+        }
+        let was_ready = pf.is_ready();
+        pf.local_sent = true;
+        (!was_ready && pf.is_ready(), *pf)
+    };
+    info!(
+        %peer_url,
+        local_sent = pf_after_local_sent.local_sent,
+        remote_received = pf_after_local_sent.remote_received,
+        ready = pf_after_local_sent.is_ready(),
+        "[pf] local_sent flipped true (post-send)"
+    );
+    info!(%peer_url, "[pf] preflight bytes sent on wire");
 
     if newly_ready {
         drain_pending_data(peer_url, peer_state, handler).await;
@@ -455,13 +504,19 @@ async fn route_data(
             };
 
             handler.recv_data(main_peer_url.clone(), payload).await?;
-            let newly_ready = {
+            let (newly_ready, pf_after_recv) = {
                 let mut pf = ps.preflight_state.lock().expect("poisoned");
                 let was_ready = pf.is_ready();
                 pf.remote_received = true;
-                !was_ready && pf.is_ready()
+                (!was_ready && pf.is_ready(), *pf)
             };
-            debug!(?main_peer_url, "preflight received");
+            info!(
+                peer_url = %main_peer_url,
+                local_sent = pf_after_recv.local_sent,
+                remote_received = pf_after_recv.remote_received,
+                ready = pf_after_recv.is_ready(),
+                "[pf] remote_received flipped true"
+            );
             if newly_ready {
                 drain_pending_data(&main_peer_url, &ps, handler).await;
             }
@@ -522,13 +577,26 @@ pub(crate) async fn remove_link(
         None => return,
     };
 
-    let (last_link, drop_peer) = {
+    let (last_link, drop_peer, remaining_count) = {
         let states = state.peer_states.read().expect("poisoned");
         match states.get(&peer_url) {
-            Some(ps) => (ps.remove_link(&space_id), ps.link_count() == 0),
+            Some(ps) => {
+                let last = ps.remove_link(&space_id);
+                let count = ps.link_count();
+                (last, count == 0, count)
+            }
             None => return,
         }
     };
+    info!(
+        %peer_url,
+        ?space_id,
+        ?link_id,
+        ?reason,
+        last_link,
+        remaining_count,
+        "[pf] link removed"
+    );
 
     if last_link && drop_peer {
         state
@@ -536,6 +604,7 @@ pub(crate) async fn remove_link(
             .write()
             .expect("poisoned")
             .remove(&peer_url);
+        info!(%peer_url, "[pf] PeerState dropped (last link closed)");
         handler.peer_disconnect(peer_url, reason);
     }
 }
