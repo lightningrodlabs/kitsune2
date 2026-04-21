@@ -21,6 +21,11 @@
 //! All of this is driven through the `Endpoint` trait, so unit tests
 //! can exercise the full flow against the in-memory fake.
 
+use crate::chunking::{
+    IngestResult, RecvChunkStates, SendChunkStates,
+    drop_link as drop_chunk_link, fragment_data, get_or_init_send_state,
+    ingest_fragment, sweep_expired,
+};
 use crate::destination::{DynEndpoint, DynLink, LinkId, LinkStatus};
 use crate::frame::{ReticulumFrame, decode_frame, encode_frame};
 use crate::peer_state::PeerState;
@@ -30,8 +35,14 @@ use bytes::Bytes;
 use kitsune2_api::{SpaceId, TxImpHnd, Url};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, trace, warn};
+
+/// Periodic sweeper tick for dropping stale reassembly sequences.
+/// 5 s is coarse but correct — the plan's reassembly timeout is 30 s,
+/// so missing by one tick is immaterial.
+const CHUNK_SWEEPER_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Maps an inbound `LinkId` → `(peer_url, space_id)` so the data
 /// router can find the right `PeerState` without iterating every peer.
@@ -54,16 +65,35 @@ pub(crate) struct RouterState {
     /// the router state so inbound handlers — which have no access to
     /// the top-level `ReticulumTransportConfig` — can apply it too.
     pub connect_timeout_s: u32,
+    /// Reassembly timeout for multi-fragment Data frames. Stored as a
+    /// `Duration` so the sweeper task can consume it without
+    /// converting on every tick.
+    pub chunk_reassembly_timeout: Duration,
+    /// Send-side chunker state (one monotonic sequence_id counter per
+    /// live link).
+    pub send_chunk_states: SendChunkStates,
+    /// Receive-side chunker state (at most one in-flight reassembly
+    /// per link).
+    pub recv_chunk_states: RecvChunkStates,
 }
 
 impl RouterState {
-    pub(crate) fn new(max_frame_bytes: usize, connect_timeout_s: u32) -> Self {
+    pub(crate) fn new(
+        max_frame_bytes: usize,
+        connect_timeout_s: u32,
+        chunk_reassembly_timeout_s: u32,
+    ) -> Self {
         Self {
             dest_hash_to_space: Arc::new(RwLock::new(HashMap::new())),
             peer_states: Arc::new(RwLock::new(HashMap::new())),
             link_registry: Arc::new(RwLock::new(HashMap::new())),
             max_frame_bytes,
             connect_timeout_s,
+            chunk_reassembly_timeout: Duration::from_secs(
+                chunk_reassembly_timeout_s as u64,
+            ),
+            send_chunk_states: Arc::new(RwLock::new(HashMap::new())),
+            recv_chunk_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -201,7 +231,7 @@ async fn route_new_link(
             &peer_state,
             handler,
             endpoint,
-            state.max_frame_bytes,
+            state,
         )
         .await
         {
@@ -226,7 +256,7 @@ pub(crate) async fn start_preflight(
     peer_state: &Arc<PeerState>,
     handler: &Arc<TxImpHnd>,
     endpoint: &DynEndpoint,
-    max_frame_bytes: usize,
+    state: &RouterState,
 ) -> kitsune2_api::K2Result<()> {
     // Guard against concurrent callers: only the first caller to
     // flip `local_sent` from false→true actually sends the preflight.
@@ -253,8 +283,8 @@ pub(crate) async fn start_preflight(
         sender_main_identity: local_main_identity,
         payload: preflight_bytes,
     };
-    let encoded = encode_frame(&frame, max_frame_bytes)?;
-    send_over_link(link, &encoded, endpoint, max_frame_bytes).await?;
+    let encoded = encode_frame(&frame, state.max_frame_bytes)?;
+    send_over_link(link, &encoded, endpoint, state).await?;
 
     // Send succeeded — now commit the state flip and see if we just
     // completed preflight (remote's frame may have arrived already).
@@ -320,33 +350,79 @@ async fn drain_pending_data(
     }
 }
 
-/// Send one encoded frame over a link, picking the right path for
-/// the payload size.
+/// Send one encoded frame over a link.
 ///
-/// rns has two delivery primitives on a Link:
-/// - `data_packet` — single rns Packet, ≤ `PACKET_MDU` (~464 bytes).
-///   No advertise/request/fragments/proof round-trip; the payload
-///   ships in one packet and arrives at the receiver as a `Link::Data`
-///   event mirrored into `received_data_events`.
-/// - `send_resource` — for larger payloads. Multi-packet transfer
-///   with its own handshake.
+/// Preflight frames are always small by construction (see
+/// `announce_wire.rs` for the budget math) and are shipped verbatim
+/// via `Link::send_small`. Data frames are handed to the chunker:
+/// if they fit in the backend's plaintext MDU, they go out as one
+/// `TAG_DATA` packet unchanged; if they don't, the kitsune2 payload
+/// is fragmented into N `TAG_CHUNKED` packets (see [`crate::chunking`]).
 ///
-/// Using Resource for *every* size, which we did initially, was
-/// unreliable for tiny preflight frames: rns's resource manager
-/// appears to silently drop the very first Resource transfer on a
-/// freshly-Active link. Keeping small frames on `data_packet` avoids
-/// that path entirely.
+/// All per-link sends go through `Link::send_small` — the backend's
+/// `Endpoint::send_resource` is no longer called from this path,
+/// which closes the freshly-Active-link Resource race that
+/// [`tests/two_node_tcp_preflight.rs`] regresses.
 pub(crate) async fn send_over_link(
     link: &DynLink,
     encoded: &[u8],
     endpoint: &DynEndpoint,
-    _max_frame_bytes: usize,
+    state: &RouterState,
 ) -> kitsune2_api::K2Result<()> {
-    if encoded.len() <= endpoint.packet_mdu() {
-        link.send_small(encoded).await
+    if encoded.is_empty() {
+        return Err(kitsune2_api::K2Error::other(
+            "send_over_link: refusing to send empty frame",
+        ));
+    }
+
+    // Inspect the outer frame tag. Preflight frames pass straight
+    // through (always ≤ MDU); Data frames are chunker-routed.
+    let tag = encoded[0];
+    if tag == crate::frame::TAG_DATA {
+        let plaintext_mdu = endpoint.packet_mdu();
+        let chunk_state =
+            get_or_init_send_state(&state.send_chunk_states, link.id());
+        let payload = &encoded[1..];
+        let fragments = fragment_data(
+            payload,
+            plaintext_mdu,
+            state.max_frame_bytes,
+            &chunk_state,
+        )?;
+        let multi = fragments.len() > 1;
+        for fragment in fragments {
+            link.send_small(&fragment).await?;
+            // Pace between fragments on the chunked path. Some
+            // backends (notably Beechat upstream) dispatch inbound
+            // `LinkEvent::Data` events via a broadcast channel with
+            // capacity 16 — more than ~15 fragments sent back-to-back
+            // overflow that channel faster than the receiver's
+            // bridge task can drain it, and the excess events are
+            // silently dropped with `RecvError::Lagged`. A 1 ms
+            // sleep between sends gives the receiver time to drain
+            // its queue. No-op cost on the single-fragment fast path.
+            //
+            // This is a workaround for an upstream cap, not a
+            // correctness fix in the chunker itself — lifting the
+            // Beechat broadcast-channel capacity upstream would
+            // remove the need.
+            if multi {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        Ok(())
     } else {
-        let link_id = link.id();
-        endpoint.send_resource(&link_id, encoded).await
+        // Preflight (or any other single-packet frame). The caller
+        // is responsible for keeping it within MDU; if not, the
+        // backend's `Link::send_small` will surface an error.
+        if encoded.len() > endpoint.packet_mdu() {
+            return Err(kitsune2_api::K2Error::other(format!(
+                "send_over_link: non-Data frame {} bytes exceeds plaintext MDU {}",
+                encoded.len(),
+                endpoint.packet_mdu(),
+            )));
+        }
+        link.send_small(encoded).await
     }
 }
 
@@ -521,35 +597,86 @@ async fn route_data(
             }
         }
         ReticulumFrame::Data(bytes) => {
-            // Gate on preflight readiness. The two router tasks run on
-            // independent tokio schedulers, so a Data frame genuinely
-            // can arrive before this side's links router has had a
-            // chance to flip `local_sent` in `start_preflight`. Buffer
-            // rather than drop — the drain runs when whichever task
-            // finally completes the handshake.
-            let ready = peer_state
-                .preflight_state
-                .lock()
-                .expect("poisoned")
-                .is_ready();
-            if !ready {
-                if peer_state.push_pending(bytes) {
+            dispatch_data_frame(bytes, &peer_url, &peer_state, handler).await?;
+        }
+        ReticulumFrame::Chunked {
+            sequence_id,
+            fragment_index,
+            fragment_count,
+            payload,
+        } => {
+            let fragment = crate::chunking::Fragment {
+                sequence_id,
+                fragment_index,
+                fragment_count,
+                payload,
+            };
+            let result = ingest_fragment(
+                &state.recv_chunk_states,
+                link_id,
+                fragment,
+                state.max_frame_bytes,
+                Instant::now(),
+            );
+            match result {
+                IngestResult::Buffered | IngestResult::Rejected => {}
+                IngestResult::Completed(bytes) => {
                     debug!(
                         ?peer_url,
-                        "data frame before preflight ready -- buffering"
+                        sequence_id,
+                        fragment_count,
+                        reassembled_bytes = bytes.len(),
+                        "chunking: sequence completed — dispatching as Data"
                     );
-                } else {
-                    warn!(
-                        ?peer_url,
-                        cap = crate::peer_state::MAX_PENDING_DATA_FRAMES,
-                        "pending-data cap hit -- dropping frame"
-                    );
+                    dispatch_data_frame(bytes, &peer_url, &peer_state, handler)
+                        .await?;
                 }
-                return Ok(());
             }
-            handler.recv_data(peer_url, bytes).await?;
         }
     }
+    Ok(())
+}
+
+/// Deliver a Data-frame payload to the handler, subject to the
+/// preflight-readiness gate. If preflight is not yet Ready for this
+/// peer, buffer the payload so the eventual drain (triggered when the
+/// other side of the handshake flips Ready) dispatches it.
+///
+/// Shared by the `TAG_DATA` arm and the `TAG_CHUNKED` completion
+/// path so both routes through `route_data` converge on the same
+/// gate. Without this factoring, a large (chunked) Data frame that
+/// arrives before preflight readiness would bypass the buffer and
+/// get dropped.
+async fn dispatch_data_frame(
+    bytes: Bytes,
+    peer_url: &Url,
+    peer_state: &Arc<PeerState>,
+    handler: &Arc<TxImpHnd>,
+) -> kitsune2_api::K2Result<()> {
+    // Gate on preflight readiness. The two router tasks run on
+    // independent tokio schedulers, so a Data frame genuinely
+    // can arrive before this side's links router has had a
+    // chance to flip `local_sent` in `start_preflight`. Buffer
+    // rather than drop — the drain runs when whichever task
+    // finally completes the handshake.
+    let ready = peer_state
+        .preflight_state
+        .lock()
+        .expect("poisoned")
+        .is_ready();
+    if !ready {
+        if peer_state.push_pending(bytes) {
+            debug!(?peer_url, "data frame before preflight ready -- buffering");
+        } else {
+            warn!(
+                ?peer_url,
+                cap = crate::peer_state::MAX_PENDING_DATA_FRAMES,
+                "pending-data cap hit -- dropping frame"
+            );
+        }
+        return Ok(());
+    }
+    handler.recv_data(peer_url.clone(), bytes).await?;
     Ok(())
 }
 
@@ -566,6 +693,15 @@ pub(crate) async fn remove_link(
     state: &RouterState,
     handler: &Arc<TxImpHnd>,
 ) {
+    // Drop chunker state regardless of whether the link was registered;
+    // an unregistered close is rare but possible and leaking state
+    // would outlive the link forever.
+    drop_chunk_link(
+        &state.send_chunk_states,
+        &state.recv_chunk_states,
+        link_id,
+    );
+
     let entry = state
         .link_registry
         .write()
@@ -694,6 +830,34 @@ pub(crate) fn spawn_close_router(
             remove_link(&link_id, None, &state, &handler).await;
         }
         debug!("close router: channel closed");
+    })
+    .abort_handle()
+}
+
+/// Spawn the reassembly-sweeper task. Ticks on a fixed interval and
+/// drops any in-flight chunked sequence that has been buffered longer
+/// than `state.chunk_reassembly_timeout`. A single task handles every
+/// link — cheaper than one timer per sequence, and coarse accuracy
+/// (± one tick) is acceptable because the timeout is measured in
+/// seconds, not milliseconds.
+pub(crate) fn spawn_chunk_reassembly_sweeper(
+    state: RouterState,
+) -> AbortHandle {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CHUNK_SWEEPER_INTERVAL);
+        // Skip the immediate first tick — there's nothing to sweep at startup.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let evicted = sweep_expired(
+                &state.recv_chunk_states,
+                Instant::now(),
+                state.chunk_reassembly_timeout,
+            );
+            if evicted > 0 {
+                debug!(evicted, "chunking: sweeper evicted stale sequences");
+            }
+        }
     })
     .abort_handle()
 }

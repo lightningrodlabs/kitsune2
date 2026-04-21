@@ -87,6 +87,21 @@ pub struct ReticulumTransportConfig {
     #[schemars(default)]
     pub link_idle_timeout_s: u32,
 
+    /// Timeout (seconds) for reassembling a multi-fragment Data frame.
+    ///
+    /// The transport's chunking layer fragments any Data payload that
+    /// exceeds the backend's plaintext MDU across multiple Link
+    /// packets. If any fragment of an in-flight sequence does not
+    /// arrive within this window of the first fragment, the whole
+    /// sequence is discarded. Reliability at the logical-frame level
+    /// is the responsibility of higher layers (kitsune2's gossip /
+    /// fetch retry loops).
+    ///
+    /// Default: 30 seconds.
+    #[serde(default = "default_chunk_reassembly_timeout_s")]
+    #[schemars(default)]
+    pub chunk_reassembly_timeout_s: u32,
+
     /// Beechat-backend-specific tuning.
     ///
     /// Fields here only take effect when the `backend-beechat` feature
@@ -146,6 +161,9 @@ fn default_announce_interval_s() -> u32 {
 }
 fn default_link_idle_timeout_s() -> u32 {
     600
+}
+fn default_chunk_reassembly_timeout_s() -> u32 {
+    30
 }
 
 /// Configuration for a single Reticulum interface.
@@ -217,6 +235,7 @@ impl Default for ReticulumTransportConfig {
             connect_timeout_s: 30,
             announce_interval_s: 300,
             link_idle_timeout_s: 600,
+            chunk_reassembly_timeout_s: 30,
             beechat: ReticulumBeechatConfig::default(),
         }
     }
@@ -237,6 +256,12 @@ impl ReticulumTransportConfig {
                 "ReticulumTransportConfig: max_frame_bytes ({}) exceeds sanity cap ({MAX_FRAME_CAP})",
                 self.max_frame_bytes,
             )));
+        }
+
+        if self.chunk_reassembly_timeout_s < 1 {
+            return Err(K2Error::other(
+                "ReticulumTransportConfig: chunk_reassembly_timeout_s must be >= 1",
+            ));
         }
 
         if let Some(ref path) = self.identity_path

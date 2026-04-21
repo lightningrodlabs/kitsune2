@@ -597,17 +597,20 @@ impl Endpoint for RealEndpoint {
 
     fn send_resource(
         &self,
-        link_id: &LinkId,
-        data: &[u8],
+        _link_id: &LinkId,
+        _data: &[u8],
     ) -> BoxFut<'_, K2Result<()>> {
-        let link_id = *link_id;
-        let data = data.to_vec();
+        // Retired: the transport-level chunking layer in
+        // `crate::chunking` fragments oversized payloads over
+        // `Link::send_small`, replacing upstream `Resource`. See
+        // `PLAN-beechat-chunking.md` §7 for why — chief among the
+        // reasons is that `Resource` silently drops the first
+        // transfer on a freshly-Active link, which is the race
+        // `tests/two_node_tcp_preflight.rs` was written to catch.
         Box::pin(async move {
-            let t = self.transport.lock().await;
-            t.send_resource(&link_id, data, None).await.map_err(|e| {
-                K2Error::other(format!("rns send_resource failed: {e:?}"))
-            })?;
-            Ok(())
+            Err(K2Error::other(
+                "LXMF-rs backend: send_resource is retired — the chunking layer in crate::chunking fragments over Link::send_small",
+            ))
         })
     }
 

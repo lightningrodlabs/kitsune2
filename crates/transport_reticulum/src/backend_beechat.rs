@@ -556,53 +556,33 @@ impl Endpoint for RealEndpoint {
 
     fn send_resource(
         &self,
-        link_id: &LinkId,
-        data: &[u8],
+        _link_id: &LinkId,
+        _data: &[u8],
     ) -> BoxFut<'_, K2Result<()>> {
-        let link_id = *link_id;
-        let data = data.to_vec();
+        // Retired: all per-link sends go through `Link::send_small`,
+        // fragmented by the chunking layer above the backend trait
+        // when they exceed `packet_mdu()`. See
+        // `PLAN-beechat-chunking.md` §7.
         Box::pin(async move {
-            if data.len() > reticulum::packet::PACKET_MDU {
-                return Err(K2Error::other(format!(
-                    "Beechat backend: payload {} bytes exceeds PACKET_MDU {} \
-                     (chunking layer is Phase 4, see PLAN-beechat-backend.md)",
-                    data.len(),
-                    reticulum::packet::PACKET_MDU,
-                )));
-            }
-
-            let t = self.transport.lock().await;
-
-            // Look up the Link by id: for `send_resource` called from
-            // `TxImp::send`, the link is outbound; the data router
-            // responds on inbound links for the preflight path. Try
-            // out_links first, fall back to in_links.
-            let link = match t.find_out_link(&link_id).await {
-                Some(l) => l,
-                None => match t.find_in_link(&link_id).await {
-                    Some(l) => l,
-                    None => {
-                        return Err(K2Error::other(format!(
-                            "send_resource: link {link_id:?} not found"
-                        )));
-                    }
-                },
-            };
-
-            let packet = {
-                let link = link.lock().await;
-                link.data_packet(&data).map_err(|e| {
-                    K2Error::other(format!("Beechat data_packet failed: {e:?}"))
-                })?
-            };
-
-            t.send_packet(packet).await;
-            Ok(())
+            Err(K2Error::other(
+                "Beechat backend: send_resource is retired — the chunking layer in crate::chunking fragments over Link::send_small",
+            ))
         })
     }
 
     fn packet_mdu(&self) -> usize {
-        reticulum::packet::PACKET_MDU
+        // Beechat's `Link::send_small` hands its payload to
+        // `Link::data_packet`, which Fernet-encrypts in place. The
+        // resulting ciphertext has to fit the on-wire `PACKET_MDU`
+        // (2048 bytes). Fernet overhead is fixed by the crypto layer:
+        // `FERNET_OVERHEAD_SIZE = IV(16) + HMAC(32) = 48` plus up to
+        // `FERNET_MAX_PADDING = 16` bytes of AES-CBC PKCS7 padding.
+        // The plaintext ceiling is therefore `2048 - 48 - 16 = 1984`
+        // bytes — anything larger overflows `PacketDataBuffer`. See
+        // `Reticulum-rs-lrl/src/crypt/fernet.rs` for the constants.
+        const FERNET_OVERHEAD: usize = 48;
+        const FERNET_MAX_PADDING: usize = 16;
+        reticulum::packet::PACKET_MDU - FERNET_OVERHEAD - FERNET_MAX_PADDING
     }
 
     fn recv_announces(

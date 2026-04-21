@@ -87,7 +87,10 @@ pub fn default_builder() -> Builder {
 ///
 /// The Reticulum transport uses announces for peer discovery, so there
 /// is no HTTP bootstrap client in this configuration.
-#[cfg(any(feature = "transport-reticulum", feature = "transport-reticulum-beechat"))]
+#[cfg(any(
+    feature = "transport-reticulum",
+    feature = "transport-reticulum-beechat"
+))]
 pub fn reticulum_builder(
     node: std::sync::Arc<kitsune2_transport_reticulum::ReticulumNode>,
 ) -> Builder {

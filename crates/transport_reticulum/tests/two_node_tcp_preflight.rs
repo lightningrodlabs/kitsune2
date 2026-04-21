@@ -120,6 +120,7 @@ fn cfg_with_interface(
         connect_timeout_s: 10,
         announce_interval_s: 1,
         link_idle_timeout_s: 60,
+        chunk_reassembly_timeout_s: 30,
         beechat: Default::default(),
     }
 }

@@ -168,6 +168,7 @@ fn k2_config() -> ReticulumTransportConfig {
         // of cycles, slow enough not to flood the bridge.
         announce_interval_s: 1,
         link_idle_timeout_s: 60,
+        chunk_reassembly_timeout_s: 30,
         beechat: Default::default(),
     }
 }

@@ -55,6 +55,7 @@ mod backend_beechat;
 #[cfg(feature = "backend-beechat")]
 use backend_beechat as backend;
 
+mod chunking;
 mod config;
 mod destination;
 mod frame;
@@ -299,8 +300,11 @@ impl ReticulumTransport {
 
         // Build the shared RouterState that both routers and TxImp::send
         // consult.
-        let router_state =
-            RouterState::new(config.max_frame_bytes, config.connect_timeout_s);
+        let router_state = RouterState::new(
+            config.max_frame_bytes,
+            config.connect_timeout_s,
+            config.chunk_reassembly_timeout_s,
+        );
 
         // Spawn the global announce listener (identity cache + bootstrap
         // candidate queue), the inbound-link router, and the data router.
@@ -335,6 +339,9 @@ impl ReticulumTransport {
             handler.clone(),
         );
 
+        let chunk_sweeper_handle =
+            routers::spawn_chunk_reassembly_sweeper(router_state.clone());
+
         // Spawn the bootstrap drain that decodes incoming announce
         // app_data into AgentInfoSigned records and inserts them into
         // each space's peer store (via the PeerBinding registered by
@@ -358,6 +365,7 @@ impl ReticulumTransport {
                 links_router_handle,
                 data_router_handle,
                 close_router_handle,
+                chunk_sweeper_handle,
                 bootstrap_drain_handle,
             ]),
         });
@@ -507,7 +515,7 @@ impl TxImp for ReticulumTransport {
                             &peer_state,
                             &handler,
                             node.endpoint(),
-                            config.max_frame_bytes,
+                            &router_state,
                         )
                         .await?;
                     }
@@ -538,7 +546,7 @@ impl TxImp for ReticulumTransport {
                 &link,
                 &encoded,
                 node.endpoint(),
-                config.max_frame_bytes,
+                &router_state,
             )
             .await
         })
