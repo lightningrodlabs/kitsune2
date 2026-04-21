@@ -95,6 +95,12 @@ pub(crate) fn load_identity_bytes(bytes: &[u8]) -> K2Result<PrivateIdentity> {
 }
 
 /// Spawn each configured interface on the Transport's `InterfaceManager`.
+///
+/// Multicast UDP ifaces go through `Transport::add_multicast_udp_interface`
+/// so the transport handler learns about the iface's per-peer routing
+/// map — that's what lets point-to-point traffic for a
+/// multicast-discovered peer go out unicast from the shared socket
+/// (instead of flooding the group or needing its own port).
 async fn start_interfaces(
     transport: &SharedTransport,
     interfaces: &[ReticulumInterfaceConfig],
@@ -103,10 +109,10 @@ async fn start_interfaces(
         let t = transport.lock().await;
         t.iface_manager()
     };
-    let mut mgr = iface_manager.lock().await;
     for iface in interfaces {
         match iface {
             ReticulumInterfaceConfig::TcpClient { target } => {
+                let mut mgr = iface_manager.lock().await;
                 let client = rns_transport::iface::tcp_client::TcpClient::new(
                     target.clone(),
                 );
@@ -117,6 +123,7 @@ async fn start_interfaces(
                 info!(%target, "Started Reticulum TCP client interface");
             }
             ReticulumInterfaceConfig::TcpServer { bind } => {
+                let mut mgr = iface_manager.lock().await;
                 let server = rns_transport::iface::tcp_server::TcpServer::new(
                     bind.clone(),
                     iface_manager.clone(),
@@ -135,18 +142,20 @@ async fn start_interfaces(
                         .as_deref()
                         .map(crate::config::is_multicast_addr)
                         .unwrap_or(false);
-                // Multicast vs unicast ifaces are tagged differently so
-                // the transport layer can (a) filter point-to-point tx
-                // off the multicast socket at the wire level and
-                // (b) auto-spawn per-peer unicast UDP ifaces from
-                // announces seen on the multicast socket.
                 if is_mcast {
-                    rns_transport::iface::udp::spawn_multicast_udp(
-                        &mut mgr,
+                    // Route through Transport so it registers the
+                    // PeerRouting map with its handler. Taking the
+                    // transport lock (not the iface_manager lock) is
+                    // required because add_multicast_udp_interface
+                    // locks both internally.
+                    let t = transport.lock().await;
+                    t.add_multicast_udp_interface(
                         effective_bind.clone(),
                         effective_forward.clone(),
-                    );
+                    )
+                    .await;
                 } else {
+                    let mut mgr = iface_manager.lock().await;
                     let udp = rns_transport::iface::udp::UdpInterface::new(
                         effective_bind.clone(),
                         effective_forward.clone(),
