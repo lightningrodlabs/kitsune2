@@ -98,7 +98,7 @@ flate2 = "1.0"
 # our fork which adds a `Link::peer_identity()` getter required for
 # inbound-link peer tracking — see §Risks-1 of
 # `PLAN-beechat-backend.md`.
-reticulum = { git = "https://github.com/lightningrodlabs/Reticulum-rs", rev = "8ff571f" }
+reticulum = { path = "../Reticulum-rs-lrl" }
 # kitsune types need to be serializable for network transmission.
 serde = { version = "1.0", features = ["derive"] }
 # kitsune2 agent info is serialized as json to improve debugability of
