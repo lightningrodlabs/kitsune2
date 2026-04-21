@@ -100,9 +100,36 @@ pub(crate) async fn create_endpoint_from_config(
     let transport = reticulum::transport::Transport::new(transport_config);
     let transport = Arc::new(TokioMutex::new(transport));
 
+    // Subscribe to the broadcast channels BEFORE starting interfaces.
+    // Beechat's `Transport::new` creates internal `broadcast::channel(16)`
+    // senders for link events and spins up a `spawn_link_data_forwarder`
+    // subscriber. If we wait until `RealEndpoint::new` to subscribe,
+    // events emitted during interface startup fill the buffer. Because
+    // the broadcast frees a slot only once ALL subscribers have read it,
+    // the forwarder's unread events reduce our effective capacity — and
+    // we see `Lagged(1)` on the very first data burst even with pacing.
+    // Subscribing here ensures our receivers are active from the start.
+    let (announce_rx, inbound_link_rx, outbound_link_rx) = {
+        let t = transport.lock().await;
+        (
+            t.recv_announces().await,
+            t.in_link_events(),
+            t.out_link_events(),
+        )
+    };
+
     start_interfaces(&transport, &config.interfaces).await?;
 
-    Ok(Arc::new(RealEndpoint::new(transport, identity).await))
+    Ok(Arc::new(
+        RealEndpoint::with_receivers(
+            transport,
+            identity,
+            announce_rx,
+            inbound_link_rx,
+            outbound_link_rx,
+        )
+        .await,
+    ))
 }
 
 /// Spawn each configured interface on the Transport's
@@ -221,9 +248,21 @@ impl std::fmt::Debug for RealEndpoint {
 }
 
 impl RealEndpoint {
-    pub(crate) async fn new(
+    /// Build the endpoint from pre-subscribed broadcast receivers.
+    ///
+    /// Receivers MUST be subscribed before any interfaces are started
+    /// so that the bridge tasks see every event from the beginning.
+    /// See the comment in `create_endpoint` for why this matters.
+    pub(crate) async fn with_receivers(
         transport: SharedTransport,
         identity: PrivateIdentity,
+        announce_rx: broadcast::Receiver<reticulum::transport::AnnounceEvent>,
+        inbound_link_rx: broadcast::Receiver<
+            reticulum::destination::link::LinkEventData,
+        >,
+        outbound_link_rx: broadcast::Receiver<
+            reticulum::destination::link::LinkEventData,
+        >,
     ) -> Self {
         let (announce_bridge_tx, _) =
             broadcast::channel::<AnnounceInfo>(BRIDGE_CHANNEL_SIZE);
@@ -232,19 +271,6 @@ impl RealEndpoint {
         let (data_tx, data_rx) =
             mpsc::channel::<(LinkId, Bytes)>(BRIDGE_CHANNEL_SIZE);
         let (close_tx, close_rx) = mpsc::channel::<LinkId>(BRIDGE_CHANNEL_SIZE);
-
-        // Subscribe to the underlying streams once, then let each
-        // bridge task own its receiver. Beechat has no
-        // `resource_events` — both inbound and outbound `Data` payloads
-        // flow through the link event streams.
-        let (announce_rx, inbound_link_rx, outbound_link_rx) = {
-            let t = transport.lock().await;
-            (
-                t.recv_announces().await,
-                t.in_link_events(),
-                t.out_link_events(),
-            )
-        };
 
         let link_status: LinkStatusCache =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));

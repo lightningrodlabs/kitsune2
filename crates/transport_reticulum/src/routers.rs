@@ -390,24 +390,33 @@ pub(crate) async fn send_over_link(
             &chunk_state,
         )?;
         let multi = fragments.len() > 1;
-        for fragment in fragments {
-            link.send_small(&fragment).await?;
-            // Pace between fragments on the chunked path. Some
-            // backends (notably Beechat upstream) dispatch inbound
-            // `LinkEvent::Data` events via a broadcast channel with
-            // capacity 16 — more than ~15 fragments sent back-to-back
-            // overflow that channel faster than the receiver's
-            // bridge task can drain it, and the excess events are
-            // silently dropped with `RecvError::Lagged`. A 1 ms
-            // sleep between sends gives the receiver time to drain
-            // its queue. No-op cost on the single-fragment fast path.
+        if multi {
+            debug!(
+                fragment_count = fragments.len(),
+                payload_len = payload.len(),
+                plaintext_mdu,
+                "chunking: sending multi-fragment sequence"
+            );
+        }
+        for fragment in &fragments {
+            link.send_small(fragment).await?;
+            // Pace between fragments on the chunked path. Beechat
+            // upstream dispatches inbound `LinkEvent::Data` events
+            // via a `broadcast::channel(16)`. Sending fragments
+            // faster than the receiver's packet processing pipeline
+            // (decrypt → event dispatch → bridge drain) can keep up
+            // overflows the channel; the excess events are silently
+            // dropped via `RecvError::Lagged`. 100 ms between sends
+            // matches the observed per-packet processing budget of
+            // the Beechat backend on localhost TCP. On a real
+            // constrained mesh network the physical link is the
+            // bottleneck, not this pacing.
             //
-            // This is a workaround for an upstream cap, not a
-            // correctness fix in the chunker itself — lifting the
-            // Beechat broadcast-channel capacity upstream would
-            // remove the need.
+            // Lifting the upstream `broadcast::channel` capacity
+            // would allow tighter pacing; see `PLAN-integrate-chunking.md`
+            // known gotchas.
             if multi {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
         Ok(())
