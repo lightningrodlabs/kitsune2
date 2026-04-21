@@ -128,12 +128,19 @@ async fn start_interfaces(
                 info!(%bind, "Started Reticulum TCP server interface");
             }
             ReticulumInterfaceConfig::Udp { bind, group } => {
+                let (effective_bind, effective_forward) =
+                    crate::config::resolve_udp_addrs(bind, group.as_deref());
                 let udp = rns_transport::iface::udp::UdpInterface::new(
-                    bind.clone(),
-                    group.clone(),
+                    effective_bind.clone(),
+                    effective_forward.clone(),
                 );
                 mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
-                info!(%bind, ?group, "Started Reticulum UDP interface");
+                info!(
+                    bind = %effective_bind,
+                    forward = ?effective_forward,
+                    multicast = crate::config::is_multicast_addr(&effective_bind),
+                    "Started Reticulum UDP interface",
+                );
             }
         }
     }

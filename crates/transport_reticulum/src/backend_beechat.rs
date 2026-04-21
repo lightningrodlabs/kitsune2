@@ -143,12 +143,32 @@ async fn start_interfaces(
                 info!(%bind, "Started Beechat TCP server interface");
             }
             ReticulumInterfaceConfig::Udp { bind, group } => {
+                let (effective_bind, effective_forward) =
+                    crate::config::resolve_udp_addrs(bind, group.as_deref());
+                let mcast =
+                    crate::config::is_multicast_addr(&effective_bind);
+                if mcast {
+                    warn!(
+                        bind = %effective_bind,
+                        "Beechat UDP interface: reticulum-rs's UdpInterface does \
+                         not join multicast groups at the socket layer, so this \
+                         interface will not receive multicast traffic. Use the \
+                         LXMF backend for LAN multicast discovery, or patch \
+                         reticulum-rs::iface::udp::UdpInterface to call \
+                         join_multicast_v4/v6.",
+                    );
+                }
                 let udp = reticulum::iface::udp::UdpInterface::new(
-                    bind.clone(),
-                    group.clone(),
+                    effective_bind.clone(),
+                    effective_forward.clone(),
                 );
                 mgr.spawn(udp, reticulum::iface::udp::UdpInterface::spawn);
-                info!(%bind, ?group, "Started Beechat UDP interface");
+                info!(
+                    bind = %effective_bind,
+                    forward = ?effective_forward,
+                    multicast = mcast,
+                    "Started Beechat UDP interface",
+                );
             }
         }
     }

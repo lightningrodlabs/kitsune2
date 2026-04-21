@@ -170,11 +170,40 @@ pub enum ReticulumInterfaceConfig {
         /// Bind address, e.g. `"0.0.0.0:4242"`.
         bind: String,
     },
-    /// UDP interface for local-network discovery.
+    /// UDP interface.
+    ///
+    /// Two usage patterns:
+    ///
+    /// - **Multicast** (LAN discovery). Set `group` to a multicast
+    ///   `IP:PORT` like `"224.0.0.224:4242"`. The backend joins that
+    ///   group on receive and uses it as the forward target on send,
+    ///   giving bidirectional multicast. The `bind` field is ignored
+    ///   in this mode — you can pass `"0.0.0.0:0"`.
+    ///
+    /// - **Point-to-point unicast**. Set `bind` to a local address
+    ///   and `group` to the peer's unicast address (e.g.
+    ///   `bind: "0.0.0.0:8000", group: Some("10.0.0.2:8000")`). The
+    ///   backend binds locally and forwards outbound packets to the
+    ///   unicast target.
+    ///
+    /// With `group: None` the interface is inert (no forward target
+    /// means no tx task; no group means no multicast receive) — use
+    /// `TcpClient` / `TcpServer` for point-to-point TCP instead.
+    ///
+    /// Multicast support depends on the backend:
+    /// - `backend-lxmf` honors multicast fully.
+    /// - `backend-beechat`'s underlying `reticulum-rs` crate does not
+    ///   currently join multicast groups at the socket layer. A
+    ///   multicast config compiles and runs but won't receive
+    ///   multicast traffic. Use LXMF for LAN discovery, or fix the
+    ///   upstream `reticulum-rs::iface::udp::UdpInterface`.
     Udp {
-        /// Bind address, e.g. `"0.0.0.0:0"`.
+        /// Local bind address. Ignored when `group` is a multicast
+        /// address (the backend uses `group` as the bind).
         bind: String,
-        /// Multicast group, e.g. `"ff02::1"`.
+        /// Multicast group to join (`"224.x.y.z:PORT"` or
+        /// `"[ffXX::Y]:PORT"`), or a unicast peer address for
+        /// point-to-point forwarding.
         group: Option<String>,
     },
 }
@@ -223,6 +252,38 @@ impl ReticulumTransportConfig {
 
         Ok(())
     }
+}
+
+/// Resolve the `(bind, group)` user config for a UDP interface into the
+/// `(bind_addr, forward_addr)` pair that the underlying
+/// `rns_transport` / `reticulum-rs` `UdpInterface::new` wants.
+///
+/// When `group` is a multicast address, override the user's `bind`:
+/// LXMF's socket layer only joins the multicast group if the bind
+/// address itself is multicast, and you can't simultaneously bind to a
+/// multicast group and a unicast local address on the same socket.
+/// The multicast join is the load-bearing part.
+///
+/// When `group` is unicast, keep the user's `bind` (where to listen
+/// locally) and pass `group` as `forward_addr` (where outbound goes).
+pub(crate) fn resolve_udp_addrs(
+    bind: &str,
+    group: Option<&str>,
+) -> (String, Option<String>) {
+    match group {
+        Some(g) if is_multicast_addr(g) => (g.to_string(), Some(g.to_string())),
+        Some(g) => (bind.to_string(), Some(g.to_string())),
+        None => (bind.to_string(), None),
+    }
+}
+
+/// Returns `true` if `addr` parses as a `SocketAddr` whose IP is in
+/// the IPv4 (`224.0.0.0/4`) or IPv6 (`ff00::/8`) multicast range.
+pub(crate) fn is_multicast_addr(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|sa| sa.ip().is_multicast())
+        .unwrap_or(false)
 }
 
 /// Module-level config wrapper, matching the `ModConfig` pattern.
