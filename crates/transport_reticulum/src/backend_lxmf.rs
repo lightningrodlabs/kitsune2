@@ -130,15 +130,33 @@ async fn start_interfaces(
             ReticulumInterfaceConfig::Udp { bind, group } => {
                 let (effective_bind, effective_forward) =
                     crate::config::resolve_udp_addrs(bind, group.as_deref());
-                let udp = rns_transport::iface::udp::UdpInterface::new(
-                    effective_bind.clone(),
-                    effective_forward.clone(),
-                );
-                mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
+                let is_mcast = crate::config::is_multicast_addr(&effective_bind)
+                    || effective_forward
+                        .as_deref()
+                        .map(crate::config::is_multicast_addr)
+                        .unwrap_or(false);
+                // Multicast vs unicast ifaces are tagged differently so
+                // the transport layer can (a) filter point-to-point tx
+                // off the multicast socket at the wire level and
+                // (b) auto-spawn per-peer unicast UDP ifaces from
+                // announces seen on the multicast socket.
+                if is_mcast {
+                    rns_transport::iface::udp::spawn_multicast_udp(
+                        &mut mgr,
+                        effective_bind.clone(),
+                        effective_forward.clone(),
+                    );
+                } else {
+                    let udp = rns_transport::iface::udp::UdpInterface::new(
+                        effective_bind.clone(),
+                        effective_forward.clone(),
+                    );
+                    mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
+                }
                 info!(
                     bind = %effective_bind,
                     forward = ?effective_forward,
-                    multicast = crate::config::is_multicast_addr(&effective_bind),
+                    multicast = is_mcast,
                     "Started Reticulum UDP interface",
                 );
             }
