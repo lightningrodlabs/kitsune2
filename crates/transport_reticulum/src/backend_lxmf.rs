@@ -137,11 +137,12 @@ async fn start_interfaces(
             ReticulumInterfaceConfig::Udp { bind, group } => {
                 let (effective_bind, effective_forward) =
                     crate::config::resolve_udp_addrs(bind, group.as_deref());
-                let is_mcast = crate::config::is_multicast_addr(&effective_bind)
-                    || effective_forward
-                        .as_deref()
-                        .map(crate::config::is_multicast_addr)
-                        .unwrap_or(false);
+                let is_mcast =
+                    crate::config::is_multicast_addr(&effective_bind)
+                        || effective_forward
+                            .as_deref()
+                            .map(crate::config::is_multicast_addr)
+                            .unwrap_or(false);
                 if is_mcast {
                     // Route through Transport so it registers the
                     // PeerRouting map with its handler. Taking the
@@ -160,7 +161,10 @@ async fn start_interfaces(
                         effective_bind.clone(),
                         effective_forward.clone(),
                     );
-                    mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
+                    mgr.spawn(
+                        udp,
+                        rns_transport::iface::udp::UdpInterface::spawn,
+                    );
                 }
                 info!(
                     bind = %effective_bind,

@@ -137,6 +137,12 @@ pub(crate) async fn create_endpoint_from_config(
 /// LXMF-rs's, with one wrinkle: the TCP server takes the
 /// `iface_manager` by value (an `Arc<tokio::sync::Mutex>`), while the
 /// TCP client takes only an address.
+///
+/// Multicast UDP ifaces go through `Transport::add_multicast_udp_interface`
+/// so the transport handler learns about the iface's per-peer routing
+/// map — that's what lets point-to-point traffic for a
+/// multicast-discovered peer go out unicast from the shared socket
+/// (instead of flooding the group or needing its own port).
 async fn start_interfaces(
     transport: &SharedTransport,
     interfaces: &[ReticulumInterfaceConfig],
@@ -145,10 +151,10 @@ async fn start_interfaces(
         let t = transport.lock().await;
         t.iface_manager()
     };
-    let mut mgr = iface_manager.lock().await;
     for iface in interfaces {
         match iface {
             ReticulumInterfaceConfig::TcpClient { target } => {
+                let mut mgr = iface_manager.lock().await;
                 let client = reticulum::iface::tcp_client::TcpClient::new(
                     target.clone(),
                 );
@@ -159,6 +165,7 @@ async fn start_interfaces(
                 info!(%target, "Started Beechat TCP client interface");
             }
             ReticulumInterfaceConfig::TcpServer { bind } => {
+                let mut mgr = iface_manager.lock().await;
                 let server = reticulum::iface::tcp_server::TcpServer::new(
                     bind.clone(),
                     iface_manager.clone(),
@@ -172,28 +179,36 @@ async fn start_interfaces(
             ReticulumInterfaceConfig::Udp { bind, group } => {
                 let (effective_bind, effective_forward) =
                     crate::config::resolve_udp_addrs(bind, group.as_deref());
-                let mcast =
-                    crate::config::is_multicast_addr(&effective_bind);
-                if mcast {
-                    warn!(
-                        bind = %effective_bind,
-                        "Beechat UDP interface: reticulum-rs's UdpInterface does \
-                         not join multicast groups at the socket layer, so this \
-                         interface will not receive multicast traffic. Use the \
-                         LXMF backend for LAN multicast discovery, or patch \
-                         reticulum-rs::iface::udp::UdpInterface to call \
-                         join_multicast_v4/v6.",
+                let is_mcast =
+                    crate::config::is_multicast_addr(&effective_bind)
+                        || effective_forward
+                            .as_deref()
+                            .map(crate::config::is_multicast_addr)
+                            .unwrap_or(false);
+                if is_mcast {
+                    // Route through Transport so it registers the
+                    // PeerRouting map with its handler. Taking the
+                    // transport lock (not the iface_manager lock) is
+                    // required because add_multicast_udp_interface
+                    // locks both internally.
+                    let t = transport.lock().await;
+                    t.add_multicast_udp_interface(
+                        effective_bind.clone(),
+                        effective_forward.clone(),
+                    )
+                    .await;
+                } else {
+                    let mut mgr = iface_manager.lock().await;
+                    let udp = reticulum::iface::udp::UdpInterface::new(
+                        effective_bind.clone(),
+                        effective_forward.clone(),
                     );
+                    mgr.spawn(udp, reticulum::iface::udp::UdpInterface::spawn);
                 }
-                let udp = reticulum::iface::udp::UdpInterface::new(
-                    effective_bind.clone(),
-                    effective_forward.clone(),
-                );
-                mgr.spawn(udp, reticulum::iface::udp::UdpInterface::spawn);
                 info!(
                     bind = %effective_bind,
                     forward = ?effective_forward,
-                    multicast = mcast,
+                    multicast = is_mcast,
                     "Started Beechat UDP interface",
                 );
             }
