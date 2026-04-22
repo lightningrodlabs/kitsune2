@@ -95,6 +95,12 @@ pub(crate) fn load_identity_bytes(bytes: &[u8]) -> K2Result<PrivateIdentity> {
 }
 
 /// Spawn each configured interface on the Transport's `InterfaceManager`.
+///
+/// Multicast UDP ifaces go through `Transport::add_multicast_udp_interface`
+/// so the transport handler learns about the iface's per-peer routing
+/// map — that's what lets point-to-point traffic for a
+/// multicast-discovered peer go out unicast from the shared socket
+/// (instead of flooding the group or needing its own port).
 async fn start_interfaces(
     transport: &SharedTransport,
     interfaces: &[ReticulumInterfaceConfig],
@@ -103,10 +109,10 @@ async fn start_interfaces(
         let t = transport.lock().await;
         t.iface_manager()
     };
-    let mut mgr = iface_manager.lock().await;
     for iface in interfaces {
         match iface {
             ReticulumInterfaceConfig::TcpClient { target } => {
+                let mut mgr = iface_manager.lock().await;
                 let client = rns_transport::iface::tcp_client::TcpClient::new(
                     target.clone(),
                 );
@@ -117,6 +123,7 @@ async fn start_interfaces(
                 info!(%target, "Started Reticulum TCP client interface");
             }
             ReticulumInterfaceConfig::TcpServer { bind } => {
+                let mut mgr = iface_manager.lock().await;
                 let server = rns_transport::iface::tcp_server::TcpServer::new(
                     bind.clone(),
                     iface_manager.clone(),
@@ -130,15 +137,35 @@ async fn start_interfaces(
             ReticulumInterfaceConfig::Udp { bind, group } => {
                 let (effective_bind, effective_forward) =
                     crate::config::resolve_udp_addrs(bind, group.as_deref());
-                let udp = rns_transport::iface::udp::UdpInterface::new(
-                    effective_bind.clone(),
-                    effective_forward.clone(),
-                );
-                mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
+                let is_mcast = crate::config::is_multicast_addr(&effective_bind)
+                    || effective_forward
+                        .as_deref()
+                        .map(crate::config::is_multicast_addr)
+                        .unwrap_or(false);
+                if is_mcast {
+                    // Route through Transport so it registers the
+                    // PeerRouting map with its handler. Taking the
+                    // transport lock (not the iface_manager lock) is
+                    // required because add_multicast_udp_interface
+                    // locks both internally.
+                    let t = transport.lock().await;
+                    t.add_multicast_udp_interface(
+                        effective_bind.clone(),
+                        effective_forward.clone(),
+                    )
+                    .await;
+                } else {
+                    let mut mgr = iface_manager.lock().await;
+                    let udp = rns_transport::iface::udp::UdpInterface::new(
+                        effective_bind.clone(),
+                        effective_forward.clone(),
+                    );
+                    mgr.spawn(udp, rns_transport::iface::udp::UdpInterface::spawn);
+                }
                 info!(
                     bind = %effective_bind,
                     forward = ?effective_forward,
-                    multicast = crate::config::is_multicast_addr(&effective_bind),
+                    multicast = is_mcast,
                     "Started Reticulum UDP interface",
                 );
             }

@@ -42,7 +42,7 @@ use kitsune2_transport_reticulum::{
 };
 use rand_core::OsRng;
 use rns_transport::identity::PrivateIdentity;
-use rns_transport::iface::{RxMessage, TxMessage};
+use rns_transport::iface::{IfaceSource, RxMessage, TxMessage};
 use rns_transport::transport::{Transport as RnsTransport, TransportConfig};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -125,6 +125,7 @@ async fn wire_loopback(
                 .send(RxMessage {
                     address: b_iface_addr,
                     packet,
+                    source: IfaceSource::None,
                 })
                 .await;
         }
@@ -136,6 +137,7 @@ async fn wire_loopback(
                 .send(RxMessage {
                     address: a_iface_addr,
                     packet,
+                    source: IfaceSource::None,
                 })
                 .await;
         }
