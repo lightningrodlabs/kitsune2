@@ -628,21 +628,36 @@ impl Endpoint for RealEndpoint {
 
     fn send_resource(
         &self,
-        _link_id: &LinkId,
-        _data: &[u8],
+        link_id: &LinkId,
+        data: &[u8],
     ) -> BoxFut<'_, K2Result<()>> {
-        // Retired: the transport-level chunking layer in
-        // `crate::chunking` fragments oversized payloads over
-        // `Link::send_small`, replacing upstream `Resource`. See
-        // `PLAN-beechat-chunking.md` §7 for why — chief among the
-        // reasons is that `Resource` silently drops the first
-        // transfer on a freshly-Active link, which is the race
-        // `tests/two_node_tcp_preflight.rs` was written to catch.
+        // `rns_transport`'s `Resource` handles advertise / request /
+        // fragments / proof / retransmit end-to-end and delivers the
+        // reassembled payload via a `ResourceEventKind::Complete`
+        // event — which `spawn_resource_bridge` funnels into the same
+        // `data_tx` mpsc that single-packet frames use, so `route_data`
+        // decodes both the same way via `decode_frame`.
+        //
+        // The freshly-Active-link `DroppedNoRoute` race (the one
+        // `tests/two_node_tcp_preflight.rs` was written to regress)
+        // is mitigated by `broadcast: true` in `TransportConfig` —
+        // see the comment on `create_endpoint_from_config`.
+        let link_id = *link_id;
+        let data = data.to_vec();
         Box::pin(async move {
-            Err(K2Error::other(
-                "LXMF-rs backend: send_resource is retired — the chunking layer in crate::chunking fragments over Link::send_small",
-            ))
+            let t = self.transport.lock().await;
+            t.send_resource(&link_id, data, None).await.map_err(|e| {
+                K2Error::other(format!("rns send_resource failed: {e:?}"))
+            })?;
+            Ok(())
         })
+    }
+
+    fn supports_resource_transfer(&self) -> bool {
+        // rns `Resource` is the LXMF backend's native large-payload
+        // path. `crate::routers::send_over_link` routes > MDU frames
+        // here instead of through `crate::chunking`.
+        true
     }
 
     fn packet_mdu(&self) -> usize {

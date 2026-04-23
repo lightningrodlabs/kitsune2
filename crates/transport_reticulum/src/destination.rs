@@ -127,12 +127,30 @@ pub(crate) trait Endpoint:
     /// Send a raw packet (e.g. from `Link::data_packet`).
     fn send_packet(&self, packet: &[u8]) -> BoxFut<'_, K2Result<()>>;
 
-    /// Send a large payload via the Resource abstraction.
+    /// Send a large payload via the Reticulum `Resource` abstraction.
+    ///
+    /// Only meaningful when [`Self::supports_resource_transfer`] returns
+    /// `true`. Backends without native `Resource` support should leave
+    /// the default `supports_resource_transfer` and either implement
+    /// this as an error stub or not be called at all — the dispatch in
+    /// [`crate::routers::send_over_link`] gates on the capability bit.
     fn send_resource(
         &self,
         link_id: &LinkId,
         data: &[u8],
     ) -> BoxFut<'_, K2Result<()>>;
+
+    /// Whether the backend has a native large-payload fragmentation
+    /// primitive (rns's `Resource`). When `true`, `send_over_link`
+    /// routes `> packet_mdu()` frames through [`Self::send_resource`];
+    /// otherwise the in-tree chunker ([`crate::chunking`]) fragments
+    /// them over `Link::send_small`.
+    ///
+    /// Defaults to `false` so adding a new backend doesn't silently
+    /// opt into the Resource path.
+    fn supports_resource_transfer(&self) -> bool {
+        false
+    }
 
     /// Get the packet MDU (max data unit for a single packet).
     fn packet_mdu(&self) -> usize;

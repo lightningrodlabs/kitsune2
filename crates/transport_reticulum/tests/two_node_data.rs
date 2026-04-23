@@ -36,6 +36,8 @@ use kitsune2_api::{
     BoxFut, DynTxHandler, K2Result, SpaceId, TxBaseHandler, TxHandler,
     TxSpaceHandler, Url,
 };
+#[allow(unused_imports)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use kitsune2_transport_reticulum::{
     ReticulumInterfaceConfig, ReticulumNode, ReticulumTransportConfig,
     internal_testing,
@@ -56,6 +58,13 @@ use tokio::sync::Mutex as TokioMutex;
 struct RecHandler {
     peer_connects: Mutex<Vec<Url>>,
     peer_disconnects: Mutex<Vec<(Url, Option<String>)>>,
+    /// Preflight bytes this side sends in `preflight_gather_outgoing`.
+    /// When empty (default), the baseline tiny-preflight path runs; when
+    /// non-empty and > MDU, exercises the oversized-preflight Resource
+    /// path that is the production shape on LXMF.
+    outgoing_preflight: Mutex<Bytes>,
+    /// Preflight bytes observed via `preflight_validate_incoming`.
+    incoming_preflight: Mutex<Vec<Bytes>>,
 }
 
 impl TxBaseHandler for RecHandler {
@@ -68,7 +77,23 @@ impl TxBaseHandler for RecHandler {
     }
 }
 
-impl TxHandler for RecHandler {}
+impl TxHandler for RecHandler {
+    fn preflight_gather_outgoing(
+        &self,
+        _peer_url: Url,
+    ) -> BoxFut<'_, K2Result<Bytes>> {
+        let out = self.outgoing_preflight.lock().unwrap().clone();
+        Box::pin(async move { Ok(out) })
+    }
+    fn preflight_validate_incoming(
+        &self,
+        _peer_url: Url,
+        data: Bytes,
+    ) -> BoxFut<'_, K2Result<()>> {
+        self.incoming_preflight.lock().unwrap().push(data);
+        Box::pin(async { Ok(()) })
+    }
+}
 
 #[derive(Debug, Default)]
 struct RecSpaceHandler {
@@ -279,6 +304,117 @@ async fn data_roundtrip_a_to_b() {
 
     // Drop the transports so background tasks shut down before the
     // tokio runtime is torn down.
+    drop(trans_a);
+    drop(trans_b);
+}
+
+/// Same two-node setup as `data_roundtrip_a_to_b`, but both sides
+/// synthesize a preflight payload bigger than LXMF's 400-byte plaintext
+/// MDU. This regresses the production shape that was silently broken
+/// on the `transport-reticulum` branch between 9817ee9 (chunking
+/// rewrite) and the Resource rewire: `send_over_link` refused to ship
+/// non-Data frames above MDU, so kitsune2's real preflight (which
+/// carries a signed `AgentInfo` per local agent and typically runs
+/// ~445 bytes) hit `non-Data frame 462 bytes exceeds plaintext MDU 400`
+/// and the handshake never completed. Gossip timed out after 30 s with
+/// `Failed to initiate gossip: timed out waiting for preflight Ready`.
+///
+/// This test fails (preflight validate never fires on the peer, and
+/// the data notify times out) if the LXMF backend isn't using
+/// rns `send_resource` for > MDU frames — either because the capability
+/// bit is cleared, `send_resource` is restubbed, or `send_over_link`
+/// stops routing oversized frames to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_over_mdu_roundtrip_a_to_b() {
+    let (tp_a, id_a) = make_rns_transport("node-a");
+    let (tp_b, id_b) = make_rns_transport("node-b");
+    wire_loopback(tp_a.clone(), tp_b.clone()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let node_a = ReticulumNode::from_rns_transport(tp_a.clone(), id_a.clone())
+        .await
+        .unwrap();
+    let node_b = ReticulumNode::from_rns_transport(tp_b.clone(), id_b.clone())
+        .await
+        .unwrap();
+
+    // 500-byte preflight payload per side. After K2Proto encoding plus
+    // `ReticulumFrame::Preflight`'s 1-byte tag + 16-byte identity
+    // header, the wire frame is ~520 bytes — comfortably over the
+    // 400-byte LXMF plaintext MDU, forcing the Resource path.
+    let pf_from_a: Bytes = Bytes::from(vec![0xAAu8; 500]);
+    let pf_from_b: Bytes = Bytes::from(vec![0xBBu8; 500]);
+    let h_a = Arc::new(RecHandler::default());
+    let h_b = Arc::new(RecHandler::default());
+    *h_a.outgoing_preflight.lock().unwrap() = pf_from_a.clone();
+    *h_b.outgoing_preflight.lock().unwrap() = pf_from_b.clone();
+    let dyn_a: DynTxHandler = h_a.clone();
+    let dyn_b: DynTxHandler = h_b.clone();
+
+    let cfg = k2_config();
+    let trans_a =
+        internal_testing::create_transport(cfg.clone(), dyn_a, node_a.clone())
+            .await
+            .unwrap();
+    let trans_b =
+        internal_testing::create_transport(cfg.clone(), dyn_b, node_b.clone())
+            .await
+            .unwrap();
+
+    let space = SpaceId::from(Bytes::from_static(b"alpha"));
+    let space_a = Arc::new(RecSpaceHandler::default());
+    let space_b = Arc::new(RecSpaceHandler::default());
+    let _ = trans_a.register_space_handler(space.clone(), space_a.clone());
+    let _ = trans_b.register_space_handler(space.clone(), space_b.clone());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let b_hash = id_b.as_identity().address_hash;
+    let b_url = internal_testing::identity_hash_to_url(&b_hash).unwrap();
+
+    // Firing a data notify. Data delivery is gated on preflight Ready,
+    // so its arrival on B proves both sides' Resource-sized preflights
+    // completed through rns `send_resource` without the 30 s timeout.
+    let payload = Bytes::from_static(b"post-preflight data");
+    trans_a
+        .send_space_notify(b_url.clone(), space.clone(), payload.clone())
+        .await
+        .expect("send_space_notify");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if !space_b.notifies.lock().unwrap().is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let a_in = h_a.incoming_preflight.lock().unwrap().len();
+            let b_in = h_b.incoming_preflight.lock().unwrap().len();
+            panic!(
+                "timed out waiting for post-preflight data. \
+                 A.validate_incoming={}, B.validate_incoming={}. \
+                 This is the exact failure mode the LXMF Resource \
+                 rewire fixes — check send_over_link dispatch.",
+                a_in, b_in,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Each side's `preflight_validate_incoming` must have seen the
+    // peer's 500-byte preflight bytes verbatim — proof that the oversize
+    // frame round-tripped intact through rns Resource's
+    // fragment/reassemble/proof pipeline.
+    let a_rx = h_a.incoming_preflight.lock().unwrap().clone();
+    let b_rx = h_b.incoming_preflight.lock().unwrap().clone();
+    assert_eq!(a_rx.len(), 1, "A should have validated exactly one preflight");
+    assert_eq!(b_rx.len(), 1, "B should have validated exactly one preflight");
+    assert_eq!(a_rx[0], pf_from_b, "A must receive B's 500-byte preflight");
+    assert_eq!(b_rx[0], pf_from_a, "B must receive A's 500-byte preflight");
+
+    // And the post-preflight data arrived.
+    let notifies = space_b.notifies.lock().unwrap();
+    assert_eq!(notifies.len(), 1);
+    assert_eq!(&notifies[0].2, &payload);
+
     drop(trans_a);
     drop(trans_b);
 }

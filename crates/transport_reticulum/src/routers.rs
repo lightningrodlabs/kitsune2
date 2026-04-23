@@ -352,17 +352,24 @@ async fn drain_pending_data(
 
 /// Send one encoded frame over a link.
 ///
-/// Preflight frames are always small by construction (see
-/// `announce_wire.rs` for the budget math) and are shipped verbatim
-/// via `Link::send_small`. Data frames are handed to the chunker:
-/// if they fit in the backend's plaintext MDU, they go out as one
-/// `TAG_DATA` packet unchanged; if they don't, the kitsune2 payload
-/// is fragmented into N `TAG_CHUNKED` packets (see [`crate::chunking`]).
+/// Size-based dispatch, then backend-capability-based dispatch:
 ///
-/// All per-link sends go through `Link::send_small` — the backend's
-/// `Endpoint::send_resource` is no longer called from this path,
-/// which closes the freshly-Active-link Resource race that
-/// [`tests/two_node_tcp_preflight.rs`] regresses.
+/// - **≤ MDU**: ship verbatim via `Link::send_small`. Works for any
+///   frame type (preflight, data, chunked).
+/// - **> MDU, backend supports Resource transfer** (LXMF):
+///   [`Endpoint::send_resource`] hands the whole encoded frame to
+///   rns's `Resource` primitive, which takes care of
+///   advertise/request/fragments/proof/retransmit. The reassembled
+///   payload arrives at the peer as one `ResourceEventKind::Complete`
+///   event and is bridged to the same data mpsc as single-packet
+///   frames, so `route_data` decodes it the same way.
+/// - **> MDU, backend without Resource transfer** (Beechat): the
+///   in-tree chunker ([`crate::chunking`]) fragments `TAG_DATA`
+///   payloads into N `TAG_CHUNKED` packets over `Link::send_small`.
+///   Strictly fire-and-forget — no proof, no retransmit, single
+///   in-flight sequence per link. A dropped fragment silently kills
+///   the whole payload at the reassembly timeout. Non-Data frames
+///   on such backends must fit in MDU by construction.
 pub(crate) async fn send_over_link(
     link: &DynLink,
     encoded: &[u8],
@@ -375,64 +382,60 @@ pub(crate) async fn send_over_link(
         ));
     }
 
-    // Inspect the outer frame tag. Preflight frames pass straight
-    // through (always ≤ MDU); Data frames are chunker-routed.
-    let tag = encoded[0];
-    if tag == crate::frame::TAG_DATA {
-        let plaintext_mdu = endpoint.packet_mdu();
-        let chunk_state =
-            get_or_init_send_state(&state.send_chunk_states, link.id());
-        let payload = &encoded[1..];
-        let fragments = fragment_data(
-            payload,
-            plaintext_mdu,
-            state.max_frame_bytes,
-            &chunk_state,
-        )?;
-        let multi = fragments.len() > 1;
-        if multi {
-            debug!(
-                fragment_count = fragments.len(),
-                payload_len = payload.len(),
-                plaintext_mdu,
-                "chunking: sending multi-fragment sequence"
-            );
-        }
-        for fragment in &fragments {
-            link.send_small(fragment).await?;
-            // Pace between fragments on the chunked path. Beechat
-            // upstream dispatches inbound `LinkEvent::Data` events
-            // via a `broadcast::channel(16)`. Sending fragments
-            // faster than the receiver's packet processing pipeline
-            // (decrypt → event dispatch → bridge drain) can keep up
-            // overflows the channel; the excess events are silently
-            // dropped via `RecvError::Lagged`. 100 ms between sends
-            // matches the observed per-packet processing budget of
-            // the Beechat backend on localhost TCP. On a real
-            // constrained mesh network the physical link is the
-            // bottleneck, not this pacing.
-            //
-            // Lifting the upstream `broadcast::channel` capacity
-            // would allow tighter pacing; see `PLAN-integrate-chunking.md`
-            // known gotchas.
-            if multi {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-        Ok(())
-    } else {
-        // Preflight (or any other single-packet frame). The caller
-        // is responsible for keeping it within MDU; if not, the
-        // backend's `Link::send_small` will surface an error.
-        if encoded.len() > endpoint.packet_mdu() {
-            return Err(kitsune2_api::K2Error::other(format!(
-                "send_over_link: non-Data frame {} bytes exceeds plaintext MDU {}",
-                encoded.len(),
-                endpoint.packet_mdu(),
-            )));
-        }
-        link.send_small(encoded).await
+    let plaintext_mdu = endpoint.packet_mdu();
+    if encoded.len() <= plaintext_mdu {
+        return link.send_small(encoded).await;
     }
+
+    if endpoint.supports_resource_transfer() {
+        return endpoint.send_resource(&link.id(), encoded).await;
+    }
+
+    // Chunker path. Only `TAG_DATA` is supported — preflight frames on
+    // backends without Resource transfer must fit in MDU. At Beechat's
+    // plaintext MDU (1984) a real preflight (~445 B) does fit; if this
+    // ever changes, the chunker needs to learn to preserve the outer
+    // tag across fragments and re-decode on reassembly.
+    let tag = encoded[0];
+    if tag != crate::frame::TAG_DATA {
+        return Err(kitsune2_api::K2Error::other(format!(
+            "send_over_link: non-Data frame (tag=0x{:02x}) {} bytes exceeds plaintext MDU {} on backend without Resource transfer",
+            tag,
+            encoded.len(),
+            plaintext_mdu,
+        )));
+    }
+    let chunk_state =
+        get_or_init_send_state(&state.send_chunk_states, link.id());
+    let payload = &encoded[1..];
+    let fragments = fragment_data(
+        payload,
+        plaintext_mdu,
+        state.max_frame_bytes,
+        &chunk_state,
+    )?;
+    let multi = fragments.len() > 1;
+    if multi {
+        debug!(
+            fragment_count = fragments.len(),
+            payload_len = payload.len(),
+            plaintext_mdu,
+            "chunking: sending multi-fragment sequence"
+        );
+    }
+    for fragment in &fragments {
+        link.send_small(fragment).await?;
+        // Pace between fragments on the chunked path. Beechat
+        // upstream dispatches inbound `LinkEvent::Data` events via a
+        // `broadcast::channel(16)`; faster-than-drain bursts overflow
+        // the channel and the excess events are silently dropped via
+        // `RecvError::Lagged`. 100 ms matches the observed per-packet
+        // processing budget on localhost TCP.
+        if multi {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    Ok(())
 }
 
 /// Spawn the resource-data router. Consumes `(LinkId, Bytes)` events,

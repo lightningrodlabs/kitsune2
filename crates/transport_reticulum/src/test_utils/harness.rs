@@ -38,6 +38,10 @@ pub(crate) struct FakeEndpoint {
     pub(crate) resource_sends: ResourceSends,
     /// Every `link_to` call's returned link (for inspection).
     pub(crate) links_issued: Arc<Mutex<Vec<Arc<FakeLink>>>>,
+    /// Whether [`Endpoint::supports_resource_transfer`] returns true.
+    /// Off by default (matches Beechat-shape backends); flipped on by
+    /// [`FakeEndpoint::with_resource_transfer`] to model LXMF-shape.
+    supports_resource_transfer: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for FakeEndpoint {
@@ -58,7 +62,20 @@ impl FakeEndpoint {
             destinations_added: Arc::new(Mutex::new(Vec::new())),
             resource_sends: Arc::new(Mutex::new(Vec::new())),
             links_issued: Arc::new(Mutex::new(Vec::new())),
+            supports_resource_transfer: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
         })
+    }
+
+    /// Enable the `supports_resource_transfer` capability, so oversized
+    /// frames in [`crate::routers::send_over_link`] route through
+    /// `send_resource` rather than the in-tree chunker. Models the
+    /// LXMF backend's native Resource path.
+    pub fn with_resource_transfer(self: &Arc<Self>) -> Arc<Self> {
+        self.supports_resource_transfer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.clone()
     }
 
     /// Inject an announce event for listeners to observe.
@@ -144,6 +161,11 @@ impl Endpoint for FakeEndpoint {
             self.resource_sends.lock().unwrap().push(entry);
             Ok(())
         })
+    }
+
+    fn supports_resource_transfer(&self) -> bool {
+        self.supports_resource_transfer
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn packet_mdu(&self) -> usize {

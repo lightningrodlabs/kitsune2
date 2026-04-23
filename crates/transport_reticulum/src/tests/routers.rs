@@ -682,6 +682,111 @@ async fn send_over_link_fragments_oversize_frame() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn send_over_link_routes_oversize_data_to_resource_on_lxmf_shape() {
+    // LXMF-shape endpoint (supports_resource_transfer=true): an
+    // oversized Data frame must go to `Endpoint::send_resource` with
+    // the whole encoded frame (tag included), not be fragmented via
+    // send_small. Regresses the chunker-bypass decision for backends
+    // that have a native Resource primitive.
+    let endpoint = FakeEndpoint::new().with_resource_transfer();
+    let state = RouterState::new(1024 * 1024, 30, 30);
+    let link = FakeLink::new(0x11, 0xbb, 0x77);
+    let dyn_link: crate::destination::DynLink = link.clone();
+    let dyn_endpoint: crate::destination::DynEndpoint = endpoint.clone();
+
+    let payload: Bytes =
+        Bytes::from((0u8..=255).cycle().take(2000).collect::<Vec<_>>());
+    let encoded =
+        encode_frame(&ReticulumFrame::Data(payload.clone()), 1 << 20).unwrap();
+    send_over_link(&dyn_link, &encoded, &dyn_endpoint, &state)
+        .await
+        .unwrap();
+
+    // No `send_small` calls — chunker path bypassed.
+    assert!(
+        link.sent.lock().unwrap().is_empty(),
+        "send_small must not be called when Resource transfer is supported"
+    );
+    // Exactly one send_resource call carrying the full encoded frame.
+    let calls = endpoint.resource_sends.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, link.id());
+    assert_eq!(calls[0].1, encoded.as_ref());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_over_link_routes_oversize_preflight_to_resource_on_lxmf_shape() {
+    // Direct regression for the volla LXMF bug: a > MDU Preflight
+    // frame on a Resource-supporting backend must flow through
+    // `send_resource`, not return the "non-Data frame exceeds MDU"
+    // error. Before the Resource rewire, this shape erred out at the
+    // `start_preflight` call site and gossip timed out after 30 s.
+    let endpoint = FakeEndpoint::new().with_resource_transfer();
+    let state = RouterState::new(1024 * 1024, 30, 30);
+    let link = FakeLink::new(0x11, 0xbb, 0x77);
+    let dyn_link: crate::destination::DynLink = link.clone();
+    let dyn_endpoint: crate::destination::DynEndpoint = endpoint.clone();
+
+    // 600 bytes > FakeEndpoint's 464-byte MDU, approximating the
+    // ~445-byte kitsune2 preflight payload on LXMF's 400-byte ceiling.
+    let pf_payload = Bytes::from(vec![0xABu8; 600]);
+    let encoded = encode_frame(
+        &ReticulumFrame::Preflight {
+            sender_main_identity: AddressHash::new([0xbb; 16]),
+            payload: pf_payload,
+        },
+        1 << 20,
+    )
+    .unwrap();
+    assert!(encoded.len() > dyn_endpoint.packet_mdu());
+
+    send_over_link(&dyn_link, &encoded, &dyn_endpoint, &state)
+        .await
+        .unwrap();
+
+    assert!(link.sent.lock().unwrap().is_empty());
+    let calls = endpoint.resource_sends.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, encoded.as_ref());
+    // First byte is TAG_PREFLIGHT (0x00), preserved end-to-end.
+    assert_eq!(calls[0].1[0], 0x00);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_over_link_errors_on_oversize_preflight_without_resource_support() {
+    // Mirror of the above for Beechat-shape (no Resource support):
+    // the chunker only handles TAG_DATA, so an oversized preflight
+    // must surface a clear error rather than silently dropping or
+    // fragmenting into garbled state. This guards against anyone
+    // removing the tag-gate in the chunker branch.
+    let endpoint = FakeEndpoint::new();
+    let state = RouterState::new(1024 * 1024, 30, 30);
+    let link = FakeLink::new(0x11, 0xbb, 0x77);
+    let dyn_link: crate::destination::DynLink = link.clone();
+    let dyn_endpoint: crate::destination::DynEndpoint = endpoint.clone();
+
+    let encoded = encode_frame(
+        &ReticulumFrame::Preflight {
+            sender_main_identity: AddressHash::new([0xbb; 16]),
+            payload: Bytes::from(vec![0xABu8; 600]),
+        },
+        1 << 20,
+    )
+    .unwrap();
+
+    let err = send_over_link(&dyn_link, &encoded, &dyn_endpoint, &state)
+        .await
+        .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("non-Data frame") && msg.contains("MDU"),
+        "unexpected error: {msg}"
+    );
+    assert!(link.sent.lock().unwrap().is_empty());
+    assert!(endpoint.resource_sends.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn data_router_reassembles_chunked_sequence() {
     // Inject N `TAG_CHUNKED` fragments and assert the handler sees
     // exactly one `recv_data` with the original concatenated bytes.
