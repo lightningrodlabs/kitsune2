@@ -121,8 +121,10 @@ async fn two_nodes_same_space_discover_each_other() {
     boot_b.put(agent_b.clone());
 
     // Poll both peer stores for the other node's agent. mDNS can take a
-    // few seconds to propagate the first advertisement.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    // while to propagate the first advertisement: when several responders
+    // share one host (e.g. alongside avahi, or two in-process daemons),
+    // mdns-sd's probe tiebreaking can delay the announcement by ~20s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let a_sees_b = store_a
             .get(agent_b.agent.clone())
@@ -139,7 +141,7 @@ async fn two_nodes_same_space_discover_each_other() {
         }
         if std::time::Instant::now() > deadline {
             panic!(
-                "timeout: a_sees_b={a_sees_b}, b_sees_a={b_sees_a} within 20s"
+                "timeout: a_sees_b={a_sees_b}, b_sees_a={b_sees_a} within 60s"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
