@@ -202,7 +202,7 @@
 //! └─────┴────────┴──────┘
 //! ```
 
-use crate::endpoint::{DynIrohEndpoint, IrohEndpoint};
+use crate::endpoint::{DynIrohEndpoint, Endpoint as _, IrohEndpoint};
 use bytes::Bytes;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode,
@@ -607,6 +607,35 @@ impl IrohTransport {
             );
         }
 
+        // An explicitly configured relay fully determines this node's peer
+        // URL, so with LAN discovery enabled derive and announce it
+        // immediately instead of waiting for the relay handshake. This
+        // keeps the node addressable when the relay is unreachable
+        // (offline LAN operation, where peers reach us over
+        // mDNS-discovered direct paths); the address watcher task
+        // announces the same URL again once the relay actually connects.
+        // Without LAN discovery a node is only reachable via its relay, so
+        // announcing before the relay handshake would just invite dials
+        // that cannot succeed yet.
+        if config.enable_lan_discovery
+            && let Some(relay_url_str) = &config.relay_url
+        {
+            let relay_url = RelayUrl::from_str(relay_url_str)
+                .map_err(|err| K2Error::other_src("Invalid relay URL", err))?;
+            let endpoint_id = EndpointId::from(
+                iroh::PublicKey::from_bytes(&endpoint.id_bytes()).map_err(
+                    |e| K2Error::other_src("invalid endpoint public key", e),
+                )?,
+            );
+            let url = canonicalize_relay_url(&relay_url, endpoint_id)?;
+            info!(
+                %url,
+                "Announcing peer URL derived from configured relay"
+            );
+            *local_url.write().expect("poisoned") = Some(url.clone());
+            handler.new_listening_address(url, None).await;
+        }
+
         let space_relays: SpaceRelays = Arc::new(RwLock::new(HashMap::new()));
 
         let accept_task = Self::spawn_accept_task(
@@ -831,9 +860,33 @@ impl IrohTransport {
     /// preflight, the context is dropped and an error returned.
     async fn create_connection_and_context(
         &self,
-        target: EndpointAddr,
+        mut target: EndpointAddr,
         remote_url: Url,
     ) -> K2Result<Arc<ConnectionContext>> {
+        // The peer URL only names a relay, and iroh dials the addresses it
+        // is given: with an unreachable relay (offline LAN operation) the
+        // connect attempt would block on the relay path and time out even
+        // though the peer is directly reachable. Merge any direct addresses
+        // known to LAN discovery into the dial target so iroh can establish
+        // the connection over the LAN without depending on the relay.
+        if self.config.enable_lan_discovery {
+            let direct_addrs = self
+                .endpoint
+                .discover_direct_addrs(
+                    target.id,
+                    lan_discovery::RESOLVE_DIRECT_ADDRS_TIMEOUT,
+                )
+                .await;
+            if !direct_addrs.is_empty() {
+                debug!(
+                    remote = ?remote_url.peer_id(),
+                    ?direct_addrs,
+                    "Adding LAN-discovered direct addresses to dial target"
+                );
+                target.addrs.extend(direct_addrs);
+            }
+        }
+
         // Establish connection
         debug!(?target, connect_timeout_s = self.config.connect_timeout_s, remote = ?remote_url.peer_id(), "Attempting QUIC connection");
         let start = Instant::now();

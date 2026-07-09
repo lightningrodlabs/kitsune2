@@ -2715,6 +2715,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "futures",
  "iroh-holochain",
  "iroh-relay-holochain",
  "kitsune2_api",

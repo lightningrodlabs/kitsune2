@@ -1,10 +1,11 @@
 //! Abstractions for endpoint operations, enabling unit testing.
 
 use crate::connection::{DynConnection, IrohConnection};
-use iroh::{EndpointAddr, RelayConfig, RelayUrl};
+use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayUrl, TransportAddr};
 use kitsune2_api::{BoxFut, K2Error, K2Result};
 use n0_watcher::{Disconnected, Watcher};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) trait EndpointAddrWatcher: Send + Sync {
     fn updated(&mut self) -> BoxFut<'_, Result<EndpointAddr, Disconnected>>;
@@ -58,6 +59,20 @@ pub(crate) trait Endpoint:
 
     /// Returns the public key bytes of this endpoint.
     fn id_bytes(&self) -> [u8; 32];
+
+    /// Resolves direct (IP) transport addresses for the given peer via the
+    /// endpoint's discovery services (e.g. mDNS LAN discovery).
+    ///
+    /// Returns an empty list when no discovery service reports an IP
+    /// address for the peer within `timeout`.
+    fn discover_direct_addrs(
+        &self,
+        endpoint_id: EndpointId,
+        timeout: Duration,
+    ) -> BoxFut<'_, Vec<TransportAddr>> {
+        let _ = (endpoint_id, timeout);
+        Box::pin(async { Vec::new() })
+    }
 }
 
 #[derive(Debug)]
@@ -155,6 +170,21 @@ impl Endpoint for IrohEndpoint {
 
     fn id_bytes(&self) -> [u8; 32] {
         *self.inner.id().as_bytes()
+    }
+
+    fn discover_direct_addrs(
+        &self,
+        endpoint_id: EndpointId,
+        timeout: Duration,
+    ) -> BoxFut<'_, Vec<TransportAddr>> {
+        Box::pin(async move {
+            crate::lan_discovery::resolve_direct_addrs(
+                &self.inner,
+                endpoint_id,
+                timeout,
+            )
+            .await
+        })
     }
 }
 

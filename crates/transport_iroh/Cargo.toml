@@ -13,6 +13,8 @@ edition.workspace = true
 [dependencies]
 base64 = { workspace = true }
 bytes = { workspace = true }
+# used to poll iroh discovery streams when the `mdns` feature is enabled
+futures = { workspace = true, optional = true }
 iroh = { workspace = true }
 kitsune2_bootstrap_client = { workspace = true }
 # used for test-utils
@@ -72,4 +74,4 @@ metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # dial each other by iroh NodeId without a relay. This only provides
 # dialability — it does not distribute Kitsune2 AgentInfoSigned; that is the
 # job of the `kitsune2_bootstrap_mdns` crate.
-mdns = ["iroh/discovery-local-network"]
+mdns = ["iroh/discovery-local-network", "dep:futures"]
