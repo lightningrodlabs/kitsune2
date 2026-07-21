@@ -222,6 +222,66 @@ Payloads larger than a few MTUs get fountain coding (RaptorQ) rather than
 ACK/retransmit — the canonical answer for feedback-free broadcast, and what
 makes the simplex optical medium usable at all.
 
+### 3.6 Remote signals over broadcast
+
+Holochain's remote signals (`send_remote_signal`) are already an
+*API-level* multicast: one signal, a list of recipient agents. On the wire
+today they are pure unicast fan-out — the ribosome builds a **per-recipient**
+signed payload (the recipient's `cell_id` is baked into the signed
+`ZomeCallParams`, sharing one nonce across the batch) and `holochain_p2p`
+fires one `send_space_notify` per recipient, errors ignored. Two properties
+make signals the ideal *first* consumer of the phase-2 broadcast capability:
+the delivery contract is already fire-and-forget best-effort (exactly what a
+broadcast medium provides), and there is no protocol state machine at all —
+it is a pure fan-out replacement, simpler than publish or gossip.
+
+Under phase 1, signals work unchanged but wastefully: an N-recipient signal
+is N addressed frames on a medium where one transmission physically reaches
+everyone. Phase 2 collapses this to one frame per signal, in **two modes**:
+
+**Mode 1 — polite ignore.** The frame carries the signal body once plus an
+advisory audience header: either a *listen* list or an *ignore* list —
+whichever is shorter — with "empty ignore list" as the whole-space
+broadcast. Every space member can physically read the body (it sits inside
+the phase-2 space-keyed AEAD, so non-members cannot); non-addressed members
+politely drop it at the header. Enforcement is etiquette, not cryptography.
+This requires the signature change: instead of binding a per-recipient
+`cell_id`, the sender signs `(signal, space, audience, nonce, expiry)` once.
+Receiving conductors deliver to each hosted agent matching the audience and
+dedupe by `(provenance, nonce)` — which also makes TTL-flooded re-broadcast
+on multi-hop media (BLE relaying) safe. Note the semantic shift: today a
+signal is readable only by its recipients (each unicast rides an encrypted
+connection); polite-ignore makes it readable by the whole space. That is a
+*visible* confidentiality change, so it must be opt-in at the HDK API, never
+a transparent transport optimization.
+
+**Mode 2 — encrypted.** Confidential to the recipient subset, not just the
+space. Two sub-options, deliberately staged:
+
+- *2a — per-recipient key wrapping (first).* Encrypt the body once under a
+  fresh symmetric message key; append one wrapped copy of that key per
+  recipient (crypto-box style). Frame size is `O(body) + O(recipients ×
+  ~72 B)` rather than N full copies. Holochain already exposes the
+  necessary primitives as host functions
+  (`create_x25519_keypair`, `x_25519_x_salsa20_poly1305_encrypt` backed by
+  lair), so recipients' x25519 encryption keys can be exchanged at the app
+  layer today; a later refinement is publishing an encryption key alongside
+  the agent key in `AgentInfo`. Stateless — right for ad-hoc one-shot
+  signals.
+- *2b — group ratchet (later).* For stable collaboration groups (a syn
+  session, a chat room), a group-negotiated evolving key — sender-key
+  ratchet à la Signal groups, or MLS-style tree agreement — amortizes the
+  per-signal overhead to `O(1)` and adds forward secrecy, at the cost of
+  session establishment and membership-change handling. Same frame
+  audience header as mode 1, different key schedule. Design note: keep the
+  ratchet strictly at the app/HDK layer over the same broadcast frame
+  format, so the transport stays oblivious to group membership.
+
+Signals are also the story for the slow media: a presence ping or cursor
+update fits a single BLE advertisement or a few seconds of ultrasound, where
+DHT sync never will. Mode 1 on a Trickle-paced channel is what makes those
+media useful live rather than only for discovery.
+
 ## 4. Hot-switchable backends (single binary)
 
 Requirement: one binary containing every compiled-in transport backend, with
@@ -303,10 +363,13 @@ integration is configuration, not code.
 3. **`transport_switch`** — runtime backend selection over
    {iroh, bcast-udpm, bcast-mem}; switch test swaps backends mid-run and
    verifies re-announce.
-4. **Phase-2 native broadcast** — `TxBroadcastImp` api extension, Trickle
-   beacons with chain-head repair, SRM suppression; benchmark against
-   pairwise gossip in `kitsune2_showcase` (the O(pairs) → O(deficits) claim
-   should be measurable).
+4. **Phase-2 native broadcast** — `TxBroadcastImp` api extension, then its
+   consumers in order of increasing complexity: **broadcast signals first**
+   (§3.6 — pure fan-out replacement, mode 1 "polite ignore" then mode 2a
+   encrypted; needs the audience-signature change on the holochain side),
+   then Trickle beacons with chain-head repair and SRM suppression;
+   benchmark against pairwise gossip in `kitsune2_showcase` (the O(pairs) →
+   O(deficits) claim should be measurable).
 5. **BLE extended-advertising medium** (BlueZ), then TTL flooding for
    multi-hop.
 6. **Ultrasonic medium** scoped to beacon/bootstrap frames; wire as a
