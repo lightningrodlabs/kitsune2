@@ -10,7 +10,9 @@ members = [
   "crates/kitsune2_showcase",
   "crates/test_utils",
   "crates/tool_proto_build",
+  "crates/transport_broadcast",
   "crates/transport_iroh",
+  "crates/transport_switch",
 ]
 
 resolver = "2"
@@ -38,7 +40,9 @@ kitsune2 = { version = "0.5.0-dev.0", path = "crates/kitsune2", default-features
 kitsune2_api = { version = "0.5.0-dev.0", path = "crates/api" }
 kitsune2_dht = { version = "0.5.0-dev.0", path = "crates/dht" }
 kitsune2_gossip = { version = "0.5.0-dev.0", path = "crates/gossip" }
+kitsune2_transport_broadcast = { version = "0.5.0-dev.0", path = "crates/transport_broadcast" }
 kitsune2_transport_iroh = { version = "0.5.0-dev.0", path = "crates/transport_iroh" }
+kitsune2_transport_switch = { version = "0.5.0-dev.0", path = "crates/transport_switch" }
 kitsune2_bootstrap_client = { version = "0.5.0-dev.0", path = "crates/bootstrap_client" }
 
 # used by bootstrap_srv for mpmc worker queue pattern.
@@ -91,6 +95,9 @@ tokio = "1.41.1"
 futures = "0.3"
 # bootstrap_srv uses tempfiles as virtual memory for storage instead of RAM.
 tempfile = "3.14.0"
+# low-level socket options (SO_REUSEADDR/SO_REUSEPORT) needed by the
+# udp multicast broadcast medium so several nodes can share one port.
+socket2 = "0.6"
 # kitsune2 internally uses a mix of std::io::Error and thiserror derivation.
 thiserror = "2.0.3"
 # ureq is used in the bootstrap client module.

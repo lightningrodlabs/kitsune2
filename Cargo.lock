@@ -2694,6 +2694,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitsune2_transport_broadcast"
+version = "0.5.0-dev.6"
+dependencies = [
+ "bytes",
+ "futures",
+ "kitsune2_api",
+ "kitsune2_core",
+ "kitsune2_gossip",
+ "rand 0.8.6",
+ "schemars",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kitsune2_transport_iroh"
 version = "0.5.0-dev.6"
 dependencies = [
@@ -2719,6 +2737,22 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "kitsune2_transport_switch"
+version = "0.5.0-dev.6"
+dependencies = [
+ "bytes",
+ "kitsune2_api",
+ "kitsune2_core",
+ "kitsune2_gossip",
+ "kitsune2_transport_broadcast",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
