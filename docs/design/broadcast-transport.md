@@ -151,13 +151,18 @@ non-breaking.
 
 ### 3.3 URL scheme
 
-`bcast://<medium>:1/<node-id-hex>` — e.g. `bcast://udpm:1/1a2b3c4d5e6f7081`.
+`ws://<medium>.bcast:1/<node-id-hex>` — e.g.
+`ws://udpm.bcast:1/1a2b3c4d5e6f7081`.
 
-Host = medium name, port is a constant `1` (broadcast media have no ports;
-the kitsune2 `Url` type requires one), path segment = ephemeral `NodeId`, so
-`Url::peer_id()` works unchanged. This requires adding `bcast` to the allowed
-schemes in `kitsune2_api`'s `Url` validator — the same one-line api change the
-reticulum transport made for `ret`.
+Host = medium name under a reserved `.bcast` label, port is a constant `1`
+(broadcast media have no ports; the kitsune2 `Url` type requires one), path
+segment = ephemeral `NodeId`, so `Url::peer_id()` works unchanged. Using the
+`ws` scheme follows the precedent of core's `MemTransport`
+(`ws://stub.tx:42/<id>`) and — deliberately — avoids modifying
+`kitsune2_api`'s `Url` validator, keeping this crate buildable against the
+published `kitsune2_api 0.5.0-dev.6` that holochain `develop` pins. A
+dedicated `bcast` scheme (the one-line validator change the reticulum branch
+made for `ret`) can come later when upstreaming.
 
 ### 3.4 Phase 1 — unicast emulation (compatibility)
 
@@ -312,13 +317,69 @@ The chain-head-beacon gossip design (step 4) is worth having even on iroh: it
 exploits a structural property of Holochain data that generic DHT sync
 ignores.
 
-## 7. Relationship to the reticulum transport work
+## 7. Relationship to other in-flight lightningrodlabs work
 
-The `transport-reticulum` branch pioneered several pieces this design reuses:
-per-medium trait abstraction for testability, announce-driven bootstrap
-replacing the HTTP server, the pure chunking layer (copied here with link ids
-replaced by sender node ids), and the one-line `Url` scheme addition. This
-branch intentionally starts from upstream `main` rather than that branch; the
-reticulum transport can later rebase onto this base and potentially become a
-`BroadcastMedium`-style backend itself (Reticulum interfaces are themselves
-broadcast-capable at the LoRa/packet-radio layer).
+### 7.1 Reticulum transport (`kitsune2-lrl` `transport-reticulum`)
+
+That branch pioneered several pieces this design reuses: per-medium trait
+abstraction for testability, announce-driven bootstrap replacing the HTTP
+server, the pure chunking layer (copied here with link ids replaced by sender
+node ids). This branch intentionally starts from upstream `main` rather than
+that branch; the reticulum transport can later rebase onto this base and
+potentially become a `BroadcastMedium`-style backend itself (Reticulum
+interfaces are themselves broadcast-capable at the LoRa/packet-radio layer).
+
+### 7.2 mDNS bootstrap (`kitsune2-lrl` `feat/mdns-bootstrap`, `holochain-lrl` `feat/mdns-bootstrap-0.6.1`)
+
+The mdns work solves LAN *discovery* for the connection-oriented world:
+`kitsune2_bootstrap_mdns` (a Bootstrap module announcing a privacy-preserving
+space fingerprint over mDNS, with an HMAC proof-of-knowledge handshake before
+agent infos are exchanged), `CompositeBootstrapFactory` in `kitsune2_core`
+(stack WAN + LAN bootstrap over one peer store), and an iroh `mdns` feature
+for relay-less LAN dialing. The holochain branch adds a `network.mdns`
+conductor-config block that emits the `mdnsBootstrap` module config, and
+composes the factory unconditionally — the module is a no-op unless enabled,
+so a single binary carries the capability.
+
+Influences adopted here:
+
+- **Complementary, not competing.** mdns + iroh-LAN is the connectionless
+  *discovery* / connection-oriented *data* answer for LANs (shipping against
+  0.6.1); the broadcast transport removes the connection layer entirely. In
+  the switchable world they compose: when the active backend is iroh, mdns
+  bootstrap is the LAN discovery story; when it is a broadcast medium,
+  hearing frames *is* discovery and mdns is unnecessary.
+- **Composite pattern.** `CompositeBootstrapFactory` is exactly the
+  factory-wrapping-factories shape the switchable transport uses at the
+  transport layer, and phase 2's "beacons are the bootstrap" ships as another
+  Bootstrap module composed alongside core + mdns rather than replacing them.
+- **Privacy construction.** The mdns space commitment
+  (`SHA-256(space_id || "k2-mdns-v1")`, domain-tagged, with HMAC
+  proof-of-knowledge) sets the privacy bar for anything we put on a shared
+  medium. Phase-2 broadcast space tags reuse the same construction and
+  domain-separation style (`k2-bcast-v1`), including its known limitation
+  (candidate-list confirmation) and planned time-bucketed rotation. Note
+  that phase-1 frames carry cleartext `K2Proto` payloads whose space ids
+  are visible on the air — one more reason phase 1 is a validation stage,
+  not a production mode.
+- **Single-binary gating.** The "compose unconditionally, no-op unless
+  enabled via module config" trick is the same mechanism the switch factory
+  uses to satisfy the no-separate-binaries requirement; cargo features
+  control only what is *compiled in*, never which behavior is *active*.
+- **Test gating.** The mdns branch gates real-multicast integration tests
+  behind `K2_MDNS_IT`; the UDP multicast medium tests follow the same
+  pattern (`K2_BCAST_IT`) so CI environments without multicast stay green.
+- **Config plumbing.** The `network.mdns` → `insert_module_config` →
+  kitsune2 module config path in `NetworkConfig::to_k2_config()` is the
+  template for `network.transport` → `switchTransport` /
+  `broadcastTransport` plumbing (§4.2), and the holochain-lrl branch's
+  `[patch.crates-io]` + CI dev-build workflow is the proven route for
+  getting these binaries into Moss.
+
+Version-skew plan: the mdns branches are kitsune2-0.4.1 / holochain-0.6.1
+based, while this branch tracks kitsune2 `main` (0.5.0-dev) for holochain
+0.7. The mdns kitsune2 work (bootstrap_mdns crate + composite factory +
+iroh mdns feature) is additive and small; the integration path is to
+forward-port it onto this branch once the transport work lands, so a single
+kitsune2-lrl base feeds the holochain-0.7 integration branch, which then
+wires mdns, broadcast, and the switch through one `[patch.crates-io]` set.
