@@ -210,9 +210,22 @@ and three module replacements that exploit it:
   keeps N nodes from melting a slow channel. Repair is SRM-style: a behind
   node schedules a `WANT` after a random delay and suppresses if it overhears
   an equivalent request; any holder schedules a `REPAIR` the same way. Every
-  repair heals all listeners simultaneously.
+  repair heals all listeners simultaneously. Mechanism details adopted from
+  MemoryLAN (§7.3): repair replies are additionally gated by a
+  density-scaled probability (~1/d, with d estimated per interface from
+  overheard beacon ids), and set-fingerprint beacons re-salt their Bloom
+  filter each round so hash-collision false negatives surface over time.
+  Repair is served from a small FIFO **air cache** of recently heard pages
+  with move-to-front on duplicate reception — so any node (or relay) can
+  answer for content it merely overheard, and duplicates act as a
+  popularity signal rather than waste.
 - **Bootstrap = beacons.** No bootstrap server on-medium; hearing a beacon
   *is* discovery.
+
+Multi-hop uses content-hash flooding, not TTL: a re-broadcasting node
+suppresses forwarding when the frame's hash is in a fixed-size FIFO history
+(MemoryLAN's loop-prevention; see §7.3). This is addressless, needs no hop
+budget, and composes with idempotent self-validating pages.
 
 Blocking shifts from the connection edge to ingestion: you cannot close a
 connection that does not exist, so frames/ops attributable to blocked agents
@@ -446,3 +459,65 @@ iroh mdns feature) is additive and small; the integration path is to
 forward-port it onto this branch once the transport work lands, so a single
 kitsune2-lrl base feeds the holochain-0.7 integration branch, which then
 wires mdns, broadcast, and the switch through one `[patch.crates-io]` set.
+
+### 7.3 MemoryLAN (Tschudin, 2026)
+
+Christian Tschudin's *MemoryLAN: A Local Area Content Replication Mesh*
+(Univ. of Basel, Jun–Jul 2026) is a formal treatment of a broadcast
+replication mesh in the same design space as this work — it grew out of
+conversations with the Holochain side and adopts Holochain's long-standing
+"fast push / slow heal" framing (as "fast push / slow repair") for what
+its switches were already doing. Its value to us is a *validated,
+precisely specified mechanism set*: simulations show ~2× gain over
+store-and-forward meshes (from broadcasting and from in-network repair),
+with first LoRa / long-range-BLE deployments concurring. Its model:
+**memory switches** — small-memory, client-agnostic store-and-forward
+nodes — extend a physical broadcast domain into a mesh the way Ethernet
+switches extend a bus, "operating below the routing threshold". The
+service abstraction is addressless: no sender/receiver, just content
+pages; `add` at one edge yields best-effort `update` at every edge. Fast
+push floods new pages with loop prevention by a fixed-size FIFO hash
+history (sized ~2× the content cache); slow repair beacons a Bloom
+fingerprint of a FIFO content cache, and neighbors reply to detected
+deficits with probability scaled by estimated neighbor density (1/d ..
+1/d²) to prevent NACK implosion; duplicate reception moves a page to the
+cache head ("keep hot content hot").
+
+Mechanisms adopted directly into phase 2 (§3.5): hash-history flooding
+instead of TTL for multi-hop; the FIFO air cache with move-to-front,
+serving repair from overheard content; density-scaled reply probability
+composed with SRM overhear-suppression; per-round Bloom re-salting. The
+paper also names a failure mode our doc previously didn't — **sloshing**,
+oscillating repair between nodes whose bounded caches disagree — and its
+mitigation (novelty pressure; accept convergence on a *subset*). Note that
+our chain-head repair layer is structurally immune: per-agent chains make
+repair monotone (every repair is forward progress toward a known head), so
+sloshing can only affect the unordered air-cache layer, which is
+best-effort by construction.
+
+The deepest architectural takeaway is the **switch as a first-class,
+protocol-blind role**. A MemoryLAN switch never interprets pages — which
+means it can cache and flood our space-AEAD-encrypted frames without being
+a Holochain node, holding a key, or passing a membrane: dedicated cheap
+relay hardware (ESP32-class, LoRa, BLE) can extend a space's broadcast
+domain from *outside* the space. That suggests a future `bcast-relay`
+profile: the frame/flooding/air-cache layers of `transport_broadcast`
+compiled standalone, no kitsune2 above them. Two caveats the paper leaves
+open that matter for us: a content-blind cache is poisonable (garbage
+flooding evicts real content — our switches should at minimum admit only
+frames bearing a known space's HMAC tag, and rate-limit per tag), and
+cache units interact with fragmentation (caching fountain-coded symbols
+rather than reassembled pages fits the model best: any k of n symbols
+serve).
+
+Where we intentionally go beyond MemoryLAN: its repair is content-blind
+Bloom reconciliation because it assumes nothing about the data. Holochain
+data is signed, monotone, per-agent chains — so our member-level repair
+uses precise chain-head deltas (no false negatives, ~70-byte beacons)
+and keeps Bloom reconciliation only for the unordered layers. In
+MemoryLAN's terms, phase 2 is a *typed* memory LAN for members, riding on
+an untyped one that anyone — member or relay — can serve. The tinySSB
+integration reported in the paper (an unmodified CRDT sync protocol
+running transparently over the mesh) is the same claim our phase 1 makes
+for unmodified kitsune2 modules, which is encouraging precedent from a
+deployed system.
