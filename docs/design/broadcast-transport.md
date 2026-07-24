@@ -229,6 +229,17 @@ sizes) plus free-run soaks. All loss observed was clean tail-drop
   WiFi-audience networks, not an optimization. The fair proportional
   sharing is the good half: degradation is graceful for everyone, so
   repair-based healing keeps working during contention.
+- **Wired → WiFi (downlink), bursts**: burst tolerance is **shallow and
+  saturating**. Bursts of n back-to-back full-MTU frames once per second
+  (average rate trivially low) passed ~7 of 8 (13.5% loss), ~23 of 32
+  (26.8%), and ~32 of 128 (74.7%) — while *sustained* 200 fps passed
+  clean at every size. Same average rate, different shape, tens of
+  points of loss: traffic **shape matters as much as rate**. Delivery
+  was also smeared over ~400 ms per burst (beacon-interval batching).
+  Consequence: the pacer's burst allowance must be small (~4–6 MTU
+  frames) and its real job is *smoothing* — a back-to-back chunk train
+  is shredded even when its average rate is well under budget, and the
+  same payload spread evenly passes untouched.
 - **Wired → WiFi (downlink), client transmitting**: capacity is
   **load-dependent and collapses under the client's own traffic**. With
   the WiFi node simultaneously beaconing 500 fps × 200 B (its uplink
