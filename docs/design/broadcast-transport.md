@@ -200,31 +200,42 @@ sizes) plus free-run soaks. All loss observed was clean tail-drop
   clean through ~780 kB/s, 14.7% loss only at ~1.1 MB/s offered (≈0.9
   MB/s ceiling). Expected: client multicast reaches the AP as
   acknowledged full-rate unicast.
-- **Wired → WiFi (downlink)**: a **size-independent ~320 packets/sec
-  policer** — every size clean at ≤200 fps; ~20% loss at 400 fps and
-  ~59% at 800 fps, at 200 B and 1400 B alike. Confirmed by two
-  independent sweeps agreeing within ~2% (pass rate ≈319–326/s in every
-  lossy cell of both runs). At full MTU that's ≈448 kB/s max; at 200 B
-  frames only ≈64 kB/s — small frames cost 7× more per byte on the
-  constrained direction. (One earlier free-run at 500 fps × 200 B
-  measured clean in both directions, which the cap should have shed —
-  AP multicast policing appears state-dependent, e.g.
-  multicast-to-unicast conversion toggling with IGMP/client state;
-  treat exact numbers as AP-specific, the *shapes* as the durable
-  finding.)
+- **Wired → WiFi (downlink), quiet client radio**: a **size-independent
+  ~320 packets/sec cap** — every size clean at ≤200 fps; ~20% loss at
+  400 fps and ~59% at 800 fps, at 200 B and 1400 B alike. Confirmed by
+  two independent (self-serialized, one-transmitter-at-a-time) sweeps
+  agreeing within ~2% (pass rate ≈319–326/s in every lossy cell). At
+  full MTU that's ≈448 kB/s max; at 200 B frames only ≈64 kB/s — small
+  frames cost 7× more per byte on the constrained direction.
+- **Wired → WiFi (downlink), client transmitting**: capacity is
+  **load-dependent and collapses under the client's own traffic**. With
+  the WiFi node simultaneously beaconing 500 fps × 200 B (its uplink
+  stayed lossless throughout), the same downlink passed only ~110
+  frames/sec (78% loss of a 500 fps stream, sustained and stable). The
+  client radio is half-duplex: airtime it spends transmitting is
+  airtime it cannot hear, and unacknowledged multicast heard by nobody
+  is gone — a WiFi node deafens *itself*, and only itself, by talking.
 
 Implications: (a) phase 1 needs a **sender-side pacer with two budgets —
 packets/sec and bytes/sec** — since one direction was bound by each;
 staying under the budget eliminates WiFi loss without FEC, converting
-overrun into longer transfer times; (b) **frame coalescing matters**: a
-pps-capped downlink punishes exactly the chatty small frames phase-2
-protocols favor, so co-pending messages (beacons, WANTs, signals) should
-batch into MTU-sized frames in the frame scheduler; (c) direction
-asymmetry is real — a WiFi node can serve repairs generously (fat
-acked uplink) but receives through a straw, an input for phase-2's
-density/direction-aware reply probability; (d) fountain coding is
-motivated by genuinely noisy media (BLE, ultrasound) and beyond-budget
-bulk, not by WiFi per se.
+overrun into longer transfer times — and because downlink capacity is
+dynamic, defaults should sit well under the quiet-radio cap (~100–150
+pps); (b) **pacing your transmit protects your own receive** on
+half-duplex radios — the pacer is hearing protection, not just
+etiquette, and phase-2's suppression protocols (Trickle, SRM) double in
+the same role; (c) **slow heal is load-bearing, not a fallback**: WiFi
+nodes provably miss pushes during exactly the periods they are most
+active, and catch up via repair — the fast-push/slow-heal split is
+what makes a half-duplex lossy medium workable at all; (d) **frame
+coalescing matters**: a pps-capped downlink punishes exactly the chatty
+small frames phase-2 protocols favor, so co-pending messages (beacons,
+WANTs, signals) should batch into MTU-sized frames in the frame
+scheduler; (e) direction asymmetry is real — a WiFi node can serve
+repairs generously (fat acked uplink) but receives through a straw, an
+input for phase-2's density/direction-aware reply probability; (f)
+fountain coding is motivated by genuinely noisy media (BLE, ultrasound)
+and beyond-budget bulk, not by WiFi per se.
 
 ### 3.5 Phase 2 — native broadcast (the payoff)
 
