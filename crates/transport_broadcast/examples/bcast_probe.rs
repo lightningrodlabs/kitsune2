@@ -73,6 +73,9 @@ struct Args {
     rates: Vec<f64>,
     sizes: Vec<usize>,
     step_secs: f64,
+    rcvbuf: Option<u32>,
+    run_for: Option<f64>,
+    burst: Option<usize>,
 }
 
 fn usage() -> ! {
@@ -83,20 +86,28 @@ fn usage() -> ! {
          MODES:\n\
          \x20 (default)         listen; report senders heard\n\
          \x20 --send <HZ>       also beacon numbered frames at this rate\n\
+         \x20 --burst <N>       send N back-to-back frames once per second\n\
+         \x20                   (probes bottleneck queue depth)\n\
          \x20 --sweep           step a rate x size grid and print a loss\n\
          \x20                   matrix from receiver reports\n\n\
          OPTIONS:\n\
          \x20 --group <ADDR>    multicast group [default: 239.19.42.7]\n\
          \x20 --port <PORT>     shared udp port [default: 24842]\n\
          \x20 --mtu <BYTES>     max frame size [default: 1400]\n\
-         \x20 --size <BYTES>    free-run beacon size [default: 1200]\n\
+         \x20 --size <BYTES>    beacon/burst frame size [default: 1200]\n\
          \x20 --report <SECS>   free-run report interval [default: 2]\n\
+         \x20 --rcvbuf <BYTES>  set SO_RCVBUF (test kernel-drop hypotheses)\n\
+         \x20 --for <SECS>      exit after this long, printing a final\n\
+         \x20                   summary (free-run modes only)\n\
          \x20 --rates <LIST>    sweep rates, frames/s\n\
          \x20                   [default: 10,25,50,100,200,400,800]\n\
          \x20 --sizes <LIST>    sweep frame sizes, bytes\n\
          \x20                   [default: 200,500,1000,1400]\n\
          \x20 --step-secs <S>   transmit time per sweep step [default: 3]\n\
-         \x20 --help            show this help"
+         \x20 --help            show this help\n\n\
+         Every report also prints host-wide kernel udp drop counter deltas\n\
+         (/proc/net/snmp InErrors/RcvbufErrors) when they are non-zero, to\n\
+         separate network loss from local receive-path loss."
     );
     std::process::exit(2);
 }
@@ -113,6 +124,9 @@ fn parse_args() -> Args {
         rates: vec![10.0, 25.0, 50.0, 100.0, 200.0, 400.0, 800.0],
         sizes: vec![200, 500, 1000, 1400],
         step_secs: 3.0,
+        rcvbuf: None,
+        run_for: None,
+        burst: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -158,11 +172,27 @@ fn parse_args() -> Args {
                 out.step_secs =
                     value("--step-secs").parse().unwrap_or_else(|_| usage())
             }
+            "--rcvbuf" => {
+                out.rcvbuf =
+                    Some(value("--rcvbuf").parse().unwrap_or_else(|_| usage()))
+            }
+            "--for" => {
+                out.run_for =
+                    Some(value("--for").parse().unwrap_or_else(|_| usage()))
+            }
+            "--burst" => {
+                out.burst =
+                    Some(value("--burst").parse().unwrap_or_else(|_| usage()))
+            }
             _ => usage(),
         }
     }
-    if out.sweep && out.send_hz.is_some() {
-        eprintln!("--sweep and --send are mutually exclusive");
+    let modes = [out.sweep, out.send_hz.is_some(), out.burst.is_some()]
+        .iter()
+        .filter(|on| **on)
+        .count();
+    if modes > 1 {
+        eprintln!("--sweep, --send and --burst are mutually exclusive");
         std::process::exit(2);
     }
     for &size in out.sizes.iter().chain(std::iter::once(&out.size)) {
@@ -295,6 +325,55 @@ fn decode(frame: &[u8]) -> Option<Frame> {
 }
 
 // ---------------------------------------------------------------------
+// kernel udp counters (linux)
+
+/// Host-wide kernel udp counters from `/proc/net/snmp`. These cover every
+/// udp socket on the machine, so treat deltas as an upper bound on what
+/// happened to *our* socket — but a non-zero `RcvbufErrors` delta during a
+/// lossy run is strong evidence the loss is local, not on the network.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct UdpKernelStats {
+    in_datagrams: u64,
+    in_errors: u64,
+    rcvbuf_errors: u64,
+}
+
+fn read_udp_kernel_stats() -> Option<UdpKernelStats> {
+    let text = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut udp_lines = text.lines().filter(|l| l.starts_with("Udp:"));
+    let header: Vec<&str> = udp_lines.next()?.split_whitespace().collect();
+    let values: Vec<&str> = udp_lines.next()?.split_whitespace().collect();
+    let field = |name: &str| -> Option<u64> {
+        let at = header.iter().position(|f| *f == name)?;
+        values.get(at)?.parse().ok()
+    };
+    Some(UdpKernelStats {
+        in_datagrams: field("InDatagrams")?,
+        in_errors: field("InErrors")?,
+        rcvbuf_errors: field("RcvbufErrors")?,
+    })
+}
+
+/// Print the delta between two kernel snapshots if anything dropped.
+fn print_kernel_delta(
+    label: &str,
+    before: Option<UdpKernelStats>,
+    after: Option<UdpKernelStats>,
+) {
+    if let (Some(before), Some(after)) = (before, after) {
+        let in_errors = after.in_errors.saturating_sub(before.in_errors);
+        let rcvbuf_errors =
+            after.rcvbuf_errors.saturating_sub(before.rcvbuf_errors);
+        if in_errors > 0 || rcvbuf_errors > 0 {
+            println!(
+                "{label} kernel udp drops (host-wide): InErrors +{in_errors} \
+                 RcvbufErrors +{rcvbuf_errors}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // shared state
 
 /// Free-run stats for one sender (seq-gap based).
@@ -361,6 +440,7 @@ async fn main() {
         group: args.group.clone(),
         port: args.port,
         mtu: args.mtu,
+        rcvbuf: args.rcvbuf,
     })
     .await
     .unwrap_or_else(|err| {
@@ -370,10 +450,14 @@ async fn main() {
 
     let self_id: u64 = rand::random();
     println!(
-        "[bcast-probe] group {}:{} mtu {} | self id {:016x} | {}",
+        "[bcast-probe] group {}:{} mtu {}{} | self id {:016x} | {}",
         args.group,
         args.port,
         args.mtu,
+        match args.rcvbuf {
+            Some(rcvbuf) => format!(" rcvbuf {rcvbuf}"),
+            None => String::new(),
+        },
         self_id,
         if args.sweep {
             format!(
@@ -382,6 +466,8 @@ async fn main() {
                 args.sizes.len(),
                 args.step_secs
             )
+        } else if let Some(burst) = args.burst {
+            format!("bursting {burst} x {} B every second", args.size)
         } else {
             match args.send_hz {
                 Some(hz) => {
@@ -541,23 +627,65 @@ async fn main() {
         });
     }
 
+    // Burst mode: n back-to-back frames once per second.
+    if let Some(burst) = args.burst {
+        let medium = medium.clone();
+        let size = args.size;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let mut seq: u64 = 0;
+            loop {
+                interval.tick().await;
+                for _ in 0..burst {
+                    let frame = encode_data(self_id, FREE_RUN_STEP, seq, size);
+                    if let Err(err) = medium.transmit(frame.into()).await {
+                        eprintln!("transmit failed: {err}");
+                    }
+                    seq += 1;
+                }
+            }
+        });
+    }
+
     // Free-run report loop.
     let started = Instant::now();
+    let kernel_at_start = read_udp_kernel_stats();
+    let mut kernel_last = kernel_at_start;
+    let deadline = args
+        .run_for
+        .map(|secs| started + Duration::from_secs_f64(secs));
+    let transmitting = args.send_hz.is_some() || args.burst.is_some();
     let mut report =
         tokio::time::interval(Duration::from_secs(args.report_secs));
     report.tick().await;
     loop {
         report.tick().await;
         let now = Instant::now();
+        if let Some(deadline) = deadline
+            && now >= deadline
+        {
+            break;
+        }
+        let kernel_now = read_udp_kernel_stats();
+        print_kernel_delta(
+            &format!("[{:5.0}s]", started.elapsed().as_secs_f64()),
+            kernel_last,
+            kernel_now,
+        );
+        kernel_last = kernel_now;
         let mut shared = shared.lock().unwrap();
         if shared.free_run.is_empty() {
+            let observing = !shared.observed.is_empty();
             println!(
-                "[{:5.0}s] no probe frames heard yet{}",
+                "[{:5.0}s] {}",
                 started.elapsed().as_secs_f64(),
-                if args.send_hz.is_some() {
-                    " (not even our own loopback — check the transmit path)"
+                if observing {
+                    "observing a sweep (see sweeping side for the matrix)"
+                } else if transmitting {
+                    "no probe frames heard yet (not even our own loopback \
+                     — check the transmit path)"
                 } else {
-                    ""
+                    "no probe frames heard yet"
                 }
             );
             continue;
@@ -588,6 +716,30 @@ async fn main() {
             );
         }
     }
+
+    // --for expired: final summary.
+    println!(
+        "\n[bcast-probe] final summary after {:.0}s:",
+        started.elapsed().as_secs_f64()
+    );
+    let shared = shared.lock().unwrap();
+    let mut senders: Vec<_> = shared.free_run.iter().collect();
+    senders.sort_by_key(|(id, _)| **id);
+    for (id, s) in senders {
+        println!(
+            "  {}  recv {}/{} ({:.1}% loss)  ooo {}",
+            if *id == self_id {
+                "self            ".to_string()
+            } else {
+                format!("{id:016x}")
+            },
+            s.received,
+            s.expected(),
+            s.loss_pct(),
+            s.out_of_order,
+        );
+    }
+    print_kernel_delta("  total", kernel_at_start, read_udp_kernel_stats());
 }
 
 // ---------------------------------------------------------------------
@@ -626,6 +778,8 @@ async fn run_sweep(
             None => break,
         }
     }
+
+    let kernel_at_start = read_udp_kernel_stats();
 
     // The grid. step id = row-major index.
     let steps: Vec<(f64, usize)> = args
@@ -720,5 +874,10 @@ async fn run_sweep(
     println!(
         "\n('-' = no frames of that step were reported received; offered \
          kB/s = rate x size / 1024)"
+    );
+    print_kernel_delta(
+        "[bcast-probe]",
+        kernel_at_start,
+        read_udp_kernel_stats(),
     );
 }

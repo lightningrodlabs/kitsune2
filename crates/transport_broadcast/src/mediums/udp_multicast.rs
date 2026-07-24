@@ -39,6 +39,19 @@ pub struct UdpMulticastConfig {
     ///
     /// Default: 1400.
     pub mtu: usize,
+
+    /// Socket receive buffer size (`SO_RCVBUF`) in bytes.
+    ///
+    /// The kernel accounts buffered datagrams by allocation size (~2 KiB
+    /// per packet regardless of payload), so the OS default (~208 KiB on
+    /// Linux) holds only ~100 packets — at broadcast frame rates, a busy
+    /// receiver can drop packets in its own kernel and the loss is
+    /// indistinguishable from network loss without checking
+    /// `/proc/net/snmp`. When unset, the OS default is used.
+    ///
+    /// Default: `None`.
+    #[serde(default)]
+    pub rcvbuf: Option<u32>,
 }
 
 impl Default for UdpMulticastConfig {
@@ -47,6 +60,7 @@ impl Default for UdpMulticastConfig {
             group: "239.19.42.7".into(),
             port: 24842,
             mtu: 1400,
+            rcvbuf: None,
         }
     }
 }
@@ -109,6 +123,11 @@ impl UdpMulticastMedium {
                 .into(),
             )
             .map_err(|err| K2Error::other_src("bind multicast port", err))?;
+        if let Some(rcvbuf) = config.rcvbuf {
+            socket
+                .set_recv_buffer_size(rcvbuf as usize)
+                .map_err(|err| K2Error::other_src("set SO_RCVBUF", err))?;
+        }
         socket
             .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
             .map_err(|err| K2Error::other_src("join multicast group", err))?;
