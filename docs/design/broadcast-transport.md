@@ -188,6 +188,29 @@ Known, accepted limitations of phase 1: no per-frame FEC or retransmission
 the fountain-coding layer lands), and the same preflight-loss sensitivity any
 connection emulation has.
 
+#### Measured: udp multicast on a real LAN (2026-07-24, bcast-probe)
+
+Two machines, consumer AP, `bcast_probe` example, both directions
+beaconing:
+
+- **Wired ↔ wired**: 500 fps × 1400 B ≈ 684 kB/s per sender, both
+  directions simultaneously — 0.0% loss, zero reordering.
+- **Wired ↔ WiFi**: symmetric behavior, and the loss is a *bandwidth*
+  policy, not radio noise: at 500 fps × 1400 B (~684 kB/s offered) the AP
+  forwards ~270–300 kB/s and tail-drops the rest (~60% loss, `ooo 0` —
+  clean drops); at 500 fps × 200 B (~98 kB/s) loss is 0.0–0.1%. The AP
+  enforces a fixed multicast forwarding budget (~2.2–2.4 Mbit/s here);
+  under it, even high frame rates are clean.
+
+Implications: (a) phase 1 needs a **sender-side pacer** (token bucket on
+the medium, configurable bytes/sec budget) — staying under the AP budget
+eliminates WiFi loss entirely without FEC, converting overrun-loss into
+longer transfer times; (b) small-frame-chatty protocols (phase-2 beacons,
+repair, signals) have ample WiFi headroom — 500 clean frames/sec measured;
+(c) fountain coding is motivated by genuinely noisy media (BLE, ultrasound)
+and beyond-budget bulk, not by WiFi per se; (d) loss symmetry means repair
+serving needs no topology awareness on WiFi LANs.
+
 ### 3.5 Phase 2 — native broadcast (the payoff)
 
 Adds an optional capability to `kitsune2_api` (mirroring how per-space hooks
