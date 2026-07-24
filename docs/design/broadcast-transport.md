@@ -216,6 +216,19 @@ sizes) plus free-run soaks. All loss observed was clean tail-drop
   (two adjacent low-rate cells losing 28–48%, not reproduced) — real
   WiFi delivers occasional whole-second outages at any rate, which is
   the phase-2 repair layer's job to absorb.
+- **Wired → WiFi (downlink), two senders**: the ~320 pps budget is
+  **aggregate and fairly shared**. Two wired machines each sending
+  200 fps × 1400 B were received by the WiFi node at 20.0% and 21.0%
+  loss respectively — statistically identical to one sender at 400 fps
+  — while hearing each other at 0% on the wire. The policer counts
+  packets, not sources; overrun loss splits proportionally with no
+  capture or starvation. Consequence: per-node pacing is necessary but
+  **not sufficient** — N polite senders still jointly overrun a shared
+  budget, so phase-2's constant-total-traffic protocols (Trickle-paced
+  beacons, suppressed repair) are a correctness requirement for
+  WiFi-audience networks, not an optimization. The fair proportional
+  sharing is the good half: degradation is graceful for everyone, so
+  repair-based healing keeps working during contention.
 - **Wired → WiFi (downlink), client transmitting**: capacity is
   **load-dependent and collapses under the client's own traffic**. With
   the WiFi node simultaneously beaconing 500 fps × 200 B (its uplink
