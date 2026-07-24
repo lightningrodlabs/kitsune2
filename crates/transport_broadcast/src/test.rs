@@ -294,7 +294,7 @@ async fn network_stats_report_backend_and_counters() {
     let conn = stats
         .connections
         .iter()
-        .find(|c| c.pub_key == bob.url.as_str())
+        .find(|c| Some(c.pub_key.as_str()) == bob.url.peer_id())
         .expect("connection to bob in stats");
     assert!(conn.send_message_count >= 1);
     assert!(conn.send_bytes > 0);

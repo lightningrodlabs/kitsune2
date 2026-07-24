@@ -587,7 +587,14 @@ impl TxImp for BroadcastTransport {
                 .unwrap()
                 .values()
                 .map(|entry| TransportConnectionStats {
-                    pub_key: entry.url.to_string(),
+                    // The peer id (node-id hex), matching the iroh transport's
+                    // pub_key semantics so consumers (e.g. holochain's per-app
+                    // stats filter) can match entries against peer-store URLs.
+                    pub_key: entry
+                        .url
+                        .peer_id()
+                        .unwrap_or_default()
+                        .to_string(),
                     send_message_count: entry.send_message_count,
                     send_bytes: entry.send_bytes,
                     recv_message_count: entry.recv_message_count,
