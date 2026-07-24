@@ -50,12 +50,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const MAGIC: &[u8; 8] = b"K2PROBE2";
+const MAGIC: &[u8; 8] = b"K2PROBE3";
 const TYPE_DATA: u8 = 0;
 const TYPE_REPORT: u8 = 1;
 
-/// magic + type + sender id + step + seq.
-const DATA_HEADER_LEN: usize = 8 + 1 + 8 + 2 + 8;
+/// magic + type + sender id + step + seq + nominal rate.
+const DATA_HEADER_LEN: usize = 8 + 1 + 8 + 2 + 8 + 2;
 /// The step id used by free-run (non-sweep) beacons.
 const FREE_RUN_STEP: u16 = 0xffff;
 
@@ -215,13 +215,26 @@ fn parse_args() -> Args {
 // ---------------------------------------------------------------------
 // wire format
 
-fn encode_data(sender: u64, step: u16, seq: u64, size: usize) -> Vec<u8> {
+/// `rate_hint` is the sender's nominal frames/sec (saturated to u16,
+/// 0 = unknown). It lets receivers report "% of the nominal stream
+/// heard" via wall clock — the seq-gap loss metric silently understates
+/// catastrophic loss, because frames outside the observed seq range are
+/// invisible to it (measured: a receiver that heard 1 of 30000 frames
+/// displayed "1/1, 0.0% loss").
+fn encode_data(
+    sender: u64,
+    step: u16,
+    seq: u64,
+    size: usize,
+    rate_hint: u16,
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(size);
     frame.extend_from_slice(MAGIC);
     frame.push(TYPE_DATA);
     frame.extend_from_slice(&sender.to_be_bytes());
     frame.extend_from_slice(&step.to_be_bytes());
     frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(&rate_hint.to_be_bytes());
     frame.resize(size, 0xbc);
     frame
 }
@@ -230,6 +243,7 @@ struct DataFrame {
     sender: u64,
     step: u16,
     seq: u64,
+    rate_hint: u16,
 }
 
 /// One receiver's cumulative counters for one (subject, step).
@@ -286,6 +300,7 @@ fn decode(frame: &[u8]) -> Option<Frame> {
                 sender: u64::from_be_bytes(frame[9..17].try_into().ok()?),
                 step: u16::from_be_bytes(frame[17..19].try_into().ok()?),
                 seq: u64::from_be_bytes(frame[19..27].try_into().ok()?),
+                rate_hint: u16::from_be_bytes(frame[27..29].try_into().ok()?),
             }))
         }
         TYPE_REPORT => {
@@ -384,7 +399,9 @@ struct FreeRunStats {
     received: u64,
     out_of_order: u64,
     window_bytes: u64,
+    first_heard: Option<Instant>,
     last_heard: Option<Instant>,
+    rate_hint: u16,
 }
 
 impl FreeRunStats {
@@ -398,6 +415,23 @@ impl FreeRunStats {
             return 0.0;
         }
         100.0 * (1.0 - (self.received.min(expected) as f64 / expected as f64))
+    }
+
+    /// Percent of the sender's *nominal* stream heard since we first
+    /// heard it, from the rate hint and the wall clock. Catches the
+    /// catastrophic-loss case the seq-gap metric cannot see (frames
+    /// outside the observed seq range). Only meaningful while the
+    /// sender is actually still transmitting.
+    fn nominal_pct(&self, now: Instant) -> Option<f64> {
+        if self.rate_hint == 0 {
+            return None;
+        }
+        let elapsed = now.duration_since(self.first_heard?).as_secs_f64();
+        if elapsed < 1.0 {
+            return None;
+        }
+        let nominal = self.rate_hint as f64 * elapsed;
+        Some((self.received as f64 / nominal * 100.0).min(100.0))
     }
 }
 
@@ -505,6 +539,7 @@ async fn main() {
                                     FreeRunStats {
                                         first_seq: data.seq,
                                         max_seq: data.seq,
+                                        first_heard: Some(Instant::now()),
                                         ..Default::default()
                                     }
                                 });
@@ -516,6 +551,7 @@ async fn main() {
                             entry.received += 1;
                             entry.window_bytes += frame_len as u64;
                             entry.last_heard = Some(Instant::now());
+                            entry.rate_hint = data.rate_hint;
                         } else {
                             // Sweep data: count it (own frames excluded —
                             // loopback would report perfect scores).
@@ -615,10 +651,12 @@ async fn main() {
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs_f64(1.0 / hz));
+            let rate_hint = hz.round().min(u16::MAX as f64) as u16;
             let mut seq: u64 = 0;
             loop {
                 interval.tick().await;
-                let frame = encode_data(self_id, FREE_RUN_STEP, seq, size);
+                let frame =
+                    encode_data(self_id, FREE_RUN_STEP, seq, size, rate_hint);
                 if let Err(err) = medium.transmit(frame.into()).await {
                     eprintln!("transmit failed: {err}");
                 }
@@ -633,11 +671,18 @@ async fn main() {
         let size = args.size;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            let rate_hint = burst.min(u16::MAX as usize) as u16;
             let mut seq: u64 = 0;
             loop {
                 interval.tick().await;
                 for _ in 0..burst {
-                    let frame = encode_data(self_id, FREE_RUN_STEP, seq, size);
+                    let frame = encode_data(
+                        self_id,
+                        FREE_RUN_STEP,
+                        seq,
+                        size,
+                        rate_hint,
+                    );
                     if let Err(err) = medium.transmit(frame.into()).await {
                         eprintln!("transmit failed: {err}");
                     }
@@ -700,7 +745,7 @@ async fn main() {
                 .map(|t| now.duration_since(t).as_secs_f64())
                 .unwrap_or(f64::NAN);
             println!(
-                "[{:5.0}s] {}  recv {}/{} ({:.1}% loss)  ooo {}  {:8.1} kB/s  last {:.1}s ago",
+                "[{:5.0}s] {}  recv {}/{} ({:.1}% loss)  ooo {}  {:8.1} kB/s  last {:.1}s ago{}",
                 started.elapsed().as_secs_f64(),
                 if *id == self_id {
                     "self            ".to_string()
@@ -713,6 +758,15 @@ async fn main() {
                 s.out_of_order,
                 rate,
                 ago,
+                match s.nominal_pct(now) {
+                    Some(pct) if *id != self_id => {
+                        format!(
+                            "  [{:.1}% of nominal {} fps]",
+                            pct, s.rate_hint
+                        )
+                    }
+                    _ => String::new(),
+                },
             );
         }
     }
@@ -726,8 +780,19 @@ async fn main() {
     let mut senders: Vec<_> = shared.free_run.iter().collect();
     senders.sort_by_key(|(id, _)| **id);
     for (id, s) in senders {
+        // Nominal coverage over the whole wall clock: slightly deflated
+        // if the sender stopped before we did, but crucially non-blind
+        // in the catastrophic case (1 frame heard, then deafness) where
+        // a last-heard basis would report nothing at all.
+        let nominal = s
+            .nominal_pct(Instant::now())
+            .filter(|_| *id != self_id)
+            .map(|pct| {
+                format!("  [{:.1}% of nominal {} fps]", pct, s.rate_hint)
+            })
+            .unwrap_or_default();
         println!(
-            "  {}  recv {}/{} ({:.1}% loss)  ooo {}",
+            "  {}  recv {}/{} ({:.1}% loss)  ooo {}{}",
             if *id == self_id {
                 "self            ".to_string()
             } else {
@@ -737,6 +802,7 @@ async fn main() {
             s.expected(),
             s.loss_pct(),
             s.out_of_order,
+            nominal,
         );
     }
     print_kernel_delta("  total", kernel_at_start, read_udp_kernel_stats());
@@ -814,7 +880,13 @@ async fn run_sweep(
         let mut seq: u64 = 0;
         while Instant::now() < step_end {
             interval.tick().await;
-            let frame = encode_data(self_id, index as u16, seq, *size);
+            let frame = encode_data(
+                self_id,
+                index as u16,
+                seq,
+                *size,
+                rate.round().min(u16::MAX as f64) as u16,
+            );
             if let Err(err) = medium.transmit(frame.into()).await {
                 eprintln!("transmit failed: {err}");
             }
