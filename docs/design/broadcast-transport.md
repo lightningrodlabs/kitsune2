@@ -270,6 +270,73 @@ input for phase-2's density/direction-aware reply probability; (f)
 fountain coding is motivated by genuinely noisy media (BLE, ultrasound)
 and beyond-budget bulk, not by WiFi per se.
 
+### 3.4b The phase-1 pacer (designed, not yet built)
+
+Every parameter below is derived from the measured findings above; if a
+different network materially disagrees with those measurements, re-run
+`scripts/EXPERIMENTS.md` before trusting the defaults.
+
+**Placement — a wrapping medium.** A `PacedMedium` implementing
+[`BroadcastMedium`], wrapping any inner medium; the transport composes
+`PacedMedium::new(inner, budgets)` at creation. Rationale: testable in
+isolation against `MemAir` under `tokio::time::pause()`; applies
+unchanged to every future medium (BLE has its own budgets); and the
+probe deliberately drives the *raw* medium, so measurement stays
+unpaced. Only `transmit()` changes; everything else passes through.
+
+**Semantics — delay, never drop.** `transmit()` awaits until the frame
+is admissible, then sends; per-caller FIFO ordering via a small async
+mutex. Backpressure propagates naturally (`TxImp::send` awaits transmit,
+callers await send), slowing kitsune2 modules to the medium's real
+capacity instead of feeding an AP's tail-drop. The medium contract
+(best-effort, no delivery guarantee) is unchanged — only *when* frames
+enter the air moves. Measured justification: overrun and burst loss are
+the only sender-fixable loss modes, and both convert cleanly into
+longer transfer times (a 1 MB chunk train at 150 pps × 1400 B is ~4.8 s
+of clean air versus 1.5 s at 60% loss — and with no phase-1 retransmit,
+that is the difference between arriving and not arriving).
+
+**Mechanics — two token buckets, one clock.** A frames bucket
+(refill = `maxFramesPerSec`, cost 1) and a bytes bucket (refill =
+`maxBytesPerSec`, cost = frame length); a transmit must satisfy both,
+wait = max of the two. Implementation: token levels + last-refill
+instant behind a `tokio::sync::Mutex`, compute earliest admissible
+time, `sleep_until`, decrement, send. Zero overhead when under budget.
+
+**Defaults, each traceable to a measurement:**
+
+| knob | default | source |
+| --- | --- | --- |
+| `maxFramesPerSec` | ~100–150 | quiet-radio downlink cap ~320 pps, shared *aggregate* (two senders ≡ one at their sum) — leave room for peers |
+| `maxBytesPerSec` | ~200 kB/s | binds when frames are large and pps is set generously; wifi uplink ~0.9 MB/s and wired ~684 kB/s are far above it |
+| frames-bucket burst | ~4–6 frames | AP burst tolerance: pass-per-burst ~7/~23/~32 at n=8/32/128 — spikes are shredded, smoothness is rewarded |
+| bytes-bucket burst | ~8 KB | same, in bytes at MTU |
+| `0` on either budget | unlimited | measurement/testing escape hatch |
+
+Config lands as `broadcastTransport.pacer.{maxFramesPerSec,
+maxBytesPerSec}` in the module config (flows through holochain's
+`network.transport` block unchanged; runtime-tunable later via the same
+config-update mechanism the switch transport uses).
+
+**Known, accepted limitations:** (a) it cannot arbitrate the *shared*
+budget — N polite nodes still jointly overrun an aggregate policer;
+that is phase-2's Trickle/suppression job (measured as a correctness
+requirement, not an optimization); (b) single FIFO means a bulk chunk
+train head-of-line blocks small urgent frames for seconds at low
+budgets — deliberately not fixed in v1, because the clean fix is the
+phase-2 frame scheduler (priority lanes + MTU coalescing) and a
+two-lane hack here would prejudge that design; (c) it cannot restore a
+transmitting WiFi node's hearing (radio-level, measured up to total) —
+slow-heal covers that by architecture.
+
+**Observability:** counters for frames delayed, cumulative delay, and
+current bucket levels, surfaced through the medium so
+`dump_network_stats` can show a node living at its budget.
+
+**Tests:** against `MemAir` with mocked time — exact-rate conformance
+per bucket, the max() interaction when both bind, burst-then-sustain,
+pass-through when unlimited.
+
 ### 3.5 Phase 2 — native broadcast (the payoff)
 
 Adds an optional capability to `kitsune2_api` (mirroring how per-space hooks
