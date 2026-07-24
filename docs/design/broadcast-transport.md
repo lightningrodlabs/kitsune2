@@ -203,10 +203,19 @@ sizes) plus free-run soaks. All loss observed was clean tail-drop
 - **Wired → WiFi (downlink), quiet client radio**: a **size-independent
   ~320 packets/sec cap** — every size clean at ≤200 fps; ~20% loss at
   400 fps and ~59% at 800 fps, at 200 B and 1400 B alike. Confirmed by
-  two independent (self-serialized, one-transmitter-at-a-time) sweeps
+  four independent (self-serialized, one-transmitter-at-a-time) sweeps
   agreeing within ~2% (pass rate ≈319–326/s in every lossy cell). At
   full MTU that's ≈448 kB/s max; at 200 B frames only ≈64 kB/s — small
   frames cost 7× more per byte on the constrained direction.
+  **Mechanism attributed**: re-running the sweep with an 8 MiB
+  `SO_RCVBUF` on the receiver left the matrix unchanged, ruling out
+  receiver-kernel buffer overflow (which would also present as a
+  size-independent pps cap, since the kernel buffers datagrams by ~2 KiB
+  truesize) — the cap is the AP's multicast policer, in the network,
+  not the host. One sweep also caught a transient ~10 s radio blackout
+  (two adjacent low-rate cells losing 28–48%, not reproduced) — real
+  WiFi delivers occasional whole-second outages at any rate, which is
+  the phase-2 repair layer's job to absorb.
 - **Wired → WiFi (downlink), client transmitting**: capacity is
   **load-dependent and collapses under the client's own traffic**. With
   the WiFi node simultaneously beaconing 500 fps × 200 B (its uplink
