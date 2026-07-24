@@ -190,26 +190,41 @@ connection emulation has.
 
 #### Measured: udp multicast on a real LAN (2026-07-24, bcast-probe)
 
-Two machines, consumer AP, `bcast_probe` example, both directions
-beaconing:
+Two machines, consumer AP, `bcast_probe` sweep matrices (7 rates × 4
+sizes) plus free-run soaks. All loss observed was clean tail-drop
+(`ooo 0`), never reordering.
 
 - **Wired ↔ wired**: 500 fps × 1400 B ≈ 684 kB/s per sender, both
-  directions simultaneously — 0.0% loss, zero reordering.
-- **Wired ↔ WiFi**: symmetric behavior, and the loss is a *bandwidth*
-  policy, not radio noise: at 500 fps × 1400 B (~684 kB/s offered) the AP
-  forwards ~270–300 kB/s and tail-drops the rest (~60% loss, `ooo 0` —
-  clean drops); at 500 fps × 200 B (~98 kB/s) loss is 0.0–0.1%. The AP
-  enforces a fixed multicast forwarding budget (~2.2–2.4 Mbit/s here);
-  under it, even high frame rates are clean.
+  directions simultaneously — 0.0% loss.
+- **WiFi → wired (uplink)**: nearly lossless across the whole grid —
+  clean through ~780 kB/s, 14.7% loss only at ~1.1 MB/s offered (≈0.9
+  MB/s ceiling). Expected: client multicast reaches the AP as
+  acknowledged full-rate unicast.
+- **Wired → WiFi (downlink)**: a **size-independent ~320 packets/sec
+  policer** — every size clean at ≤200 fps; ~20% loss at 400 fps and
+  ~59% at 800 fps, at 200 B and 1400 B alike. Confirmed by two
+  independent sweeps agreeing within ~2% (pass rate ≈319–326/s in every
+  lossy cell of both runs). At full MTU that's ≈448 kB/s max; at 200 B
+  frames only ≈64 kB/s — small frames cost 7× more per byte on the
+  constrained direction. (One earlier free-run at 500 fps × 200 B
+  measured clean in both directions, which the cap should have shed —
+  AP multicast policing appears state-dependent, e.g.
+  multicast-to-unicast conversion toggling with IGMP/client state;
+  treat exact numbers as AP-specific, the *shapes* as the durable
+  finding.)
 
-Implications: (a) phase 1 needs a **sender-side pacer** (token bucket on
-the medium, configurable bytes/sec budget) — staying under the AP budget
-eliminates WiFi loss entirely without FEC, converting overrun-loss into
-longer transfer times; (b) small-frame-chatty protocols (phase-2 beacons,
-repair, signals) have ample WiFi headroom — 500 clean frames/sec measured;
-(c) fountain coding is motivated by genuinely noisy media (BLE, ultrasound)
-and beyond-budget bulk, not by WiFi per se; (d) loss symmetry means repair
-serving needs no topology awareness on WiFi LANs.
+Implications: (a) phase 1 needs a **sender-side pacer with two budgets —
+packets/sec and bytes/sec** — since one direction was bound by each;
+staying under the budget eliminates WiFi loss without FEC, converting
+overrun into longer transfer times; (b) **frame coalescing matters**: a
+pps-capped downlink punishes exactly the chatty small frames phase-2
+protocols favor, so co-pending messages (beacons, WANTs, signals) should
+batch into MTU-sized frames in the frame scheduler; (c) direction
+asymmetry is real — a WiFi node can serve repairs generously (fat
+acked uplink) but receives through a straw, an input for phase-2's
+density/direction-aware reply probability; (d) fountain coding is
+motivated by genuinely noisy media (BLE, ultrasound) and beyond-budget
+bulk, not by WiFi per se.
 
 ### 3.5 Phase 2 — native broadcast (the payoff)
 
