@@ -361,13 +361,23 @@ fn metrics_current_values() {
     assert!(metrics["series"]["hours"].is_array());
     assert!(metrics["series"]["days"].is_array());
 
-    // The /metrics route itself serves the HTML dashboard.
+    // The /metrics route itself serves the HTML dashboard, with a CSP
+    // that permits its inline style/script and same-origin fetch (the
+    // global strict CSP layer would otherwise blank the page).
     let addr = format!("http://{}/metrics", s.listen_addrs()[0]);
     let res = ureq::get(&addr).call().unwrap();
     assert_eq!(
         res.headers().get("content-type").unwrap(),
         "text/html; charset=utf-8"
     );
+    let csp = res
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("style-src 'unsafe-inline'"));
+    assert!(csp.contains("connect-src 'self'"));
     let body = res.into_body().read_to_string().unwrap();
     assert!(body.contains("/metrics-raw"));
 }

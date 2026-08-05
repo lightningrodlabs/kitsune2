@@ -561,7 +561,10 @@ fn tokio_thread(
                             "max-age=63072000; includeSubDomains",
                         ),
                     ))
-                    .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+                    // if_not_present so a route serving an actual page
+                    // (the /metrics dashboard) can carry its own policy;
+                    // every route that sets none gets the strict default.
+                    .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
                         http::header::CONTENT_SECURITY_POLICY,
                         HeaderValue::from_static(
                             "default-src 'none'; frame-ancestors 'none'; form-action 'none'; base-uri 'self'; block-all-mixed-content; plugin-types 'none'",
@@ -806,6 +809,14 @@ async fn handle_metrics_html() -> response::Response {
     response::Response::builder()
         .status(200)
         .header("Content-Type", "text/html; charset=utf-8")
+        // The dashboard is a self-contained page: inline style/script
+        // only, data fetched from this origin, nothing external.
+        .header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; \
+             script-src 'unsafe-inline'; connect-src 'self'; \
+             frame-ancestors 'none'; form-action 'none'; base-uri 'self'",
+        )
         .body(body::Body::from(include_str!("metrics.html")))
         .expect("failed to encode response")
 }
