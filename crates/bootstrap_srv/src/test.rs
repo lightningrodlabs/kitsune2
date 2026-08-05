@@ -272,18 +272,20 @@ fn health_always_returns_empty() {
 #[test]
 fn metrics_disabled_not_available() {
     let s = BootstrapSrv::new(Config::testing()).unwrap();
-    let addr = format!("http://{}/metrics", s.listen_addrs()[0]);
-    match ureq::get(&addr).call() {
-        Err(ureq::Error::StatusCode(status)) => {
-            // When metrics is disabled the route is not registered.
-            // The exact error code depends on whether the SBD catch-all
-            // route matches first (400) or not (404).
-            assert!(
-                status == 404 || status == 400,
-                "expected 400 or 404, got {status}"
-            );
+    for route in ["metrics", "metrics-raw"] {
+        let addr = format!("http://{}/{route}", s.listen_addrs()[0]);
+        match ureq::get(&addr).call() {
+            Err(ureq::Error::StatusCode(status)) => {
+                // When metrics is disabled the route is not registered.
+                // The exact error code depends on whether the SBD catch-all
+                // route matches first (400) or not (404).
+                assert!(
+                    status == 404 || status == 400,
+                    "expected 400 or 404, got {status}"
+                );
+            }
+            oth => panic!("expected error status, got {oth:?}"),
         }
-        oth => panic!("expected error status, got {oth:?}"),
     }
 }
 
@@ -323,7 +325,7 @@ fn metrics_current_values() {
     .call()
     .unwrap();
 
-    let addr = format!("http://{}/metrics", s.listen_addrs()[0]);
+    let addr = format!("http://{}/metrics-raw", s.listen_addrs()[0]);
     let res = ureq::get(&addr)
         .call()
         .unwrap()
@@ -345,6 +347,22 @@ fn metrics_current_values() {
 
     // uptimeSecs should be present.
     assert!(metrics["uptimeSecs"].is_number());
+
+    // History series arrays are present (may be empty before the first
+    // prune-tick snapshot).
+    assert!(metrics["series"]["minutes"].is_array());
+    assert!(metrics["series"]["hours"].is_array());
+    assert!(metrics["series"]["days"].is_array());
+
+    // The /metrics route itself serves the HTML dashboard.
+    let addr = format!("http://{}/metrics", s.listen_addrs()[0]);
+    let res = ureq::get(&addr).call().unwrap();
+    assert_eq!(
+        res.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let body = res.into_body().read_to_string().unwrap();
+    assert!(body.contains("/metrics-raw"));
 }
 
 #[test]

@@ -455,7 +455,12 @@ fn tokio_thread(
                 );
 
             if config.metrics {
-                app = app.route("/metrics", routing::get(handle_metrics_get));
+                app = app
+                    .route("/metrics", routing::get(handle_metrics_html))
+                    .route(
+                        "/metrics-raw",
+                        routing::get(handle_metrics_get),
+                    );
             }
 
             let mut app = app
@@ -795,6 +800,14 @@ async fn handle_metrics_get(
     extract::State(state): extract::State<AppState>,
 ) -> response::Response {
     handle_dispatch(&state.h_send, HttpRequest::MetricsGet).await
+}
+
+async fn handle_metrics_html() -> response::Response {
+    response::Response::builder()
+        .status(200)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(body::Body::from(include_str!("metrics.html")))
+        .expect("failed to encode response")
 }
 
 async fn handle_boot_get(

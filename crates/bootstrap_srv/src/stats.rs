@@ -341,6 +341,44 @@ impl MetricsCollector {
             resp["allTime"] = inner.all_time.to_json();
         }
 
+        // Raw history series (oldest to newest) so consumers can plot
+        // trends: per-minute snapshots, then hourly and daily averages.
+        let minutes: Vec<serde_json::Value> = inner
+            .minutes
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "spaces": s.total_spaces,
+                    "cells": s.total_cells,
+                    "uniqueAgents": s.unique_agents,
+                })
+            })
+            .collect();
+        let window_point = |w: &WindowAggregate| {
+            let avg = |m: &MinMaxSum| {
+                if w.sample_count > 0 {
+                    (m.sum as f64 / w.sample_count as f64 * 10.0).round()
+                        / 10.0
+                } else {
+                    0.0
+                }
+            };
+            serde_json::json!({
+                "spaces": avg(&w.total_spaces),
+                "cells": avg(&w.total_cells),
+                "uniqueAgents": avg(&w.unique_agents),
+            })
+        };
+        let hours: Vec<serde_json::Value> =
+            inner.hours.iter().map(window_point).collect();
+        let days: Vec<serde_json::Value> =
+            inner.days.iter().map(window_point).collect();
+        resp["series"] = serde_json::json!({
+            "minutes": minutes,
+            "hours": hours,
+            "days": days,
+        });
+
         resp
     }
 }
