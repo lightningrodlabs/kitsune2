@@ -7,6 +7,8 @@ mod iroh_relay_axum;
 
 const S1: &str = "2o79pTXHaK1FTPZeBiJo2lCgXW_P0ULjX_5Div_2qxU";
 const S2: &str = "7JY1S1rI_2E5Ag_xUbRO1h8g4jb7ZFO1W98cnNMxPgs";
+const S3: &str = "3o79pTXHaK1FTPZeBiJo2lCgXW_P0ULjX_5Div_2qxU";
+const S4: &str = "4o79pTXHaK1FTPZeBiJo2lCgXW_P0ULjX_5Div_2qxU";
 
 const K1: &str = "m-U7gdxW1A647O-4wkuCWOvtGGVfHEsxNScFKiL8-k8";
 const K2: &str = "v9I5GT3xVKPcaa4uyd2pcuJromf5zv1-OaahYOLBAWY";
@@ -345,6 +347,11 @@ fn metrics_current_values() {
     assert_eq!(metrics["current"]["minCellsPerSpace"], 1);
     assert_eq!(metrics["current"]["maxCellsPerSpace"], 2);
 
+    // No membership set repeats 3 times, so no group is detected and both
+    // spaces read as tool networks.
+    assert_eq!(metrics["current"]["groups"], 0);
+    assert_eq!(metrics["current"]["toolInstances"], 2);
+
     // uptimeSecs should be present.
     assert!(metrics["uptimeSecs"].is_number());
 
@@ -363,6 +370,56 @@ fn metrics_current_values() {
     );
     let body = res.into_body().read_to_string().unwrap();
     assert!(body.contains("/metrics-raw"));
+}
+
+#[test]
+fn metrics_group_estimation() {
+    let mut config = Config::testing();
+    config.metrics = true;
+    let s = BootstrapSrv::new(config).unwrap();
+
+    // Two agents registered in three spaces with identical membership —
+    // the signature of a Moss group (group/foyer/assets roles).
+    for space in [S1, S2, S3] {
+        for seed in [K1, K2] {
+            PutInfo {
+                addr: s.listen_addrs()[0],
+                space,
+                space_url: space,
+                agent_seed: seed,
+                ..Default::default()
+            }
+            .call()
+            .unwrap();
+        }
+    }
+
+    // One agent alone in a fourth space — a partially-adopted tool.
+    PutInfo {
+        addr: s.listen_addrs()[0],
+        space: S4,
+        space_url: S4,
+        ..Default::default()
+    }
+    .call()
+    .unwrap();
+
+    let addr = format!("http://{}/metrics-raw", s.listen_addrs()[0]);
+    let res = ureq::get(&addr)
+        .call()
+        .unwrap()
+        .into_body()
+        .read_to_string()
+        .unwrap();
+    let metrics: serde_json::Value = serde_json::from_str(&res).unwrap();
+
+    assert_eq!(metrics["current"]["totalSpaces"], 4);
+    assert_eq!(metrics["current"]["totalCells"], 7);
+    assert_eq!(metrics["current"]["uniqueAgents"], 2);
+    assert_eq!(metrics["current"]["groups"], 1);
+    assert_eq!(metrics["current"]["toolInstances"], 1);
+    assert_eq!(metrics["current"]["avgPeoplePerGroup"], 2.0);
+    assert_eq!(metrics["current"]["avgToolsPerGroup"], 1.0);
 }
 
 #[test]

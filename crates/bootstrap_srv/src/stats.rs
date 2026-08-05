@@ -68,6 +68,9 @@ struct Snapshot {
     unique_agents: u32,
     min_cells_per_space: u32,
     max_cells_per_space: u32,
+    groups: u32,
+    tool_instances: u32,
+    group_member_sum: u32,
 }
 
 /// Tracks min, max, and sum for computing aggregates.
@@ -118,6 +121,9 @@ struct WindowAggregate {
     unique_agents: MinMaxSum,
     min_cells_per_space: MinMaxSum,
     max_cells_per_space: MinMaxSum,
+    groups: MinMaxSum,
+    tool_instances: MinMaxSum,
+    group_member_sum: MinMaxSum,
 }
 
 impl WindowAggregate {
@@ -128,6 +134,9 @@ impl WindowAggregate {
         self.unique_agents.record(snap.unique_agents);
         self.min_cells_per_space.record(snap.min_cells_per_space);
         self.max_cells_per_space.record(snap.max_cells_per_space);
+        self.groups.record(snap.groups);
+        self.tool_instances.record(snap.tool_instances);
+        self.group_member_sum.record(snap.group_member_sum);
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -135,6 +144,17 @@ impl WindowAggregate {
         // total cells seen across samples over total unique agents seen.
         let avg_cells_per_agent = if self.unique_agents.sum > 0 {
             self.total_cells.sum as f64 / self.unique_agents.sum as f64
+        } else {
+            0.0
+        };
+        // Sample-weighted ratios over the window.
+        let avg_people_per_group = if self.groups.sum > 0 {
+            self.group_member_sum.sum as f64 / self.groups.sum as f64
+        } else {
+            0.0
+        };
+        let avg_tools_per_group = if self.groups.sum > 0 {
+            self.tool_instances.sum as f64 / self.groups.sum as f64
         } else {
             0.0
         };
@@ -146,6 +166,10 @@ impl WindowAggregate {
             "avgCellsPerAgent": avg_cells_per_agent,
             "minCellsPerSpace": self.min_cells_per_space.to_json(self.sample_count),
             "maxCellsPerSpace": self.max_cells_per_space.to_json(self.sample_count),
+            "groups": self.groups.to_json(self.sample_count),
+            "toolInstances": self.tool_instances.to_json(self.sample_count),
+            "avgPeoplePerGroup": avg_people_per_group,
+            "avgToolsPerGroup": avg_tools_per_group,
         })
     }
 }
@@ -195,6 +219,22 @@ fn aggregate_windows<'a>(
         out.max_cells_per_space.max =
             out.max_cells_per_space.max.max(w.max_cells_per_space.max);
         out.max_cells_per_space.sum += w.max_cells_per_space.sum;
+
+        out.groups.min = out.groups.min.min(w.groups.min);
+        out.groups.max = out.groups.max.max(w.groups.max);
+        out.groups.sum += w.groups.sum;
+
+        out.tool_instances.min =
+            out.tool_instances.min.min(w.tool_instances.min);
+        out.tool_instances.max =
+            out.tool_instances.max.max(w.tool_instances.max);
+        out.tool_instances.sum += w.tool_instances.sum;
+
+        out.group_member_sum.min =
+            out.group_member_sum.min.min(w.group_member_sum.min);
+        out.group_member_sum.max =
+            out.group_member_sum.max.max(w.group_member_sum.max);
+        out.group_member_sum.sum += w.group_member_sum.sum;
     }
     out
 }
@@ -251,6 +291,9 @@ impl MetricsCollector {
             unique_agents: stats.unique_agents as u32,
             min_cells_per_space: stats.min_cells_per_space as u32,
             max_cells_per_space: stats.max_cells_per_space as u32,
+            groups: stats.groups as u32,
+            tool_instances: stats.tool_instances as u32,
+            group_member_sum: stats.group_member_sum as u32,
         };
 
         let mut inner = self.0.lock().unwrap();
@@ -296,6 +339,16 @@ impl MetricsCollector {
         } else {
             0.0
         };
+        let avg_people_per_group = if current_stats.groups > 0 {
+            current_stats.group_member_sum as f64 / current_stats.groups as f64
+        } else {
+            0.0
+        };
+        let avg_tools_per_group = if current_stats.groups > 0 {
+            current_stats.tool_instances as f64 / current_stats.groups as f64
+        } else {
+            0.0
+        };
 
         let inner = self.0.lock().unwrap();
         let uptime_secs = inner.start_time.elapsed().as_secs();
@@ -311,6 +364,10 @@ impl MetricsCollector {
                 "avgCellsPerSpace": avg_cells_per_space,
                 "minCellsPerSpace": current_stats.min_cells_per_space,
                 "maxCellsPerSpace": current_stats.max_cells_per_space,
+                "groups": current_stats.groups,
+                "toolInstances": current_stats.tool_instances,
+                "avgPeoplePerGroup": avg_people_per_group,
+                "avgToolsPerGroup": avg_tools_per_group,
             },
         });
 
@@ -347,10 +404,21 @@ impl MetricsCollector {
             .minutes
             .iter()
             .map(|s| {
+                let r = |num: u32, den: u32| {
+                    if den > 0 {
+                        (num as f64 / den as f64 * 10.0).round() / 10.0
+                    } else {
+                        0.0
+                    }
+                };
                 serde_json::json!({
                     "spaces": s.total_spaces,
                     "cells": s.total_cells,
                     "uniqueAgents": s.unique_agents,
+                    "groups": s.groups,
+                    "tools": s.tool_instances,
+                    "peoplePerGroup": r(s.group_member_sum, s.groups),
+                    "toolsPerGroup": r(s.tool_instances, s.groups),
                 })
             })
             .collect();
@@ -363,10 +431,21 @@ impl MetricsCollector {
                     0.0
                 }
             };
+            let ratio = |num: &MinMaxSum, den: &MinMaxSum| {
+                if den.sum > 0 {
+                    (num.sum as f64 / den.sum as f64 * 10.0).round() / 10.0
+                } else {
+                    0.0
+                }
+            };
             serde_json::json!({
                 "spaces": avg(&w.total_spaces),
                 "cells": avg(&w.total_cells),
                 "uniqueAgents": avg(&w.unique_agents),
+                "groups": avg(&w.groups),
+                "tools": avg(&w.tool_instances),
+                "peoplePerGroup": ratio(&w.group_member_sum, &w.groups),
+                "toolsPerGroup": ratio(&w.tool_instances, &w.groups),
             })
         };
         let hours: Vec<serde_json::Value> =
@@ -439,6 +518,7 @@ mod tests {
             unique_agents,
             min_cells_per_space,
             max_cells_per_space,
+            ..Default::default()
         }
     }
 

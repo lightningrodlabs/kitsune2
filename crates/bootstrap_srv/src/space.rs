@@ -23,6 +23,21 @@ pub struct SpaceStats {
     pub min_cells_per_space: usize,
     /// Most cells registered in any single space.
     pub max_cells_per_space: usize,
+    /// Estimated group count.
+    ///
+    /// A Moss group installs one happ with three DNA roles
+    /// (group/foyer/assets), so every group appears here as three spaces
+    /// with identical membership. Spaces are clustered by exact membership
+    /// set and each cluster of `m` same-membership spaces counts
+    /// `floor(m / 3)` groups. Fully-adopted tools join their group's
+    /// cluster and can inflate this; partially-adopted tools form their
+    /// own clusters and do not.
+    pub groups: usize,
+    /// Estimated tool-instance count: `spaces - 3 * groups`.
+    pub tool_instances: usize,
+    /// Sum of member counts over estimated groups (weighted by groups per
+    /// cluster), for deriving average people per group.
+    pub group_member_sum: usize,
 }
 
 /// A map of spaces.
@@ -63,20 +78,39 @@ impl SpaceMap {
         let mut min_cells = usize::MAX;
         let mut max_cells = 0usize;
         let mut agents = std::collections::HashSet::new();
+        // Spaces clustered by exact membership set, for group estimation.
+        let mut clusters: std::collections::HashMap<Vec<[u8; 32]>, usize> =
+            std::collections::HashMap::new();
         for list in lists {
             let count = list.len();
             cells += count;
             min_cells = min_cells.min(count);
             max_cells = max_cells.max(count);
-            for entry in list {
-                if let Ok(parsed) = entry.parse() {
-                    agents.insert(parsed.agent.to_bytes());
-                }
+            let mut members: Vec<[u8; 32]> = list
+                .iter()
+                .filter_map(|entry| {
+                    entry.parse().ok().map(|p| p.agent.to_bytes())
+                })
+                .collect();
+            for m in members.iter() {
+                agents.insert(*m);
             }
+            members.sort_unstable();
+            members.dedup();
+            *clusters.entry(members).or_insert(0) += 1;
         }
         if spaces == 0 {
             min_cells = 0;
         }
+
+        let mut groups = 0usize;
+        let mut group_member_sum = 0usize;
+        for (members, multiplicity) in clusters {
+            let g = multiplicity / 3;
+            groups += g;
+            group_member_sum += g * members.len();
+        }
+        let tool_instances = spaces - 3 * groups;
 
         SpaceStats {
             spaces,
@@ -84,6 +118,9 @@ impl SpaceMap {
             unique_agents: agents.len(),
             min_cells_per_space: min_cells,
             max_cells_per_space: max_cells,
+            groups,
+            tool_instances,
+            group_member_sum,
         }
     }
 
