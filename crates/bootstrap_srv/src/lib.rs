@@ -204,6 +204,7 @@ use store::*;
 
 mod space;
 use space::*;
+pub use space::SpaceStats;
 
 mod http;
 use http::*;

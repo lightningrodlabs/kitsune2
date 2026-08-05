@@ -334,10 +334,14 @@ fn metrics_current_values() {
 
     // Verify current stats.
     assert_eq!(metrics["current"]["totalSpaces"], 2);
-    assert_eq!(metrics["current"]["totalAgents"], 3);
-    assert_eq!(metrics["current"]["avgAgentsPerSpace"], 1.5);
-    assert_eq!(metrics["current"]["minAgentsPerSpace"], 1);
-    assert_eq!(metrics["current"]["maxAgentsPerSpace"], 2);
+    assert_eq!(metrics["current"]["totalCells"], 3);
+    // The default-seed agent is in both spaces; K2 only in S1 — so the 3
+    // cells belong to 2 distinct agent keys.
+    assert_eq!(metrics["current"]["uniqueAgents"], 2);
+    assert_eq!(metrics["current"]["avgCellsPerAgent"], 1.5);
+    assert_eq!(metrics["current"]["avgCellsPerSpace"], 1.5);
+    assert_eq!(metrics["current"]["minCellsPerSpace"], 1);
+    assert_eq!(metrics["current"]["maxCellsPerSpace"], 2);
 
     // uptimeSecs should be present.
     assert!(metrics["uptimeSecs"].is_number());

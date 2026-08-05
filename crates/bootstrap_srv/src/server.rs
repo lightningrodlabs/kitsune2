@@ -241,8 +241,7 @@ fn prune_worker(
 
             // Record a metrics snapshot if enabled.
             if let Some(mc) = &metrics {
-                let (spaces, agents, min, max) = space_map.stats();
-                mc.record_snapshot(spaces, agents, min, max);
+                mc.record_snapshot(space_map.stats());
             }
         }
     }

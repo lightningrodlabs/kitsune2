@@ -1,6 +1,6 @@
 //! Lightweight historical metrics collection using multi-resolution ring buffers.
 //!
-//! Memory footprint: ~2.8 KB total across all resolution levels.
+//! Memory footprint: ~6 KB total across all resolution levels.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -64,9 +64,10 @@ impl<T: Copy + Default> RingBuffer<T> {
 #[derive(Clone, Copy, Default)]
 struct Snapshot {
     total_spaces: u32,
-    total_agents: u32,
-    min_agents_per_space: u32,
-    max_agents_per_space: u32,
+    total_cells: u32,
+    unique_agents: u32,
+    min_cells_per_space: u32,
+    max_cells_per_space: u32,
 }
 
 /// Tracks min, max, and sum for computing aggregates.
@@ -113,27 +114,38 @@ impl MinMaxSum {
 struct WindowAggregate {
     sample_count: u32,
     total_spaces: MinMaxSum,
-    total_agents: MinMaxSum,
-    min_agents_per_space: MinMaxSum,
-    max_agents_per_space: MinMaxSum,
+    total_cells: MinMaxSum,
+    unique_agents: MinMaxSum,
+    min_cells_per_space: MinMaxSum,
+    max_cells_per_space: MinMaxSum,
 }
 
 impl WindowAggregate {
     fn record(&mut self, snap: &Snapshot) {
         self.sample_count += 1;
         self.total_spaces.record(snap.total_spaces);
-        self.total_agents.record(snap.total_agents);
-        self.min_agents_per_space.record(snap.min_agents_per_space);
-        self.max_agents_per_space.record(snap.max_agents_per_space);
+        self.total_cells.record(snap.total_cells);
+        self.unique_agents.record(snap.unique_agents);
+        self.min_cells_per_space.record(snap.min_cells_per_space);
+        self.max_cells_per_space.record(snap.max_cells_per_space);
     }
 
     fn to_json(&self) -> serde_json::Value {
+        // Sample-weighted average of cells-per-agent over the window:
+        // total cells seen across samples over total unique agents seen.
+        let avg_cells_per_agent = if self.unique_agents.sum > 0 {
+            self.total_cells.sum as f64 / self.unique_agents.sum as f64
+        } else {
+            0.0
+        };
         serde_json::json!({
             "samples": self.sample_count,
             "totalSpaces": self.total_spaces.to_json(self.sample_count),
-            "totalAgents": self.total_agents.to_json(self.sample_count),
-            "minAgentsPerSpace": self.min_agents_per_space.to_json(self.sample_count),
-            "maxAgentsPerSpace": self.max_agents_per_space.to_json(self.sample_count),
+            "totalCells": self.total_cells.to_json(self.sample_count),
+            "uniqueAgents": self.unique_agents.to_json(self.sample_count),
+            "avgCellsPerAgent": avg_cells_per_agent,
+            "minCellsPerSpace": self.min_cells_per_space.to_json(self.sample_count),
+            "maxCellsPerSpace": self.max_cells_per_space.to_json(self.sample_count),
         })
     }
 }
@@ -164,21 +176,25 @@ fn aggregate_windows<'a>(
         out.total_spaces.max = out.total_spaces.max.max(w.total_spaces.max);
         out.total_spaces.sum += w.total_spaces.sum;
 
-        out.total_agents.min = out.total_agents.min.min(w.total_agents.min);
-        out.total_agents.max = out.total_agents.max.max(w.total_agents.max);
-        out.total_agents.sum += w.total_agents.sum;
+        out.total_cells.min = out.total_cells.min.min(w.total_cells.min);
+        out.total_cells.max = out.total_cells.max.max(w.total_cells.max);
+        out.total_cells.sum += w.total_cells.sum;
 
-        out.min_agents_per_space.min =
-            out.min_agents_per_space.min.min(w.min_agents_per_space.min);
-        out.min_agents_per_space.max =
-            out.min_agents_per_space.max.max(w.min_agents_per_space.max);
-        out.min_agents_per_space.sum += w.min_agents_per_space.sum;
+        out.unique_agents.min = out.unique_agents.min.min(w.unique_agents.min);
+        out.unique_agents.max = out.unique_agents.max.max(w.unique_agents.max);
+        out.unique_agents.sum += w.unique_agents.sum;
 
-        out.max_agents_per_space.min =
-            out.max_agents_per_space.min.min(w.max_agents_per_space.min);
-        out.max_agents_per_space.max =
-            out.max_agents_per_space.max.max(w.max_agents_per_space.max);
-        out.max_agents_per_space.sum += w.max_agents_per_space.sum;
+        out.min_cells_per_space.min =
+            out.min_cells_per_space.min.min(w.min_cells_per_space.min);
+        out.min_cells_per_space.max =
+            out.min_cells_per_space.max.max(w.min_cells_per_space.max);
+        out.min_cells_per_space.sum += w.min_cells_per_space.sum;
+
+        out.max_cells_per_space.min =
+            out.max_cells_per_space.min.min(w.max_cells_per_space.min);
+        out.max_cells_per_space.max =
+            out.max_cells_per_space.max.max(w.max_cells_per_space.max);
+        out.max_cells_per_space.sum += w.max_cells_per_space.sum;
     }
     out
 }
@@ -202,7 +218,7 @@ struct MetricsInner {
 /// Thread-safe metrics collector for historical server stats.
 ///
 /// Cheaply cloneable (inner state is behind `Arc<Mutex>`).
-/// Memory footprint: ~2.8 KB across all resolution levels.
+/// Memory footprint: ~6 KB across all resolution levels.
 #[derive(Clone)]
 pub struct MetricsCollector(Arc<Mutex<MetricsInner>>);
 
@@ -228,18 +244,13 @@ impl MetricsCollector {
     /// Record a new snapshot from the current space map stats.
     ///
     /// Call this once per prune interval (~60s in production).
-    pub fn record_snapshot(
-        &self,
-        total_spaces: usize,
-        total_agents: usize,
-        min_agents: usize,
-        max_agents: usize,
-    ) {
+    pub fn record_snapshot(&self, stats: crate::SpaceStats) {
         let snap = Snapshot {
-            total_spaces: total_spaces as u32,
-            total_agents: total_agents as u32,
-            min_agents_per_space: min_agents as u32,
-            max_agents_per_space: max_agents as u32,
+            total_spaces: stats.spaces as u32,
+            total_cells: stats.cells as u32,
+            unique_agents: stats.unique_agents as u32,
+            min_cells_per_space: stats.min_cells_per_space as u32,
+            max_cells_per_space: stats.max_cells_per_space as u32,
         };
 
         let mut inner = self.0.lock().unwrap();
@@ -269,15 +280,19 @@ impl MetricsCollector {
 
     /// Build the full JSON response for the `/metrics` endpoint.
     ///
-    /// `current_stats` is `(num_spaces, total_agents, min_agents, max_agents)`
-    /// from `SpaceMap::stats()`, computed on-demand at request time.
+    /// `current_stats` is a [`crate::SpaceStats`] from `SpaceMap::stats()`,
+    /// computed on-demand at request time.
     pub fn to_json(
         &self,
-        current_stats: (usize, usize, usize, usize),
+        current_stats: crate::SpaceStats,
     ) -> serde_json::Value {
-        let (num_spaces, total_agents, min_agents, max_agents) = current_stats;
-        let avg_agents = if num_spaces > 0 {
-            total_agents as f64 / num_spaces as f64
+        let avg_cells_per_space = if current_stats.spaces > 0 {
+            current_stats.cells as f64 / current_stats.spaces as f64
+        } else {
+            0.0
+        };
+        let avg_cells_per_agent = if current_stats.unique_agents > 0 {
+            current_stats.cells as f64 / current_stats.unique_agents as f64
         } else {
             0.0
         };
@@ -289,11 +304,13 @@ impl MetricsCollector {
             "uptimeSecs": uptime_secs,
             "snapshotIntervalSecs": Self::SNAPSHOTS_PER_HOUR,
             "current": {
-                "totalSpaces": num_spaces,
-                "totalAgents": total_agents,
-                "avgAgentsPerSpace": avg_agents,
-                "minAgentsPerSpace": min_agents,
-                "maxAgentsPerSpace": max_agents,
+                "totalSpaces": current_stats.spaces,
+                "totalCells": current_stats.cells,
+                "uniqueAgents": current_stats.unique_agents,
+                "avgCellsPerAgent": avg_cells_per_agent,
+                "avgCellsPerSpace": avg_cells_per_space,
+                "minCellsPerSpace": current_stats.min_cells_per_space,
+                "maxCellsPerSpace": current_stats.max_cells_per_space,
             },
         });
 
@@ -371,16 +388,32 @@ mod tests {
         );
     }
 
+    fn stats(
+        spaces: usize,
+        cells: usize,
+        unique_agents: usize,
+        min_cells_per_space: usize,
+        max_cells_per_space: usize,
+    ) -> crate::SpaceStats {
+        crate::SpaceStats {
+            spaces,
+            cells,
+            unique_agents,
+            min_cells_per_space,
+            max_cells_per_space,
+        }
+    }
+
     #[test]
     fn metrics_collector_snapshot_and_json() {
         let mc = MetricsCollector::new();
 
         // Record a few snapshots.
-        mc.record_snapshot(2, 10, 3, 7);
-        mc.record_snapshot(3, 15, 2, 8);
-        mc.record_snapshot(2, 12, 4, 6);
+        mc.record_snapshot(stats(2, 10, 5, 3, 7));
+        mc.record_snapshot(stats(3, 15, 6, 2, 8));
+        mc.record_snapshot(stats(2, 12, 4, 4, 6));
 
-        let json = mc.to_json((2, 12, 4, 6));
+        let json = mc.to_json(stats(2, 12, 4, 4, 6));
         let obj = json.as_object().unwrap();
 
         // Should have current and lastHour, allTime.
@@ -395,19 +428,28 @@ mod tests {
 
         // Verify current values.
         assert_eq!(json["current"]["totalSpaces"], 2);
-        assert_eq!(json["current"]["totalAgents"], 12);
+        assert_eq!(json["current"]["totalCells"], 12);
+        assert_eq!(json["current"]["uniqueAgents"], 4);
+        assert_eq!(json["current"]["avgCellsPerAgent"], 3.0);
 
         // Verify lastHour aggregates.
         assert_eq!(json["lastHour"]["samples"], 3);
         assert_eq!(json["lastHour"]["totalSpaces"]["min"], 2);
         assert_eq!(json["lastHour"]["totalSpaces"]["max"], 3);
-        assert_eq!(json["lastHour"]["totalAgents"]["min"], 10);
-        assert_eq!(json["lastHour"]["totalAgents"]["max"], 15);
+        assert_eq!(json["lastHour"]["totalCells"]["min"], 10);
+        assert_eq!(json["lastHour"]["totalCells"]["max"], 15);
+        assert_eq!(json["lastHour"]["uniqueAgents"]["min"], 4);
+        assert_eq!(json["lastHour"]["uniqueAgents"]["max"], 6);
+        // (10 + 15 + 12) / (5 + 6 + 4)
+        assert_eq!(
+            json["lastHour"]["avgCellsPerAgent"],
+            37.0 / 15.0,
+        );
 
         // Verify allTime matches lastHour (same data so far).
         assert_eq!(json["allTime"]["samples"], 3);
-        assert_eq!(json["allTime"]["totalAgents"]["min"], 10);
-        assert_eq!(json["allTime"]["totalAgents"]["max"], 15);
+        assert_eq!(json["allTime"]["totalCells"]["min"], 10);
+        assert_eq!(json["allTime"]["totalCells"]["max"], 15);
     }
 
     #[test]
@@ -416,17 +458,17 @@ mod tests {
 
         // Record 60 snapshots to trigger an hourly cascade.
         for i in 0..60 {
-            mc.record_snapshot(1, i + 1, 1, i + 1);
+            mc.record_snapshot(stats(1, i + 1, i + 1, 1, i + 1));
         }
 
-        let json = mc.to_json((1, 60, 1, 60));
+        let json = mc.to_json(stats(1, 60, 60, 1, 60));
         let obj = json.as_object().unwrap();
 
         // Should now have lastDay (hourly cascade happened).
         assert!(obj.contains_key("lastDay"));
         assert_eq!(json["lastDay"]["samples"], 60);
-        assert_eq!(json["lastDay"]["totalAgents"]["min"], 1);
-        assert_eq!(json["lastDay"]["totalAgents"]["max"], 60);
+        assert_eq!(json["lastDay"]["totalCells"]["min"], 1);
+        assert_eq!(json["lastDay"]["totalCells"]["max"], 60);
     }
 
     #[test]
@@ -435,10 +477,10 @@ mod tests {
 
         // 60 snapshots * 24 hours = 1440 snapshots to trigger a daily cascade.
         for i in 0..1440 {
-            mc.record_snapshot(1, i + 1, 1, i + 1);
+            mc.record_snapshot(stats(1, i + 1, i + 1, 1, i + 1));
         }
 
-        let json = mc.to_json((1, 1440, 1, 1440));
+        let json = mc.to_json(stats(1, 1440, 1440, 1, 1440));
         let obj = json.as_object().unwrap();
 
         assert!(obj.contains_key("lastWeek"));

@@ -6,6 +6,25 @@ use crate::store::*;
 /// The space identifier.
 pub type SpaceId = bytes::Bytes;
 
+/// Point-in-time stats over all spaces.
+///
+/// Each stored entry is one agent info in one space — i.e. one cell.
+/// A conductor participating in N spaces contributes N cells but only
+/// one unique agent (assuming it uses the same key in every space).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpaceStats {
+    /// Number of spaces with registered infos.
+    pub spaces: usize,
+    /// Total agent-info entries across all spaces (one per agent per space).
+    pub cells: usize,
+    /// Distinct agent keys across all spaces.
+    pub unique_agents: usize,
+    /// Fewest cells registered in any single space.
+    pub min_cells_per_space: usize,
+    /// Most cells registered in any single space.
+    pub max_cells_per_space: usize,
+}
+
 /// A map of spaces.
 #[derive(Clone)]
 pub struct SpaceMap(Arc<Mutex<HashMap<SpaceId, Space>>>);
@@ -28,23 +47,44 @@ impl SpaceMap {
         }
     }
 
-    /// Return stats about all spaces: (num_spaces, total_agents, min_agents, max_agents).
-    pub fn stats(&self) -> (usize, usize, usize, usize) {
-        let map = self.0.lock().unwrap();
-        let num_spaces = map.len();
-        let mut total_agents = 0usize;
-        let mut min_agents = usize::MAX;
-        let mut max_agents = 0usize;
-        for space in map.values() {
-            let count = space.readable.lock().unwrap().len();
-            total_agents += count;
-            min_agents = min_agents.min(count);
-            max_agents = max_agents.max(count);
+    /// Return point-in-time stats over all spaces.
+    pub fn stats(&self) -> SpaceStats {
+        // Clone the entry ref lists so no space lock is held while
+        // parsing entries below.
+        let lists: Vec<Vec<crate::StoreEntryRef>> = {
+            let map = self.0.lock().unwrap();
+            map.values()
+                .map(|space| space.readable.lock().unwrap().clone())
+                .collect()
+        };
+
+        let spaces = lists.len();
+        let mut cells = 0usize;
+        let mut min_cells = usize::MAX;
+        let mut max_cells = 0usize;
+        let mut agents = std::collections::HashSet::new();
+        for list in lists {
+            let count = list.len();
+            cells += count;
+            min_cells = min_cells.min(count);
+            max_cells = max_cells.max(count);
+            for entry in list {
+                if let Ok(parsed) = entry.parse() {
+                    agents.insert(parsed.agent.to_bytes());
+                }
+            }
         }
-        if num_spaces == 0 {
-            min_agents = 0;
+        if spaces == 0 {
+            min_cells = 0;
         }
-        (num_spaces, total_agents, min_agents, max_agents)
+
+        SpaceStats {
+            spaces,
+            cells,
+            unique_agents: agents.len(),
+            min_cells_per_space: min_cells,
+            max_cells_per_space: max_cells,
+        }
     }
 
     /// Update all the spaces stored in this map.
