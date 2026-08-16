@@ -3,20 +3,6 @@
 //! A [`SpaceSecret`] hands kitsune2 purpose-scoped key material derived from a
 //! host-held space secret. The access module proves knowledge of that material
 //! to gain access to a space.
-//!
-//! # Status
-//!
-//! This module currently only provides [`NoopSpaceSecret`], a placeholder that
-//! returns a fixed key for every space and purpose. It exists so that the
-//! [`Builder::space_secret`] slot can be populated while the real
-//! implementation is being built. It is **not** a meaningful access control
-//! mechanism: every space derives the same key, so any two nodes running it
-//! will always be able to prove knowledge to each other.
-//!
-//! `CoreSpaceSecret`, which derives keys with `HKDF-SHA256` from a
-//! configured per-space secret (defaulting to the space id, i.e. today's
-//! "open to anyone who knows the space id" semantics), replaces this as the
-//! registered default in both the test and production builders.
 
 use bytes::Bytes;
 use kitsune2_api::*;
@@ -24,8 +10,8 @@ use std::sync::Arc;
 
 /// A placeholder [`SpaceSecretFactory`] that produces [`NoopSpaceSecret`].
 ///
-/// See the [module docs](self) for why this exists and why it is not an
-/// access control mechanism.
+/// See [`NoopSpaceSecret`] for why this exists and why it is not an access
+/// control mechanism.
 #[derive(Debug)]
 pub struct NoopSpaceSecretFactory {}
 
@@ -58,10 +44,18 @@ impl SpaceSecretFactory for NoopSpaceSecretFactory {
     }
 }
 
-/// A placeholder [`SpaceSecret`] that returns a fixed key.
+/// A placeholder [`SpaceSecret`] that returns a fixed key for every space and
+/// every purpose.
 ///
-/// See the [module docs](self) for why this exists and why it is not an
-/// access control mechanism.
+/// It exists so that the [`Builder::space_secret`] slot can be populated while
+/// the real implementation is being built. It is **not** a meaningful access
+/// control mechanism: every space derives the same key, so any two nodes
+/// running it will always be able to prove knowledge to each other.
+///
+/// It will be replaced as the registered default in both the test and
+/// production builders by an implementation that derives keys with
+/// `HKDF-SHA256` from a configured per-space secret, defaulting to the space
+/// id (today's "open to anyone who knows the space id" semantics).
 #[derive(Debug)]
 pub struct NoopSpaceSecret;
 
