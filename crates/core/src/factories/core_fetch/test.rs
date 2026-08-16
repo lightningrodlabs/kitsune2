@@ -139,6 +139,10 @@ mod tests {
             ) -> K2Result<bool> {
                 Ok(false)
             }
+
+            fn is_access_granted(&self, _peer_url: &Url) -> K2Result<bool> {
+                Ok(true)
+            }
         }
 
         let builder = Arc::new(crate::default_test_builder());

@@ -43,6 +43,11 @@ mod config {
     #[serde(rename_all = "camelCase")]
     pub struct CoreSpaceSecretModConfig {
         /// CoreSpaceSecret configuration.
+        ///
+        /// Defaulted, so that a config which has never had defaults applied
+        /// to it still validates as "no secret configured".
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
         pub core_space_secret: CoreSpaceSecretConfig,
     }
 }
