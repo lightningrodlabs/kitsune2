@@ -127,11 +127,38 @@ impl Node {
 }
 
 /// Hand one space the other's agent info, which is what bootstrap would
-/// otherwise do. This is only ever used to set up a space that is not the
-/// space under test.
+/// otherwise do.
+///
+/// That tells a node where a peer is and nothing about whether it is allowed
+/// in — an agent info is self-issued — so the peer is still unknown
+/// afterwards. It does give the access module a URL to challenge, which is
+/// how the two sides come to grant each other.
 async fn introduce(from: &DynSpace, agent: &AgentId, to: &DynSpace) {
     let info = from.peer_store().get(agent.clone()).await.unwrap().unwrap();
     to.peer_store().insert(vec![info]).await.unwrap();
+}
+
+/// Introduce two spaces to each other and wait until each has granted the
+/// other, which the hello exchange the introduction triggers is what does.
+///
+/// This is how the tests set up a space that is not the space under test.
+async fn introduce_and_await_grants(
+    s1: &DynSpace,
+    agent_1: &AgentId,
+    s2: &DynSpace,
+    agent_2: &AgentId,
+) {
+    let url1 = url_of(s1).await;
+    let url2 = url_of(s2).await;
+
+    introduce(s2, agent_2, s1).await;
+    introduce(s1, agent_1, s2).await;
+
+    iter_check!(15_000, 10, {
+        if is_granted(s1, &url2) && is_granted(s2, &url1) {
+            break;
+        }
+    });
 }
 
 /// A per-space config override that gives the space a secret of its own.
@@ -210,8 +237,7 @@ async fn a_peer_joining_a_second_space_is_introduced_over_the_existing_connectio
     let (a2, agent_a2) = n2.join(SPACE_A, None).await;
     let url1 = url_of(&a1).await;
     let url2 = url_of(&a2).await;
-    introduce(&a2, &agent_a2, &a1).await;
-    introduce(&a1, &agent_a1, &a2).await;
+    introduce_and_await_grants(&a1, &agent_a1, &a2, &agent_a2).await;
 
     // And they are connected, which is what makes this the multi-cell case:
     // the connection outlives any single space's membership.
@@ -273,8 +299,7 @@ async fn a_peer_with_the_wrong_secret_is_never_granted_and_learns_nothing() {
     let (a3, agent_a3) = n3.join(SPACE_A, None).await;
     let url1 = url_of(&a1).await;
     let url3 = url_of(&a3).await;
-    introduce(&a3, &agent_a3, &a1).await;
-    introduce(&a1, &agent_a1, &a3).await;
+    introduce_and_await_grants(&a1, &agent_a1, &a3, &agent_a3).await;
     assert!(notify_arrives(&a1, &url3, &n3, &SPACE_A, b"space-a").await);
 
     // Space B has a secret, and node 3 does not have it.
@@ -332,8 +357,7 @@ async fn blocking_a_granted_peer_stops_its_traffic() {
     let (a2, agent_a2) = n2.join(SPACE_A, None).await;
     let url1 = url_of(&a1).await;
     let url2 = url_of(&a2).await;
-    introduce(&a2, &agent_a2, &a1).await;
-    introduce(&a1, &agent_a1, &a2).await;
+    introduce_and_await_grants(&a1, &agent_a1, &a2, &agent_a2).await;
     assert!(notify_arrives(&a1, &url2, &n2, &SPACE_A, b"space-a").await);
 
     // Both join a second space and grant each other through a hello exchange.
@@ -391,29 +415,21 @@ async fn a_default_secret_space_grants_an_unknown_peer_in_one_exchange() {
     let n1 = Node::new().await;
     let n2 = Node::new().await;
 
-    let (a1, _agent_a1) = n1.join(SPACE_A, None).await;
+    let (a1, agent_a1) = n1.join(SPACE_A, None).await;
     let (a2, agent_a2) = n2.join(SPACE_A, None).await;
     let url1 = url_of(&a1).await;
     let url2 = url_of(&a2).await;
 
-    // Node 1 learns of node 2's url the way bootstrap would tell it.
-    introduce(&a2, &agent_a2, &a1).await;
-    // Storing an agent info also records an access decision of its own
-    // today, through the access state's peer store listener. Clear it, so
-    // that node 2 is in the unknown state the hello module is there to
-    // resolve, rather than one the peer store handed us.
-    a1.peer_access_state()
-        .remove_access_decision(url2.clone())
-        .unwrap();
+    // Node 1 has heard of nobody, so node 2 is unknown, and an unknown peer's
+    // non-hello traffic is dropped even in a space with no secret at all.
     assert!(!is_granted(&a1, &url2));
-
-    // An unknown peer's traffic is dropped, in both directions.
     assert!(!notify_arrives(&a1, &url2, &n2, &SPACE_A, b"unknown").await);
 
-    // A local agent joining challenges every peer we know of, and with the
-    // default secret both sides can prove knowledge immediately.
-    let joined: DynLocalAgent = Arc::new(Ed25519LocalAgent::default());
-    a1.local_agent_join(joined).await.unwrap();
+    // Node 1 now learns of node 2's url the way bootstrap would tell it.
+    // A url with no decision about it is challenged, and with the default
+    // secret — the space id — both sides can prove knowledge immediately.
+    introduce(&a2, &agent_a2, &a1).await;
+    introduce(&a1, &agent_a1, &a2).await;
 
     iter_check!(15_000, 10, {
         if is_granted(&a1, &url2) && is_granted(&a2, &url1) {
@@ -439,8 +455,7 @@ async fn a_dropped_message_from_a_forgotten_peer_heals_the_pair() {
     let (a2, agent_a2) = n2.join(SPACE_A, None).await;
     let url1 = url_of(&a1).await;
     let url2 = url_of(&a2).await;
-    introduce(&a2, &agent_a2, &a1).await;
-    introduce(&a1, &agent_a1, &a2).await;
+    introduce_and_await_grants(&a1, &agent_a1, &a2, &agent_a2).await;
     assert!(notify_arrives(&a1, &url2, &n2, &SPACE_A, b"space-a").await);
 
     let (b1, _agent_b1) = n1.join(SPACE_B, None).await;

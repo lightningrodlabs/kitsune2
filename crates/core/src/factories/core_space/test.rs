@@ -191,19 +191,48 @@ async fn space_notify_send_recv() {
     s1.local_agent_join(ned.clone()).await.unwrap();
     s2.local_agent_join(bob.clone()).await.unwrap();
 
+    // Knowing where a peer is does not admit it. Each side challenges the
+    // other's url, and only once both have proven knowledge of the space
+    // secret does anything but the access module's own traffic flow.
+    let granted = |space: &DynSpace, url: &Url| {
+        matches!(
+            space
+                .peer_access_state()
+                .get_access_decision(url.clone())
+                .unwrap()
+                .map(|a| a.decision),
+            Some(AccessDecision::Granted)
+        )
+    };
+    iter_check!(15_000, 10, {
+        if granted(&s1, &u2) && granted(&s2, &u1) {
+            break;
+        }
+    });
+
     s1.send_notify(u2.clone(), bytes::Bytes::from_static(b"hello"))
         .await
         .unwrap();
 
+    iter_check!(5000, 10, {
+        if !recv.lock().unwrap().is_empty() {
+            break;
+        }
+    });
     let (f, s, d) = recv.lock().unwrap().remove(0);
     assert_eq!(u1.clone(), f);
     assert_eq!(TEST_SPACE_ID, s);
     assert_eq!("hello", String::from_utf8_lossy(&d));
 
-    s2.send_notify(u1, bytes::Bytes::from_static(b"world"))
+    s2.send_notify(u1.clone(), bytes::Bytes::from_static(b"world"))
         .await
         .unwrap();
 
+    iter_check!(5000, 10, {
+        if !recv.lock().unwrap().is_empty() {
+            break;
+        }
+    });
     let (f, s, d) = recv.lock().unwrap().remove(0);
     assert_eq!(u2, f);
     assert_eq!(TEST_SPACE_ID, s);

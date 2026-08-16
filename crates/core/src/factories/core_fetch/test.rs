@@ -158,11 +158,10 @@ mod tests {
         )
         .unwrap();
 
-        // We need to add an agent info of the sending peer to the receiving
-        // peer's peer store so that it won't consider the peer blocked and
-        // drop the message.
-        // TODO: Change kitsune to be able to deal with that case without
-        // requiring manual insert, then remove it.
+        // The sending peer here is a bare transport with no access module of
+        // its own, so it can never complete a hello exchange with the space.
+        // Grant it directly instead, which is what a completed exchange would
+        // have recorded, otherwise the space drops its messages as ungranted.
         let url_sender = iter_check!(200, {
             let stats = tx.dump_network_stats().await.unwrap();
             let peer_url = stats.transport_stats.peer_urls.first();
@@ -179,6 +178,16 @@ mod tests {
             .build(local_agent_2);
 
         space.peer_store().insert(vec![agent_sender]).await.unwrap();
+        space
+            .peer_access_state()
+            .set_access_decision(
+                url_sender.clone(),
+                PeerAccess {
+                    decision: AccessDecision::Granted,
+                    decided_at: Timestamp::now(),
+                },
+            )
+            .unwrap();
 
         tx.send_module(
             url,
