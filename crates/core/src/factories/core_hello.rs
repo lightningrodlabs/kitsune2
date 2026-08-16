@@ -259,8 +259,8 @@ impl PeerExchange {
 
 /// The hello module: the access module for a space.
 ///
-/// See the [module docs](self) for the wire protocol, the state machine and
-/// the triggers.
+/// See the `core_hello` module documentation for the wire protocol, the state
+/// machine and the triggers.
 #[derive(Debug)]
 pub struct CoreHello {
     inner: Arc<HelloInner>,
