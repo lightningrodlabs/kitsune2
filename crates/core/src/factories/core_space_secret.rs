@@ -171,65 +171,6 @@ pub fn encode_space_secret(secret: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(secret)
 }
 
-/// A placeholder [`SpaceSecretFactory`] that produces [`NoopSpaceSecret`].
-///
-/// See [`NoopSpaceSecret`] for why this exists and why it is not an access
-/// control mechanism.
-#[derive(Debug)]
-pub struct NoopSpaceSecretFactory {}
-
-impl NoopSpaceSecretFactory {
-    /// Construct a new `NoopSpaceSecretFactory`.
-    pub fn create() -> DynSpaceSecretFactory {
-        let out: DynSpaceSecretFactory = Arc::new(Self {});
-        out
-    }
-}
-
-impl SpaceSecretFactory for NoopSpaceSecretFactory {
-    fn default_config(&self, _config: &mut Config) -> K2Result<()> {
-        Ok(())
-    }
-
-    fn validate_config(&self, _config: &Config) -> K2Result<()> {
-        Ok(())
-    }
-
-    fn create(
-        &self,
-        _builder: Arc<Builder>,
-        _space_id: SpaceId,
-    ) -> BoxFut<'static, K2Result<DynSpaceSecret>> {
-        Box::pin(async move {
-            let out: DynSpaceSecret = Arc::new(NoopSpaceSecret);
-            Ok(out)
-        })
-    }
-}
-
-/// A placeholder [`SpaceSecret`] that returns a fixed key for every space and
-/// every purpose.
-///
-/// It is **not** a meaningful access control mechanism: every space derives the
-/// same key, so any two nodes running it will always be able to prove knowledge
-/// to each other. Prefer [`CoreSpaceSecret`], which is the registered default
-/// in the test builder and is what production builders should use.
-#[derive(Debug)]
-pub struct NoopSpaceSecret;
-
-/// The fixed key returned by [`NoopSpaceSecret::derive_key`].
-const NOOP_KEY: &[u8] = b"kitsune2-noop-space-secret-key--";
-
-impl SpaceSecret for NoopSpaceSecret {
-    fn derive_key(
-        &self,
-        _space_id: SpaceId,
-        _purpose: &str,
-    ) -> BoxFut<'static, K2Result<Bytes>> {
-        Box::pin(async move { Ok(Bytes::from_static(NOOP_KEY)) })
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -344,20 +285,5 @@ mod test {
             )
             .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn noop_secret_returns_fixed_key() {
-        let secret = NoopSpaceSecret;
-        let a = secret
-            .derive_key(SpaceId::from(Bytes::from_static(b"a")), "purpose-a")
-            .await
-            .unwrap();
-        let b = secret
-            .derive_key(SpaceId::from(Bytes::from_static(b"b")), "purpose-b")
-            .await
-            .unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a, Bytes::from_static(NOOP_KEY));
     }
 }
