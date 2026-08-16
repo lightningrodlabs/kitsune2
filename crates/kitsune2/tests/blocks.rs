@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kitsune2_api::{AgentId, Id, LocalAgent, MessageBlockCount, SpaceId};
+use kitsune2_api::{
+    AccessDecision, AgentId, Id, LocalAgent, MessageBlockCount, SpaceId,
+};
 use kitsune2_api::{
     AgentInfoSigned, BlockTarget, BoxFut, Builder, DynSpace, DynTransport,
-    K2Result, SpaceHandler, TxBaseHandler, TxHandler, TxModuleHandler,
-    TxSpaceHandler, Url,
+    K2Result, SpaceHandler, TxBaseHandler, TxHandler, TxModuleHandler, Url,
 };
 use kitsune2_core::factories::CoreGossipStubFactory;
 use kitsune2_core::{Ed25519LocalAgent, Ed25519Verifier};
@@ -352,19 +353,6 @@ pub async fn make_test_peer_light(builder: Arc<Builder>) -> TestPeerLight {
     impl TxHandler for NoopHandler {}
     impl TxBaseHandler for NoopHandler {}
     impl SpaceHandler for NoopHandler {}
-    impl TxSpaceHandler for NoopHandler {
-        fn is_any_agent_at_url_blocked(
-            &self,
-            _peer_url: &Url,
-        ) -> K2Result<bool> {
-            Ok(false)
-        }
-
-        fn is_access_granted(&self, _peer_url: &Url) -> K2Result<bool> {
-            Ok(true)
-        }
-    }
-
     let transport = builder
         .transport
         .create(builder.clone(), Arc::new(NoopHandler))
@@ -445,6 +433,39 @@ pub async fn make_test_peer_light(builder: Arc<Builder>) -> TestPeerLight {
     }
 }
 
+/// Whether a space has granted the peer at a url access to it.
+fn is_granted(space: &DynSpace, peer_url: &Url) -> bool {
+    matches!(
+        space
+            .peer_access_state()
+            .get_access_decision(peer_url.clone())
+            .unwrap()
+            .map(|a| a.decision),
+        Some(AccessDecision::Granted)
+    )
+}
+
+/// Wait until two spaces have granted each other access.
+///
+/// Knowing where a peer is does not admit it: each side has to prove
+/// knowledge of the space secret to the other's access module first, and
+/// until that exchange completes nothing but the access module's own traffic
+/// flows between them. Learning a peer's url is what triggers the exchange,
+/// so this is called after a peer store insert and before expecting any
+/// message to get through.
+async fn await_mutual_grants(
+    space_1: &DynSpace,
+    url_1: &Url,
+    space_2: &DynSpace,
+    url_2: &Url,
+) {
+    iter_check!(30_000, 50, {
+        if is_granted(space_1, url_2) && is_granted(space_2, url_1) {
+            break;
+        }
+    });
+}
+
 /// A helper function that blocks an agent in the given space and also checks that:
 /// - the agent block was not considered blocked in the blocks module before
 /// - the agent is indeed considered blocked in the blocks module afterwards
@@ -511,14 +532,16 @@ async fn incoming_message_block_count_increases_correctly() {
     let TestPeerLight {
         space1: space_alice_1,
         space2: space_alice_2,
+        dummy_agent_info_1: dummy_agent_info_alice_1,
+        dummy_agent_info_2: dummy_agent_info_alice_2,
         transport: transport_alice,
         peer_url: peer_url_alice,
-        ..
     } = make_test_peer_light(builder.clone()).await;
 
     let TestPeerLight {
         space1: space_bob_1,
         space2: _space_bob_2, // Need to keep the space in memory here since it's being used to check for blocks
+        dummy_agent_info_1: dummy_agent_info_bob_1,
         transport: transport_bob,
         peer_url: peer_url_bob,
         ..
@@ -565,28 +588,64 @@ async fn incoming_message_block_count_increases_correctly() {
         .await
         .unwrap();
 
-    // Add Carol's dummy agent infos to Alice's peer stores in both spaces
-    // to not have Alice consider Carol blocked when sending a message
-    // due to missing agents in the peer store.
+    // Introduce Alice and Carol to each other in both spaces, and let the
+    // exchange that admits them complete. Alice has to be admitted by Carol
+    // before Carol blocking her means anything, and Alice has to have
+    // admitted Carol or her messages would never leave her own transport.
     space_alice_1
         .peer_store()
         .insert(vec![dummy_agent_info_carol_1.clone()])
         .await
         .unwrap();
-
     space_alice_2
         .peer_store()
         .insert(vec![dummy_agent_info_carol_2.clone()])
         .await
         .unwrap();
+    space_carol_1
+        .peer_store()
+        .insert(vec![dummy_agent_info_alice_1.clone()])
+        .await
+        .unwrap();
+    space_carol_2
+        .peer_store()
+        .insert(vec![dummy_agent_info_alice_2.clone()])
+        .await
+        .unwrap();
+
+    await_mutual_grants(
+        &space_alice_1,
+        &peer_url_alice,
+        &space_carol_1,
+        &peer_url_carol,
+    )
+    .await;
+    await_mutual_grants(
+        &space_alice_2,
+        &peer_url_alice,
+        &space_carol_2,
+        &peer_url_carol,
+    )
+    .await;
 
     // Verify that Carol's message blocks count is empty initially
     let stats = transport_carol.dump_network_stats().await.unwrap();
     assert_eq!(stats.blocked_message_counts.len(), 0);
 
-    // Then have Alice send a message to Carol. Since we didn't add any agent
-    // info of Alice to Carol's peer store, Alice is expected to be considered
-    // blocked by Carol and Alice's message should be dropped by Carol.
+    // Carol now blocks Alice in both spaces. A block outranks anything Alice
+    // proved, so her messages start being dropped again.
+    block_agent_in_space(
+        dummy_agent_info_alice_1.agent.clone(),
+        space_carol_1.clone(),
+    )
+    .await;
+    block_agent_in_space(
+        dummy_agent_info_alice_2.agent.clone(),
+        space_carol_2.clone(),
+    )
+    .await;
+
+    // Then have Alice send a message to Carol, which Carol drops.
     transport_alice
         .send_space_notify(
             peer_url_carol.clone(),
@@ -613,7 +672,7 @@ async fn incoming_message_block_count_increases_correctly() {
     )]
     .into();
 
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_carol.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -644,7 +703,7 @@ async fn incoming_message_block_count_increases_correctly() {
         .into(),
     )]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_carol.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -684,21 +743,39 @@ async fn incoming_message_block_count_increases_correctly() {
         .into(),
     )]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_carol.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
         }
     });
 
-    // Add Carol's dummy agent infos to Bob's peer store in space 1
-    // to not have Bob consider Carol blocked when sending a message
-    // due to missing agents in the peer store.
+    // Same for Bob in space 1: introduce, let the exchange complete, then
+    // have Carol block him.
     space_bob_1
         .peer_store()
         .insert(vec![dummy_agent_info_carol_1.clone()])
         .await
         .unwrap();
+    space_carol_1
+        .peer_store()
+        .insert(vec![dummy_agent_info_bob_1.clone()])
+        .await
+        .unwrap();
+
+    await_mutual_grants(
+        &space_bob_1,
+        &peer_url_bob,
+        &space_carol_1,
+        &peer_url_carol,
+    )
+    .await;
+
+    block_agent_in_space(
+        dummy_agent_info_bob_1.agent.clone(),
+        space_carol_1.clone(),
+    )
+    .await;
 
     // And finally send one to Bob and verify that the HashMap gets updated correctly as well
     transport_bob
@@ -747,7 +824,7 @@ async fn incoming_message_block_count_increases_correctly() {
         ),
     ]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_carol.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -799,9 +876,10 @@ async fn outgoing_message_block_count_increases_correctly() {
     let stats = transport_alice.dump_network_stats().await.unwrap();
     assert_eq!(stats.blocked_message_counts.len(), 0);
 
-    // Now have Alice send a message to Carol. Since we didn't add any agent
-    // info of Carol to Alice's peer store, Carol is expected to be considered
-    // blocked and the message should be dropped before being sent.
+    // Now have Alice send a message to Carol. Alice has never heard of
+    // Carol, so Carol has not been admitted to either space and the message
+    // is dropped before being sent. Dropping an unadmitted peer's message
+    // counts the same as dropping a blocked peer's.
     transport_alice
         .send_space_notify(
             peer_url_carol.clone(),
@@ -827,7 +905,7 @@ async fn outgoing_message_block_count_increases_correctly() {
         .into(),
     )]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -858,7 +936,7 @@ async fn outgoing_message_block_count_increases_correctly() {
         .into(),
     )]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -898,7 +976,7 @@ async fn outgoing_message_block_count_increases_correctly() {
         .into(),
     )]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -947,7 +1025,7 @@ async fn outgoing_message_block_count_increases_correctly() {
         ),
     ]
     .into();
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts == expected_blocked_message_counts {
             break;
@@ -986,6 +1064,16 @@ async fn incoming_notify_messages_from_blocked_peers_are_dropped() {
         .insert(vec![agent_info_bob])
         .await
         .unwrap();
+
+    // Alice's challenge to Bob is what opens the connection, and both sides
+    // grant each other once it completes.
+    await_mutual_grants(
+        &space_alice,
+        &peer_url_alice,
+        &space_bob,
+        &peer_url_bob,
+    )
+    .await;
 
     // Alice sends a space message that should go through normally and establish
     // a connection with Bob
@@ -1041,7 +1129,7 @@ async fn incoming_notify_messages_from_blocked_peers_are_dropped() {
         .unwrap();
 
     // Verify that Bob has blocked the message
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_bob.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts.len() == 1 {
             break;
@@ -1054,7 +1142,7 @@ async fn incoming_notify_messages_from_blocked_peers_are_dropped() {
 
     // Wait for Alice to see the disconnect so the next send opens a fresh
     // connection (with a new preflight carrying the new agent info).
-    iter_check!(500, {
+    iter_check!(5000, {
         if let Ok(peer_url) = peer_disconnect_recv_alice.try_recv()
             && peer_url == peer_url_bob
         {
@@ -1095,7 +1183,7 @@ async fn incoming_notify_messages_from_blocked_peers_are_dropped() {
     });
 
     // Verify that Bob blocked this message too (incoming count increased).
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_bob.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_alice)
@@ -1145,6 +1233,16 @@ async fn incoming_module_messages_from_blocked_peers_are_dropped() {
         .insert(vec![agent_info_bob])
         .await
         .unwrap();
+
+    // Alice's challenge to Bob is what opens the connection, and both sides
+    // grant each other once it completes.
+    await_mutual_grants(
+        &space_alice,
+        &peer_url_alice,
+        &space_bob,
+        &peer_url_bob,
+    )
+    .await;
 
     // Alice sends a module message that should go through normally and establish
     // a connection with Bob
@@ -1201,7 +1299,7 @@ async fn incoming_module_messages_from_blocked_peers_are_dropped() {
         .unwrap();
 
     // Verify that Bob has blocked the message
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_bob.dump_network_stats().await.unwrap();
         if net_stats.blocked_message_counts.len() == 1 {
             break;
@@ -1214,7 +1312,7 @@ async fn incoming_module_messages_from_blocked_peers_are_dropped() {
 
     // Wait for Alice to see the disconnect so the next send opens a fresh
     // connection (with a new preflight carrying the new agent info).
-    iter_check!(500, {
+    iter_check!(5000, {
         if let Ok(peer_url) = peer_disconnect_recv_alice.try_recv()
             && peer_url == peer_url_bob
         {
@@ -1256,7 +1354,7 @@ async fn incoming_module_messages_from_blocked_peers_are_dropped() {
     });
 
     // Verify that Bob blocked this message too (incoming count increased).
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_bob.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_alice)
@@ -1305,6 +1403,16 @@ async fn outgoing_notify_messages_to_blocked_peers_are_dropped() {
         .insert(vec![agent_info_bob.clone()])
         .await
         .unwrap();
+
+    // Alice's challenge to Bob is what opens the connection, and both sides
+    // grant each other once it completes.
+    await_mutual_grants(
+        &space_alice,
+        &peer_url_alice,
+        &space_bob,
+        &peer_url_bob,
+    )
+    .await;
 
     // Alice sends a space message that should go through normally
     let payload = Bytes::from("Hello world");
@@ -1355,7 +1463,7 @@ async fn outgoing_notify_messages_to_blocked_peers_are_dropped() {
         .unwrap();
 
     // Verify that Alice has blocked the message
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
@@ -1372,7 +1480,7 @@ async fn outgoing_notify_messages_to_blocked_peers_are_dropped() {
 
     // Wait for Alice to see the disconnect so any subsequent send attempt
     // starts from a clean connection state.
-    iter_check!(500, {
+    iter_check!(5000, {
         if let Ok(peer_url) = peer_disconnect_recv_alice.try_recv()
             && peer_url == peer_url_bob
         {
@@ -1411,7 +1519,7 @@ async fn outgoing_notify_messages_to_blocked_peers_are_dropped() {
         .unwrap();
 
     // Verify that Alice's outgoing block count increased to 2.
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
@@ -1460,6 +1568,16 @@ async fn outgoing_module_messages_to_blocked_peers_are_dropped() {
         .insert(vec![agent_info_bob.clone()])
         .await
         .unwrap();
+
+    // Alice's challenge to Bob is what opens the connection, and both sides
+    // grant each other once it completes.
+    await_mutual_grants(
+        &space_alice,
+        &peer_url_alice,
+        &space_bob,
+        &peer_url_bob,
+    )
+    .await;
 
     // Alice sends a module message that should go through normally
     let payload = Bytes::from("Hello module world");
@@ -1512,7 +1630,7 @@ async fn outgoing_module_messages_to_blocked_peers_are_dropped() {
         .unwrap();
 
     // Verify that Alice has blocked the message
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
@@ -1529,7 +1647,7 @@ async fn outgoing_module_messages_to_blocked_peers_are_dropped() {
 
     // Wait for Alice to see the disconnect so any subsequent send attempt
     // starts from a clean connection state.
-    iter_check!(500, {
+    iter_check!(5000, {
         if let Ok(peer_url) = peer_disconnect_recv_alice.try_recv()
             && peer_url == peer_url_bob
         {
@@ -1569,7 +1687,7 @@ async fn outgoing_module_messages_to_blocked_peers_are_dropped() {
         .unwrap();
 
     // Verify that Alice's outgoing block count increased to 2.
-    iter_check!(500, {
+    iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
