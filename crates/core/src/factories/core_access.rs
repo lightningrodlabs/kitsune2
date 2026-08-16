@@ -166,4 +166,163 @@ impl PeerAccessState for CorePeerAccessState {
             .cloned();
         Ok(decision)
     }
+
+    fn set_access_decision(
+        &self,
+        peer_url: Url,
+        access: PeerAccess,
+    ) -> K2Result<()> {
+        let mut decisions = self.decisions.write().expect("poison");
+
+        // Blocks always win. An explicit `Blocked` entry must not be
+        // overwritten by a later `Granted`, which is what the access module
+        // records after a successful proof-of-knowledge exchange.
+        if access.decision == AccessDecision::Granted
+            && let Some(existing) = decisions.get(&peer_url)
+            && existing.decision == AccessDecision::Blocked
+        {
+            tracing::debug!(
+                ?peer_url,
+                "Ignoring Granted access decision, peer is explicitly blocked"
+            );
+            return Ok(());
+        }
+
+        decisions.insert(peer_url, access);
+        Ok(())
+    }
+
+    fn remove_access_decision(&self, peer_url: Url) -> K2Result<()> {
+        self.decisions.write().expect("poison").remove(&peer_url);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::factories::{MemBlocks, MemPeerStore, MemPeerStoreConfig};
+    use std::sync::Arc;
+
+    fn make_url(s: &str) -> Url {
+        Url::from_str(format!("ws://a.b:80/{s}")).unwrap()
+    }
+
+    /// A URL with no recorded decision is "unknown", and `set_access_decision`
+    /// records a `Granted` decision for it.
+    #[tokio::test]
+    async fn set_access_decision_records_grant() {
+        let url = make_url("grant");
+        let access_state = empty_access_state();
+
+        assert_eq!(
+            access_state.get_access_decision(url.clone()).unwrap(),
+            None
+        );
+
+        access_state
+            .set_access_decision(url.clone(), granted())
+            .unwrap();
+
+        let decision = access_state.get_access_decision(url.clone()).unwrap();
+        assert_eq!(decision.map(|d| d.decision), Some(AccessDecision::Granted));
+    }
+
+    /// Blocks always win: an explicit `Blocked` entry must not be overwritten
+    /// by a later `Granted` recorded by the access module.
+    #[tokio::test]
+    async fn set_access_decision_does_not_overwrite_blocked() {
+        let url = make_url("blocked");
+        let access_state = empty_access_state();
+
+        access_state
+            .set_access_decision(url.clone(), blocked())
+            .unwrap();
+        access_state
+            .set_access_decision(url.clone(), granted())
+            .unwrap();
+
+        let decision = access_state.get_access_decision(url.clone()).unwrap();
+        assert_eq!(
+            decision.map(|d| d.decision),
+            Some(AccessDecision::Blocked),
+            "a Granted decision must not overwrite an explicit Blocked entry"
+        );
+    }
+
+    /// A `Blocked` decision may replace an existing `Granted` decision.
+    #[tokio::test]
+    async fn set_access_decision_block_overwrites_granted() {
+        let url = make_url("regrade");
+        let access_state = empty_access_state();
+
+        access_state
+            .set_access_decision(url.clone(), granted())
+            .unwrap();
+        access_state
+            .set_access_decision(url.clone(), blocked())
+            .unwrap();
+
+        let decision = access_state.get_access_decision(url.clone()).unwrap();
+        assert_eq!(decision.map(|d| d.decision), Some(AccessDecision::Blocked));
+    }
+
+    /// Removing a decision returns the peer to the "unknown" state, and
+    /// removing an absent decision is not an error.
+    #[tokio::test]
+    async fn remove_access_decision() {
+        let url = make_url("remove");
+        let access_state = empty_access_state();
+
+        // Removing a decision that was never made is fine.
+        access_state.remove_access_decision(url.clone()).unwrap();
+
+        access_state
+            .set_access_decision(url.clone(), granted())
+            .unwrap();
+        assert!(
+            access_state
+                .get_access_decision(url.clone())
+                .unwrap()
+                .is_some()
+        );
+
+        access_state.remove_access_decision(url.clone()).unwrap();
+        assert_eq!(
+            access_state.get_access_decision(url.clone()).unwrap(),
+            None
+        );
+
+        // After removal a fresh grant can be recorded again.
+        access_state
+            .set_access_decision(url.clone(), granted())
+            .unwrap();
+        let decision = access_state.get_access_decision(url).unwrap();
+        assert_eq!(decision.map(|d| d.decision), Some(AccessDecision::Granted));
+    }
+
+    fn empty_access_state() -> CorePeerAccessState {
+        let blocks = Arc::new(MemBlocks::default());
+        let peer_store: DynPeerStore = Arc::new(MemPeerStore::new(
+            MemPeerStoreConfig {
+                prune_interval_s: 10,
+            },
+            blocks.clone(),
+        ));
+        CorePeerAccessState::new(peer_store, blocks).unwrap()
+    }
+
+    fn granted() -> PeerAccess {
+        PeerAccess {
+            decision: AccessDecision::Granted,
+            decided_at: Timestamp::now(),
+        }
+    }
+
+    fn blocked() -> PeerAccess {
+        PeerAccess {
+            decision: AccessDecision::Blocked,
+            decided_at: Timestamp::now(),
+        }
+    }
 }

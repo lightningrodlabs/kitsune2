@@ -153,6 +153,7 @@ impl LocalAgent for Ed25519LocalAgent {
 /// - `local_agent_store` - The default local agent store is [factories::CoreLocalAgentStoreFactory].
 /// - `publish` - The default publish module is [factories::CorePublishFactory].
 /// - `blocks` - The default blocks module is [factories::MemBlocksFactory].
+/// - `space_secret` - The default space secret is [factories::NoopSpaceSecretFactory].
 pub fn default_test_builder() -> Builder {
     Builder {
         config: Config::default(),
@@ -172,6 +173,8 @@ pub fn default_test_builder() -> Builder {
         local_agent_store: factories::CoreLocalAgentStoreFactory::create(),
         publish: factories::CorePublishFactory::create(),
         blocks: factories::MemBlocksFactory::create(),
+        // TODO(hello-pok phase 3): replace with `CoreSpaceSecretFactory`.
+        space_secret: factories::NoopSpaceSecretFactory::create(),
     }
 }
 

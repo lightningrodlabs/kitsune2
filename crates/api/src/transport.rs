@@ -962,6 +962,50 @@ pub trait TxSpaceHandler: TxBaseHandler {
 
     /// Return `true` if any agent using the passed peer [`Url`] is blocked.
     fn is_any_agent_at_url_blocked(&self, peer_url: &Url) -> K2Result<bool>;
+
+    /// The module id of the access module loaded for this space.
+    ///
+    /// Module messages addressed to this module id are exempt from the access
+    /// gate, because that module is what produces access decisions in the
+    /// first place. See [`HELLO_MOD_NAME`].
+    ///
+    /// The default implementation returns [`HELLO_MOD_NAME`].
+    fn access_module_id(&self) -> String {
+        HELLO_MOD_NAME.into()
+    }
+
+    /// Return `true` if the peer at the passed [`Url`] has been granted access
+    /// to this space.
+    ///
+    /// This is distinct from the blocks check: blocks are an explicit
+    /// denylist, whereas this reports whether a positive access decision has
+    /// been made. A peer that is neither blocked nor granted is "unknown", and
+    /// unknown peers are not trusted.
+    ///
+    /// The default implementation returns `Ok(false)`, which is the safe
+    /// direction: peers are ungranted until an implementation that can
+    /// actually make access decisions overrides this.
+    fn is_access_granted(&self, peer_url: &Url) -> K2Result<bool> {
+        let _ = peer_url;
+        Ok(false)
+    }
+
+    /// Notification that an incoming message from an ungranted peer was
+    /// dropped.
+    ///
+    /// This is fire-and-forget. It gives the access module the chance to
+    /// initiate an exchange toward that peer, so that an asymmetric access
+    /// state (we forgot the peer, the peer still thinks it is granted) heals
+    /// on the first dropped message rather than staying silently deaf.
+    ///
+    /// This must not be called for peers that are explicitly blocked; the
+    /// denylist always wins.
+    ///
+    /// The default implementation does nothing.
+    fn ungranted_message_dropped(&self, peer: Url) {
+        drop(peer);
+    }
+
     /// Check if this space has any local agents joined.
     ///
     /// This is used to prevent sending messages before a local agent has joined,
@@ -978,6 +1022,14 @@ pub trait TxSpaceHandler: TxBaseHandler {
 pub type DynTxSpaceHandler = Arc<dyn TxSpaceHandler>;
 
 /// Handler for module-related events.
+///
+/// # Transport contract
+///
+/// The `peer` [`Url`] passed to these callbacks must carry a peer id segment
+/// (see [`Url::peer_id`]) derived from the connection's authenticated remote
+/// identity, never from data the remote claimed in a payload. Modules are
+/// entitled to treat that peer id as the channel's authenticated identity, and
+/// the access module binds its proofs to it.
 pub trait TxModuleHandler: TxBaseHandler {
     /// The sync handler for receiving module messages sent by a remote
     /// peer in reference to a particular space. If this callback returns
