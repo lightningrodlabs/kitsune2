@@ -66,6 +66,10 @@ clap = "4.5.21"
 ctrlc = { version = "3.4.5", features = ["termination"] }
 # bootstrap_srv for signature verification.
 ed25519-dalek = "3.0.0"
+# key derivation for the per-space key material the access module uses.
+hkdf = "0.13.0"
+# the access module's proof-of-knowledge proofs are HMACs.
+hmac = "0.13.0"
 # alternative transport implementation using iroh
 iroh = "1.0.0"
 # automock traits for tests
@@ -83,6 +87,8 @@ serde = { version = "1.0", features = ["derive"] }
 # kitsune2 agent info is serialized as json to improve debugability of
 # bootstrapping. So, we need a json library.
 serde_json = "1.0"
+# the hash backing the access module's HMAC and KDF, and used to hash op data.
+sha2 = "0.11.0"
 # tokio is used for synchronization primitives as well as internal
 # task spawning. We could consider abstracting the async runtime
 # at some point in the future.
@@ -146,8 +152,6 @@ iroh-base = "1.0.0"
 # that drive a relay client.
 iroh-dns = "1.0.0"
 
-# used to hash op data
-sha2 = "0.11"
 # Generating test certificates in the bootstrap_srv
 rcgen = "0.14"
 # Deterministic RNG for reproducible tests
