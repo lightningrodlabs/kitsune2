@@ -334,8 +334,11 @@ async fn shutdown_space() {
         .await
         .unwrap();
 
-    // Wait for gossip to exchange all ops.
-    iter_check!(15000, 500, {
+    // Wait for gossip to exchange all ops. The budget matches the one
+    // `two_node_gossip` uses, since the peers now have to admit each other
+    // through the access module before any gossip round can get through, and
+    // a round that starts before that has to come round again.
+    iter_check!(60_000, 500, {
         let actual_ops_1 = space_1
             .op_store()
             .retrieve_ops(op_ids_2.clone())
