@@ -201,7 +201,8 @@ impl PeerAccessState for CorePeerAccessState {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::factories::{MemBlocks, MemPeerStore, MemPeerStoreConfig};
+    use crate::default_test_builder;
+    use kitsune2_test_utils::space::TEST_SPACE_ID;
     use std::sync::Arc;
 
     fn make_url(s: &str) -> Url {
@@ -213,7 +214,7 @@ mod test {
     #[tokio::test]
     async fn set_access_decision_records_grant() {
         let url = make_url("grant");
-        let access_state = empty_access_state();
+        let access_state = empty_access_state().await;
 
         assert_eq!(
             access_state.get_access_decision(url.clone()).unwrap(),
@@ -233,7 +234,7 @@ mod test {
     #[tokio::test]
     async fn set_access_decision_does_not_overwrite_blocked() {
         let url = make_url("blocked");
-        let access_state = empty_access_state();
+        let access_state = empty_access_state().await;
 
         access_state
             .set_access_decision(url.clone(), blocked())
@@ -254,7 +255,7 @@ mod test {
     #[tokio::test]
     async fn set_access_decision_block_overwrites_granted() {
         let url = make_url("regrade");
-        let access_state = empty_access_state();
+        let access_state = empty_access_state().await;
 
         access_state
             .set_access_decision(url.clone(), granted())
@@ -272,7 +273,7 @@ mod test {
     #[tokio::test]
     async fn remove_access_decision() {
         let url = make_url("remove");
-        let access_state = empty_access_state();
+        let access_state = empty_access_state().await;
 
         // Removing a decision that was never made is fine.
         access_state.remove_access_decision(url.clone()).unwrap();
@@ -301,14 +302,21 @@ mod test {
         assert_eq!(decision.map(|d| d.decision), Some(AccessDecision::Granted));
     }
 
-    fn empty_access_state() -> CorePeerAccessState {
-        let blocks = Arc::new(MemBlocks::default());
-        let peer_store: DynPeerStore = Arc::new(MemPeerStore::new(
-            MemPeerStoreConfig {
-                prune_interval_s: 10,
-            },
-            blocks.clone(),
-        ));
+    /// An access state whose backing peer store is empty, so every decision
+    /// it holds is one that was recorded through `set_access_decision`.
+    async fn empty_access_state() -> CorePeerAccessState {
+        let builder =
+            Arc::new(default_test_builder().with_default_config().unwrap());
+        let blocks = builder
+            .blocks
+            .create(builder.clone(), TEST_SPACE_ID)
+            .await
+            .unwrap();
+        let peer_store = builder
+            .peer_store
+            .create(builder.clone(), TEST_SPACE_ID, blocks.clone())
+            .await
+            .unwrap();
         CorePeerAccessState::new(peer_store, blocks).unwrap()
     }
 

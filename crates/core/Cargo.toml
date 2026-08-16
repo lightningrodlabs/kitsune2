@@ -19,10 +19,13 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 futures = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing = { workspace = true }
 url = { workspace = true }
