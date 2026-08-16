@@ -1,6 +1,7 @@
 //! The core space implementation provided by Kitsune2.
 
 use crate::factories::core_access::CorePeerAccessState;
+use crate::factories::core_hello::{CoreHello, CoreHelloModConfig};
 use crate::get_all_remote_agents;
 use kitsune2_api::*;
 use std::sync::{Arc, RwLock, Weak};
@@ -103,7 +104,10 @@ fn bootstrap_server_customized(global: &Config, space: &Config) -> bool {
 
 impl SpaceFactory for CoreSpaceFactory {
     fn default_config(&self, config: &mut Config) -> K2Result<()> {
-        config.set_module_config(&CoreSpaceModConfig::default())
+        config.set_module_config(&CoreSpaceModConfig::default())?;
+        // The access module is created by the space rather than by a factory
+        // of its own, so its config is defaulted here.
+        config.set_module_config(&CoreHelloModConfig::default())
     }
 
     fn validate_config(&self, _config: &Config) -> K2Result<()> {
@@ -228,6 +232,34 @@ impl SpaceFactory for CoreSpaceFactory {
                 )
                 .await?;
 
+            // The access module. It has to be built after the space handler
+            // knows this node's url, because every proof it computes binds
+            // that url's peer id, so it reads the url through `inner` rather
+            // than being handed a snapshot of it.
+            let space_secret = builder
+                .space_secret
+                .create(builder.clone(), space_id.clone())
+                .await?;
+            let hello_config: CoreHelloModConfig =
+                builder_config.get_module_config()?;
+            let hello = CoreHello::create(
+                hello_config.core_hello,
+                space_id.clone(),
+                builder.verifier.clone(),
+                space_secret,
+                peer_store.clone(),
+                local_agent_store.clone(),
+                peer_access_state.clone(),
+                tx.clone(),
+                {
+                    let inner = inner.clone();
+                    Arc::new(move || {
+                        inner.read().expect("poison").current_url.clone()
+                    })
+                },
+            )
+            .await?;
+
             let out: DynSpace = Arc::new_cyclic(move |this| {
                 let current_url = tx.register_space_handler(
                     space_id.clone(),
@@ -250,6 +282,7 @@ impl SpaceFactory for CoreSpaceFactory {
                     blocks,
                     known_peers,
                     peer_access_state,
+                    hello,
                 )
             });
             Ok(out)
@@ -353,6 +386,13 @@ impl TxSpaceHandler for TxHandlerTranslator {
         Ok(blocked)
     }
 
+    fn ungranted_message_dropped(&self, peer: Url) {
+        let Some(core_space) = self.1.upgrade() else {
+            return;
+        };
+        core_space.hello.notify_ungranted_message_dropped(peer);
+    }
+
     fn has_local_agents(&self) -> BoxFut<'_, K2Result<bool>> {
         Box::pin(async move {
             let core_space = self
@@ -384,6 +424,7 @@ struct CoreSpace {
     blocks: DynBlocks,
     known_peers: DynKnownPeers,
     peer_access_state: DynPeerAccessState,
+    hello: Arc<CoreHello>,
     inner: Arc<RwLock<InnerData>>,
     task_check_agent_infos: tokio::task::JoinHandle<()>,
 }
@@ -422,6 +463,7 @@ impl CoreSpace {
         blocks: DynBlocks,
         known_peers: DynKnownPeers,
         peer_access_state: DynPeerAccessState,
+        hello: Arc<CoreHello>,
     ) -> Self {
         let task_check_agent_infos = tokio::task::spawn(check_agent_infos(
             config,
@@ -436,6 +478,7 @@ impl CoreSpace {
             local_agent_store,
             peer_meta_store,
             peer_access_state,
+            hello,
             inner,
             op_store,
             task_check_agent_infos,
@@ -496,6 +539,10 @@ impl Space for CoreSpace {
 
     fn known_peers(&self) -> &DynKnownPeers {
         &self.known_peers
+    }
+
+    fn peer_access_state(&self) -> &DynPeerAccessState {
+        &self.peer_access_state
     }
 
     fn current_url(&self) -> Option<Url> {
@@ -587,6 +634,13 @@ impl Space for CoreSpace {
 
             // trigger the update
             local_agent.invoke_cb();
+
+            // Introduce ourselves in this space to everyone we can reach.
+            // This is the case a peer store insert never fires for: two nodes
+            // that are already connected because they share another space,
+            // where the connection long predates this join and no preflight
+            // will run again.
+            self.hello.notify_local_agent_join();
 
             Ok(())
         })
