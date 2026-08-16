@@ -157,12 +157,15 @@ impl TxImp for MemTransport {
     }
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
-        // The memory transport is always connected to everyone but doesn't
-        // expose who is connected here.
         Box::pin(async move {
-            Err(K2Error::other(
-                "get_connected_peers is not implemented for the mem transport",
-            ))
+            let (result_sender, result_receiver) =
+                tokio::sync::oneshot::channel();
+            self.cmd_send
+                .send(Cmd::GetConnectedPeers(result_sender))
+                .map_err(|_| K2Error::other("Connection Closed"))?;
+            result_receiver
+                .await
+                .map_err(|_| K2Error::other("Connection Closed"))
         })
     }
 
@@ -307,6 +310,9 @@ enum Cmd {
     /// to report back the result of handling the message by the receiving
     /// peer.
     Send(Url, bytes::Bytes, ResultSender),
+
+    /// Report back the peer urls of all connections currently in the pool.
+    GetConnectedPeers(tokio::sync::oneshot::Sender<Vec<Url>>),
 }
 
 /// The command runner task that gets spawned when creating a MemTransport
@@ -474,6 +480,9 @@ async fn cmd_task(
                         .data_send
                         .send((payload, result_sender));
                 }
+            }
+            Cmd::GetConnectedPeers(result_sender) => {
+                let _ = result_sender.send(con_pool.keys().cloned().collect());
             }
             Cmd::Send(url, data, result_sender) => {
                 if let Some(ready_data_send) = get_transport_instances()
