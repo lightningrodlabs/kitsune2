@@ -154,6 +154,7 @@ impl LocalAgent for Ed25519LocalAgent {
 /// - `publish` - The default publish module is [factories::CorePublishFactory].
 /// - `blocks` - The default blocks module is [factories::MemBlocksFactory].
 /// - `known_peers` - The default known-peers index is [factories::CoreKnownPeersFactory].
+/// - `space_secret` - The default space secret is [factories::NoopSpaceSecretFactory].
 pub fn default_test_builder() -> Builder {
     Builder {
         config: Config::default(),
@@ -174,6 +175,8 @@ pub fn default_test_builder() -> Builder {
         publish: factories::CorePublishFactory::create(),
         blocks: factories::MemBlocksFactory::create(),
         known_peers: factories::CoreKnownPeersFactory::create(),
+        // TODO(hello-pok phase 3): replace with `CoreSpaceSecretFactory`.
+        space_secret: factories::NoopSpaceSecretFactory::create(),
     }
 }
 
