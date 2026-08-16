@@ -2,6 +2,7 @@ use kitsune2_api::*;
 use kitsune2_test_utils::enable_tracing;
 use kitsune2_test_utils::iter_check;
 use kitsune2_test_utils::space::TEST_SPACE_ID;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -14,6 +15,7 @@ enum Track {
     PreflightSend,
     PreflightRecv,
     AreBlocked(Url),
+    UngrantedDropped(Url),
 }
 
 type G = Box<dyn Fn(Url) -> K2Result<bytes::Bytes> + 'static + Send + Sync>;
@@ -23,6 +25,10 @@ struct TrackHnd {
     track: Mutex<Vec<Track>>,
     preflight_gather_outgoing: G,
     preflight_validate_incoming: V,
+    /// Whether this handler reports peers as explicitly blocked.
+    blocked: AtomicBool,
+    /// Whether this handler reports peers as granted access.
+    granted: AtomicBool,
 }
 
 impl std::fmt::Debug for TrackHnd {
@@ -89,7 +95,18 @@ impl TxSpaceHandler for TrackHnd {
             .unwrap()
             .push(Track::AreBlocked(peer_url.clone()));
 
-        Ok(false)
+        Ok(self.blocked.load(Ordering::SeqCst))
+    }
+
+    fn is_access_granted(&self, _peer_url: &Url) -> K2Result<bool> {
+        Ok(self.granted.load(Ordering::SeqCst))
+    }
+
+    fn ungranted_message_dropped(&self, peer: Url) {
+        self.track
+            .lock()
+            .unwrap()
+            .push(Track::UngrantedDropped(peer));
     }
 }
 
@@ -122,7 +139,62 @@ impl TrackHnd {
             track: Mutex::new(Vec::new()),
             preflight_gather_outgoing: g,
             preflight_validate_incoming: v,
+            blocked: AtomicBool::new(false),
+            granted: AtomicBool::new(true),
         })
+    }
+
+    /// Stop reporting peers as granted access to the space.
+    pub fn ungrant(&self) {
+        self.granted.store(false, Ordering::SeqCst);
+    }
+
+    /// Start reporting peers as explicitly blocked.
+    pub fn block(&self) {
+        self.blocked.store(true, Ordering::SeqCst);
+    }
+
+    /// Check that no module message with the given module id was received.
+    pub fn check_no_mod(&self, module: &str) {
+        let track = self.track.lock().unwrap();
+        if track
+            .iter()
+            .any(|t| matches!(t, Track::ModRecv(_, _, m, _) if m == module))
+        {
+            panic!("unexpected {module} module message, out of {track:#?}");
+        }
+    }
+
+    /// Check that no space notify was received.
+    pub fn check_no_notify(&self) {
+        let track = self.track.lock().unwrap();
+        if track.iter().any(|t| matches!(t, Track::SpaceRecv(_, _, _))) {
+            panic!("unexpected space notify, out of {track:#?}");
+        }
+    }
+
+    /// Check that the access module was told about a dropped message from an
+    /// ungranted peer.
+    pub fn check_ungranted_dropped(&self, peer_url: &Url) -> K2Result<()> {
+        let track = self.track.lock().unwrap();
+        track
+            .iter()
+            .find(|t| matches!(t, Track::UngrantedDropped(url) if peer_url == url))
+            .ok_or(K2Error::other(format!(
+                "matching UngrantedDropped not found {peer_url}, out of {track:#?}"
+            )))?;
+        Ok(())
+    }
+
+    /// Check that the access module was *not* told about a dropped message.
+    pub fn check_no_ungranted_dropped(&self) {
+        let track = self.track.lock().unwrap();
+        if track
+            .iter()
+            .any(|t| matches!(t, Track::UngrantedDropped(_)))
+        {
+            panic!("unexpected UngrantedDropped, out of {track:#?}");
+        }
     }
 
     pub fn url(&self) -> Url {
@@ -547,4 +619,171 @@ async fn transport_get_connected_peers() {
     // And the peer is gone again once the connection is closed.
     t1.disconnect(u2.clone(), None).await;
     assert!(t1.get_connected_peers().await.unwrap().is_empty());
+}
+
+/// Two nodes wired up as a pair, each registered for the access module and a
+/// non-exempt "test" module.
+async fn access_pair()
+-> (Arc<TrackHnd>, DynTransport, Arc<TrackHnd>, DynTransport) {
+    let h1 = TrackHnd::new();
+    let t1 = gen_tx(h1.clone()).await;
+    t1.register_space_handler(TEST_SPACE_ID, h1.clone());
+    t1.register_module_handler(TEST_SPACE_ID, "test".into(), h1.clone());
+    t1.register_module_handler(
+        TEST_SPACE_ID,
+        HELLO_MOD_NAME.into(),
+        h1.clone(),
+    );
+
+    let h2 = TrackHnd::new();
+    let t2 = gen_tx(h2.clone()).await;
+    t2.register_space_handler(TEST_SPACE_ID, h2.clone());
+    t2.register_module_handler(TEST_SPACE_ID, "test".into(), h2.clone());
+    t2.register_module_handler(
+        TEST_SPACE_ID,
+        HELLO_MOD_NAME.into(),
+        h2.clone(),
+    );
+
+    (h1, t1, h2, t2)
+}
+
+async fn send_all(from: &DynTransport, to: &Url) {
+    from.send_module(
+        to.clone(),
+        TEST_SPACE_ID,
+        HELLO_MOD_NAME.into(),
+        bytes::Bytes::from_static(b"hello-msg"),
+    )
+    .await
+    .unwrap();
+    from.send_module(
+        to.clone(),
+        TEST_SPACE_ID,
+        "test".into(),
+        bytes::Bytes::from_static(b"test-msg"),
+    )
+    .await
+    .unwrap();
+    from.send_space_notify(
+        to.clone(),
+        TEST_SPACE_ID,
+        bytes::Bytes::from_static(b"notify-msg"),
+    )
+    .await
+    .unwrap();
+}
+
+/// An ungranted peer may only reach the access module, which is what lets it
+/// stop being ungranted.
+#[tokio::test(flavor = "multi_thread")]
+async fn ungranted_peer_reaches_only_the_access_module() {
+    enable_tracing();
+
+    let (h1, t1, h2, _t2) = access_pair().await;
+    let u2 = h2.url();
+    h2.ungrant();
+
+    send_all(&t1, &u2).await;
+
+    iter_check!(5000, {
+        if h2
+            .check_mod(&h1.url(), &TEST_SPACE_ID, HELLO_MOD_NAME, b"hello-msg")
+            .is_ok()
+        {
+            break;
+        }
+    });
+    h2.check_no_mod("test");
+    h2.check_no_notify();
+
+    // And the drop told the space, so its access module can challenge us.
+    h2.check_ungranted_dropped(&h1.url()).unwrap();
+}
+
+/// A granted peer's messages all pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn granted_peer_messages_all_pass() {
+    enable_tracing();
+
+    let (h1, t1, h2, _t2) = access_pair().await;
+    let u1 = h1.url();
+    let u2 = h2.url();
+
+    send_all(&t1, &u2).await;
+
+    iter_check!(5000, {
+        if h2.check_notify(&u1, &TEST_SPACE_ID, b"notify-msg").is_ok() {
+            break;
+        }
+    });
+    h2.check_mod(&u1, &TEST_SPACE_ID, HELLO_MOD_NAME, b"hello-msg")
+        .unwrap();
+    h2.check_mod(&u1, &TEST_SPACE_ID, "test", b"test-msg")
+        .unwrap();
+    h2.check_no_ungranted_dropped();
+}
+
+/// A blocked peer is refused everything but the exempt wire types, even the
+/// access module, and even though it is still reported as granted. The
+/// denylist wins, and blocking must not be answered with a challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocked_peer_is_refused_even_when_granted() {
+    enable_tracing();
+
+    let (h1, t1, h2, _t2) = access_pair().await;
+    let u1 = h1.url();
+    let u2 = h2.url();
+
+    // Connect first, so the preflight is out of the way and we can be sure
+    // the later drops are the access check's doing.
+    t1.send_module(
+        u2.clone(),
+        TEST_SPACE_ID,
+        "test".into(),
+        bytes::Bytes::from_static(b"before"),
+    )
+    .await
+    .unwrap();
+    iter_check!(5000, {
+        if h2.check_mod(&u1, &TEST_SPACE_ID, "test", b"before").is_ok() {
+            break;
+        }
+    });
+
+    h2.block();
+    send_all(&t1, &u2).await;
+
+    // Nothing new arrived, in either module or as a notify.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h2.check_mod(&u1, &TEST_SPACE_ID, HELLO_MOD_NAME, b"hello-msg")
+        .unwrap_err();
+    h2.check_mod(&u1, &TEST_SPACE_ID, "test", b"test-msg")
+        .unwrap_err();
+    h2.check_no_notify();
+    h2.check_no_ungranted_dropped();
+}
+
+/// The sending side applies the same rule, so we do not even put a message on
+/// the wire toward a peer we have not granted.
+#[tokio::test(flavor = "multi_thread")]
+async fn sending_to_an_ungranted_peer_is_dropped_locally() {
+    enable_tracing();
+
+    let (h1, t1, h2, _t2) = access_pair().await;
+    let u2 = h2.url();
+    // The *sender* does not consider the destination granted.
+    h1.ungrant();
+
+    send_all(&t1, &u2).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h2.check_mod(&h1.url(), &TEST_SPACE_ID, HELLO_MOD_NAME, b"hello-msg")
+        .unwrap();
+    h2.check_no_mod("test");
+    h2.check_no_notify();
+
+    // An outgoing drop must not trigger a challenge: only the authenticated
+    // sender of an incoming message does that.
+    h1.check_no_ungranted_dropped();
 }

@@ -22,6 +22,10 @@ impl TxSpaceHandler for MockTxHandler {
     fn is_any_agent_at_url_blocked(&self, _peer_url: &Url) -> K2Result<bool> {
         Ok(false)
     }
+
+    fn is_access_granted(&self, _peer_url: &Url) -> K2Result<bool> {
+        Ok(true)
+    }
 }
 
 fn create_op_list(num_ops: u16) -> (Vec<MemoryOp>, Vec<OpId>) {

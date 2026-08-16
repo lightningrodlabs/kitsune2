@@ -278,12 +278,15 @@ impl TxImpHnd {
         })
     }
 
-    /// Check whether a message is permitted for a given peer and space
+    /// Check whether a message is permitted for a given peer and space.
     ///
-    /// If any agent associated with the given peer and space id is blocked
-    /// and the message is not of one of the explicitly allowed message types,
-    /// this function will return false and increase the count of blocked
-    /// messages by one.
+    /// Messages are permitted in precedence order: a peer with any blocked
+    /// agent at its url is refused whatever else is true of it; a peer that
+    /// has been granted access to the space is allowed; anything else is
+    /// refused, except the message types and the access module exempted
+    /// below. Refusing a message increases the count of blocked messages by
+    /// one, and refusing a message from a merely ungranted peer also tells
+    /// the space handler, so that its access module can challenge that peer.
     pub fn check_message_permitted(
         &self,
         peer_url: &Url,
@@ -291,8 +294,8 @@ impl TxImpHnd {
         module_id: &Option<String>,
         message_type: &K2WireType,
     ) -> K2Result<bool> {
-        // We accept the following messages also for peers at whose url all
-        // agents are blocked:
+        // These message types bypass the access gate entirely, for peers that
+        // are blocked as well as for peers that have not been granted access:
         //
         // - Preflight: Such that we can discover any new agent infos available
         //   at that peer URL (agent infos are sent via preflight messages and
@@ -305,6 +308,18 @@ impl TxImpHnd {
         // - Disconnect: If we receive a Disconnect message, we disconnect
         //   anyway and a disconnect message also wouldn't include a space id
         //   for which we could check for blocked agents.
+        //
+        // Module messages addressed to a space's access module (see
+        // [`TxSpaceHandler::access_module_id`]) are exempt too, but only for
+        // ungranted peers, and that exemption is applied in
+        // [`check_peer_access`] rather than here because it is space scoped.
+        // The reason for it is the same shape as the preflight reason above:
+        // the access module is what turns an ungranted peer into a granted
+        // one, so gating its messages on being granted would make the state
+        // unreachable. Unlike preflight, the exemption does not extend to
+        // blocked peers: a denylisted peer has nothing to prove, and letting
+        // it keep talking to the access module would hand it an oracle it
+        // could not otherwise reach.
         if matches!(
             message_type,
             K2WireType::Preflight
@@ -340,7 +355,7 @@ impl TxImpHnd {
             }
             Some(id) => SpaceId::from(id.clone()),
         };
-        let is_blocked = is_peer_blocked(
+        let outcome = check_peer_access(
             self.space_map.clone(),
             self.blocked_message_counts.clone(),
             peer_url,
@@ -348,7 +363,7 @@ impl TxImpHnd {
             module_id,
             false,
         )?;
-        Ok(!is_blocked)
+        Ok(matches!(outcome, AccessOutcome::Allow))
     }
 }
 
@@ -364,55 +379,107 @@ impl std::fmt::Debug for TxImpHnd {
     }
 }
 
-/// Check whether any agent associated with the given peer url is blocked
-/// for a space and increase the message blocks count by one if they are.
-fn is_peer_blocked(
+/// Whether a message may pass between us and a peer in a space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessOutcome {
+    /// The message may pass.
+    Allow,
+
+    /// At least one agent at the peer url is blocked in this space, so the
+    /// message is dropped.
+    Blocked,
+
+    /// The peer has not been granted access to this space, so the message is
+    /// dropped. Unlike being blocked this is resolvable: the access module
+    /// challenges the peer, and one round trip later its messages flow.
+    Ungranted,
+}
+
+/// Decide whether a message may pass between us and a peer in a space, and
+/// count it if it may not.
+///
+/// The precedence is the three-valued rule: an explicit block always wins, a
+/// granted peer is allowed, and everything else is dropped except messages
+/// addressed to the space's access module, which are what let an ungranted
+/// peer become a granted one.
+fn check_peer_access(
     space_map: SpaceMap,
     message_blocks_map: MessageBlocksMap,
     peer_url: &Url,
     space_id: &SpaceId,
     module_id: &Option<String>,
     outgoing: bool,
-) -> K2Result<bool> {
+) -> K2Result<AccessOutcome> {
     let space_handler =
         space_map.lock().expect("poisoned").get(space_id).cloned();
-    match space_handler {
-        Some(space_handler) => {
-            let all_blocked = space_handler.is_any_agent_at_url_blocked(peer_url).inspect_err(|e| tracing::warn!(?space_id, ?peer_url, ?module_id, "Failed to check whether any agent is blocked, peer connection will be closed: {e}"))?;
-            if all_blocked {
-                tracing::debug!(
-                    ?space_id,
-                    ?peer_url,
-                    ?module_id,
-                    "At least one agent at peer is blocked, message will be dropped."
-                );
-                if outgoing {
-                    incr_blocked_message_count_outgoing(
-                        message_blocks_map,
-                        peer_url.clone(),
-                        space_id,
-                    );
-                } else {
-                    incr_blocked_message_count_incoming(
-                        message_blocks_map,
-                        peer_url.clone(),
-                        space_id,
-                    );
-                }
-                return Ok(true);
-            }
-            Ok(false)
-        }
-        None => {
-            tracing::error!(
-                ?space_id,
-                ?peer_url,
-                ?module_id,
-                "No space handler found. Message will be dropped."
+    let Some(space_handler) = space_handler else {
+        tracing::error!(
+            ?space_id,
+            ?peer_url,
+            ?module_id,
+            "No space handler found. Message will be dropped."
+        );
+        return Ok(AccessOutcome::Blocked);
+    };
+
+    let count = |message_blocks_map| {
+        if outgoing {
+            incr_blocked_message_count_outgoing(
+                message_blocks_map,
+                peer_url.clone(),
+                space_id,
             );
-            Ok(true)
+        } else {
+            incr_blocked_message_count_incoming(
+                message_blocks_map,
+                peer_url.clone(),
+                space_id,
+            );
         }
+    };
+
+    // The denylist wins over everything, including a peer that has proven
+    // knowledge of the space secret.
+    let blocked = space_handler.is_any_agent_at_url_blocked(peer_url).inspect_err(|e| tracing::warn!(?space_id, ?peer_url, ?module_id, "Failed to check whether any agent is blocked, peer connection will be closed: {e}"))?;
+    if blocked {
+        tracing::debug!(
+            ?space_id,
+            ?peer_url,
+            ?module_id,
+            "At least one agent at peer is blocked, message will be dropped."
+        );
+        count(message_blocks_map);
+        return Ok(AccessOutcome::Blocked);
     }
+
+    let granted = space_handler.is_access_granted(peer_url).inspect_err(|e| tracing::warn!(?space_id, ?peer_url, ?module_id, "Failed to check whether a peer is granted access, peer connection will be closed: {e}"))?;
+    if granted {
+        return Ok(AccessOutcome::Allow);
+    }
+
+    // The access module is exempt, because gating the module that produces
+    // access decisions on already having one would make a grant unreachable.
+    if module_id.as_deref() == Some(space_handler.access_module_id().as_str()) {
+        return Ok(AccessOutcome::Allow);
+    }
+
+    tracing::debug!(
+        ?space_id,
+        ?peer_url,
+        ?module_id,
+        "Peer has not been granted access to the space, message will be dropped."
+    );
+    count(message_blocks_map);
+
+    // Tell the space that a peer it does not know is talking to us, so its
+    // access module can challenge that peer. Only for incoming messages: the
+    // sender of an incoming message is authenticated by the connection, so
+    // challenges flow back to the actual sender and nowhere else.
+    if !outgoing {
+        space_handler.ungranted_message_dropped(peer_url.clone());
+    }
+
+    Ok(AccessOutcome::Ungranted)
 }
 
 fn incr_blocked_message_count_incoming(
@@ -759,7 +826,7 @@ impl Transport for DefaultTransport {
     ) -> BoxFut<'_, K2Result<()>> {
         Box::pin(async move {
             self.error_if_no_local_agents(space_id.clone()).await?;
-            if is_peer_blocked(
+            match check_peer_access(
                 self.space_map.clone(),
                 self.blocked_message_counts.clone(),
                 &peer_url,
@@ -767,12 +834,25 @@ impl Transport for DefaultTransport {
                 &None,
                 true,
             )? {
-                tracing::warn!(
-                    ?peer_url,
-                    ?space_id,
-                    "Attempted to send space notify message to a peer that is blocked in that space. Dropping message."
-                );
-                return Ok(());
+                AccessOutcome::Allow => (),
+                AccessOutcome::Blocked => {
+                    tracing::warn!(
+                        ?peer_url,
+                        ?space_id,
+                        "Attempted to send space notify message to a peer that is blocked in that space. Dropping message."
+                    );
+                    return Ok(());
+                }
+                AccessOutcome::Ungranted => {
+                    // Expected until the peer completes an exchange with the
+                    // access module, so this is not worth a warning.
+                    tracing::debug!(
+                        ?peer_url,
+                        ?space_id,
+                        "Attempted to send space notify message to a peer that has not been granted access to that space. Dropping message."
+                    );
+                    return Ok(());
+                }
             }
             let enc = (K2Proto {
                 ty: K2WireType::Notify as i32,
@@ -794,21 +874,35 @@ impl Transport for DefaultTransport {
     ) -> BoxFut<'_, K2Result<()>> {
         Box::pin(async move {
             self.error_if_no_local_agents(space_id.clone()).await?;
-            if is_peer_blocked(
+            match check_peer_access(
                 self.space_map.clone(),
                 self.blocked_message_counts.clone(),
                 &peer_url,
                 &space_id,
-                &None,
+                &Some(module.clone()),
                 true,
             )? {
-                tracing::warn!(
-                    ?peer_url,
-                    ?space_id,
-                    ?module,
-                    "Attempted to send module message to a peer that is blocked in the associated space. Dropping message."
-                );
-                return Ok(());
+                AccessOutcome::Allow => (),
+                AccessOutcome::Blocked => {
+                    tracing::warn!(
+                        ?peer_url,
+                        ?space_id,
+                        ?module,
+                        "Attempted to send module message to a peer that is blocked in the associated space. Dropping message."
+                    );
+                    return Ok(());
+                }
+                AccessOutcome::Ungranted => {
+                    // Expected until the peer completes an exchange with the
+                    // access module, so this is not worth a warning.
+                    tracing::debug!(
+                        ?peer_url,
+                        ?space_id,
+                        ?module,
+                        "Attempted to send module message to a peer that has not been granted access to the associated space. Dropping message."
+                    );
+                    return Ok(());
+                }
             }
             let enc = (K2Proto {
                 ty: K2WireType::Module as i32,
