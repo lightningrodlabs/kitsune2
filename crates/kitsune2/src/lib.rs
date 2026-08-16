@@ -45,7 +45,9 @@ use kitsune2_transport_tx5::Tx5TransportFactory;
 /// - `publish` - The default publish module is [factories::CorePublishFactory].
 /// - `blocks` - The default blocks module is [factories::MemBlocksFactory].
 ///   Note: you will likely want to implement your own [`Blocks`] module.
-/// - `space_secret` - The default space secret is [factories::NoopSpaceSecretFactory].
+/// - `space_secret` - The default space secret is [factories::CoreSpaceSecretFactory],
+///   which derives the access module's key material from a configured
+///   per-space secret, defaulting to the space id.
 pub fn default_builder() -> Builder {
     Builder {
         config: Config::default(),
@@ -72,7 +74,6 @@ pub fn default_builder() -> Builder {
         publish: factories::CorePublishFactory::create(),
         blocks: factories::MemBlocksFactory::create(),
         known_peers: factories::CoreKnownPeersFactory::create(),
-        // TODO(hello-pok phase 6): replace with `CoreSpaceSecretFactory`.
-        space_secret: factories::NoopSpaceSecretFactory::create(),
+        space_secret: factories::CoreSpaceSecretFactory::create(),
     }
 }
