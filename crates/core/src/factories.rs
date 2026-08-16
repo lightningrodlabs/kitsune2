@@ -49,3 +49,6 @@ pub use core_known_peers::*;
 
 mod core_access;
 pub use core_access::*;
+
+mod core_space_secret;
+pub use core_space_secret::*;

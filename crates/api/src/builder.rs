@@ -77,6 +77,11 @@ pub struct Builder {
     /// The [`KnownPeersFactory`] to be used for creating [`KnownPeers`]
     /// instances.
     pub known_peers: DynKnownPeersFactory,
+
+    /// The [`SpaceSecretFactory`] to be used for creating [`SpaceSecret`]
+    /// instances, which provide the key material the access module proves
+    /// knowledge of.
+    pub space_secret: DynSpaceSecretFactory,
 }
 
 impl Builder {
@@ -105,6 +110,7 @@ impl Builder {
                 publish,
                 blocks,
                 known_peers,
+                space_secret,
             } = &mut self;
 
             kitsune.default_config(config)?;
@@ -121,6 +127,7 @@ impl Builder {
             publish.default_config(config)?;
             blocks.default_config(config)?;
             known_peers.default_config(config)?;
+            space_secret.default_config(config)?;
 
             config.mark_defaults_set();
         }
@@ -144,6 +151,7 @@ impl Builder {
         self.publish.validate_config(&self.config)?;
         self.blocks.validate_config(&self.config)?;
         self.known_peers.validate_config(&self.config)?;
+        self.space_secret.validate_config(&self.config)?;
 
         self.config.mark_validated();
 
