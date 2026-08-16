@@ -827,3 +827,37 @@ async fn the_join_trigger_tolerates_a_transport_without_connection_listing() {
         stub.take().into_iter().map(|(url, _)| url).collect();
     assert_eq!(challenged, vec![stored_url]);
 }
+
+/// An initiate that never arrived does not deadlock the pair.
+///
+/// This is the Moss case: a node that joins a space first challenges a peer
+/// that has not joined that space yet, so its initiate is discarded. When the
+/// peer joins and challenges back, the tie-break may hand the initiator role
+/// to the side whose initiate was lost, so that side repeats it rather than
+/// waiting out a timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_initiate_is_repeated_rather_than_waited_out() {
+    let low = Node::new(URL_A).await;
+    let high = Node::new(URL_B).await;
+    assert!(low.url.peer_id().unwrap() < high.url.peer_id().unwrap());
+
+    // The lower peer id challenges first, and the challenge is discarded.
+    low.hello.inner.initiate(high.url.clone(), false).await;
+    low.transport.take();
+
+    // The peer later challenges back.
+    high.hello.inner.initiate(low.url.clone(), false).await;
+    let (_, initiate) = high.transport.take_one();
+    low.deliver(&high.url, initiate).await;
+
+    // The side holding the initiator role repeats its initiate instead of
+    // ignoring the crossing one.
+    let (_, repeated) = low.transport.take_one();
+    assert!(matches!(repeated, HelloMsg::Initiate(_)));
+
+    high.deliver(&low.url, repeated).await;
+    pump(&low, &high).await;
+
+    assert!(low.is_granted(&high.url));
+    assert!(high.is_granted(&low.url));
+}
