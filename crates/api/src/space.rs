@@ -60,6 +60,13 @@ pub trait Space: 'static + Send + Sync + std::fmt::Debug {
     /// Get a reference to the blocks module being used by this space.
     fn blocks(&self) -> &DynBlocks;
 
+    /// Get a reference to the access state being used by this space.
+    ///
+    /// This is where the access module records what it decided about a peer,
+    /// and what the enforcement path consults before letting a message
+    /// through.
+    fn peer_access_state(&self) -> &access::DynPeerAccessState;
+
     /// The URL that this space is currently reachable at, if any.
     fn current_url(&self) -> Option<Url>;
 

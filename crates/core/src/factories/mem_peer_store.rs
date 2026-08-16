@@ -93,7 +93,8 @@ impl PeerStoreFactory for MemPeerStoreFactory {
     }
 }
 
-struct MemPeerStore(Mutex<Inner>);
+/// A production-ready memory-based peer store.
+pub struct MemPeerStore(Mutex<Inner>);
 
 impl std::fmt::Debug for MemPeerStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,6 +103,7 @@ impl std::fmt::Debug for MemPeerStore {
 }
 
 impl MemPeerStore {
+    /// Construct a new MemPeerStore.
     pub fn new(config: MemPeerStoreConfig, blocks: DynBlocks) -> Self {
         Self(Mutex::new(Inner::new(
             config,
