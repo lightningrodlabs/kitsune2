@@ -220,6 +220,15 @@ enum Exchange {
     AwaitingAck,
 }
 
+/// How we answer an incoming `Initiate`.
+enum Answer {
+    /// Repeat our own `Initiate`, because we hold the initiator role.
+    Initiate(HelloNonce),
+
+    /// Answer as responder, with the given nonce of ours.
+    Respond(HelloNonce),
+}
+
 /// What we remember about one peer URL.
 #[derive(Debug)]
 struct PeerExchange {
@@ -634,26 +643,19 @@ impl HelloInner {
             return;
         };
 
-        let our_nonce = fresh_nonce();
-        let transcript = match transcript_for_urls(
-            HELLO_PROOF_TAG,
-            &our_nonce,
-            &their_nonce,
-            &our_url,
-            &peer_url,
-        ) {
-            Ok(transcript) => transcript,
-            Err(err) => {
-                tracing::debug!(
-                    ?err,
-                    ?peer_url,
-                    "Abandoning a hello exchange that cannot be bound to a channel"
-                );
-                return;
-            }
+        // Both peer ids must be available before anything else, because
+        // every answer to an initiate is bound to them.
+        let (Some(our_peer_id), Some(their_peer_id)) =
+            (our_url.peer_id(), peer_url.peer_id())
+        else {
+            tracing::debug!(
+                ?peer_url,
+                "Abandoning a hello exchange that cannot be bound to a channel"
+            );
+            return;
         };
 
-        {
+        let answer = {
             let mut state = self.state.lock().expect("poison");
             let now = Instant::now();
             let in_flight =
@@ -663,83 +665,127 @@ impl HelloInner {
                 PeerExchange::new(self.config.retry_backoff_min())
             });
 
-            // Simultaneous initiate. Both sides compare the same two peer ids
-            // the transcripts bind, so exactly one exchange survives. The
-            // lower peer id keeps its initiator role; the higher one drops
-            // its own exchange and answers as responder. Peer ids are used
-            // rather than full URLs because a URL is not stable across relay
-            // failover.
-            if matches!(entry.exchange, Some((Exchange::Challenging { .. }, _)))
-            {
-                match (our_url.peer_id(), peer_url.peer_id()) {
-                    (Some(ours), Some(theirs))
-                        if ours.as_bytes() < theirs.as_bytes() =>
-                    {
-                        tracing::debug!(
-                            ?peer_url,
-                            "Ignoring a simultaneous hello initiate, we keep the initiator role"
-                        );
-                        return;
-                    }
-                    (Some(ours), Some(theirs)) if ours == theirs => {
+            match &entry.exchange {
+                // Simultaneous initiate. Both sides compare the same two peer
+                // ids the transcripts bind, so exactly one exchange survives.
+                // The lower peer id keeps its initiator role; the higher one
+                // drops its own exchange and answers as responder. Peer ids
+                // are used rather than full URLs because a URL is not stable
+                // across relay failover.
+                Some((Exchange::Challenging { our_nonce }, _)) => {
+                    if our_peer_id == their_peer_id {
                         tracing::warn!(
                             ?peer_url,
                             "Dropping a hello initiate from a peer claiming our own peer id"
                         );
                         return;
                     }
-                    (Some(_), Some(_)) => {
+                    if our_peer_id.as_bytes() < their_peer_id.as_bytes() {
+                        // We keep the initiator role. Our initiate is sent
+                        // again rather than merely not answered, because the
+                        // peer initiating at all is evidence it never saw the
+                        // first one — which is exactly what happens when we
+                        // challenged it for a space it had not joined yet.
+                        // The nonce is unchanged, so a peer that did see the
+                        // first one recognises this as the same exchange.
                         tracing::debug!(
                             ?peer_url,
-                            "Abandoning our hello exchange for a simultaneous initiate, the peer keeps the initiator role"
+                            "Answering a crossing hello initiate by repeating our own, we keep the initiator role"
                         );
-                        entry.exchange = None;
+                        Answer::Initiate(*our_nonce)
+                    } else {
+                        tracing::debug!(
+                            ?peer_url,
+                            "Abandoning our hello exchange for a crossing initiate, the peer keeps the initiator role"
+                        );
+                        let our_nonce = fresh_nonce();
+                        entry.exchange = Some((
+                            Exchange::Responding {
+                                our_nonce,
+                                their_nonce,
+                            },
+                            now,
+                        ));
+                        Answer::Respond(our_nonce)
                     }
-                    _ => {
-                        // `transcript_for_urls` above already established
-                        // that both peer ids are present, so this cannot
-                        // happen, but the tie-break must not fall through to
-                        // a state where both sides keep their exchange.
+                }
+
+                // The same initiate again, so our respond was lost. Repeat
+                // it, with the nonce we are still waiting on a confirm for.
+                Some((
+                    Exchange::Responding {
+                        our_nonce,
+                        their_nonce: pending,
+                    },
+                    _,
+                )) if *pending == their_nonce => {
+                    tracing::debug!(
+                        ?peer_url,
+                        "Repeating our hello respond for a repeated initiate"
+                    );
+                    Answer::Respond(*our_nonce)
+                }
+
+                // Anything else is a new exchange, which replaces whatever
+                // we were doing with this peer: a peer that initiates has
+                // forgotten the old exchange, so there is nothing left to
+                // finish.
+                _ => {
+                    if entry.exchange.is_none()
+                        && in_flight
+                            >= self.config.max_concurrent_exchanges as usize
+                    {
                         tracing::debug!(
                             ?peer_url,
-                            "Dropping a hello initiate that cannot be tie-broken"
+                            "Dropping a hello initiate, too many exchanges are in flight"
                         );
+                        if entry.is_idle() {
+                            state.remove(&peer_url);
+                        }
                         return;
                     }
+
+                    let our_nonce = fresh_nonce();
+                    entry.exchange = Some((
+                        Exchange::Responding {
+                            our_nonce,
+                            their_nonce,
+                        },
+                        now,
+                    ));
+                    Answer::Respond(our_nonce)
                 }
             }
-
-            if entry.exchange.is_none()
-                && in_flight >= self.config.max_concurrent_exchanges as usize
-            {
-                tracing::debug!(
-                    ?peer_url,
-                    "Dropping a hello initiate, too many exchanges are in flight"
-                );
-                if entry.is_idle() {
-                    state.remove(&peer_url);
-                }
-                return;
-            }
-
-            entry.exchange = Some((
-                Exchange::Responding {
-                    our_nonce,
-                    their_nonce,
-                },
-                now,
-            ));
-        }
-
-        // The responder proves first and discloses nothing.
-        let respond = Respond {
-            proto_ver: HELLO_PROTO_VER,
-            nonce_r: bytes::Bytes::copy_from_slice(&our_nonce),
-            proof_r: hello_proof(&self.hello_key, &transcript),
         };
-        if let Err(err) = self.send(&peer_url, HelloMsg::Respond(respond)).await
-        {
-            tracing::debug!(?err, ?peer_url, "Could not send a hello respond");
+
+        let msg = match answer {
+            Answer::Initiate(our_nonce) => HelloMsg::Initiate(Initiate {
+                proto_ver: HELLO_PROTO_VER,
+                nonce_i: bytes::Bytes::copy_from_slice(&our_nonce),
+            }),
+            // The responder proves first and discloses nothing.
+            Answer::Respond(our_nonce) => {
+                let transcript = transcript(
+                    HELLO_PROOF_TAG,
+                    &our_nonce,
+                    &their_nonce,
+                    our_peer_id,
+                    their_peer_id,
+                );
+                HelloMsg::Respond(Respond {
+                    proto_ver: HELLO_PROTO_VER,
+                    nonce_r: bytes::Bytes::copy_from_slice(&our_nonce),
+                    proof_r: hello_proof(&self.hello_key, &transcript),
+                })
+            }
+        };
+
+        if let Err(err) = self.send(&peer_url, msg).await {
+            tracing::debug!(
+                ?err,
+                ?peer_url,
+                "Could not answer a hello initiate"
+            );
             self.fail(&peer_url);
         }
     }
