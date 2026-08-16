@@ -1,5 +1,6 @@
 use kitsune2_api::*;
 use kitsune2_test_utils::enable_tracing;
+use kitsune2_test_utils::iter_check;
 use kitsune2_test_utils::space::TEST_SPACE_ID;
 use std::sync::{Arc, Mutex};
 
@@ -510,4 +511,40 @@ async fn preflight_before_other() {
 
     h1.check_preflight_before_other_messages();
     h2.check_preflight_before_other_messages();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transport_get_connected_peers() {
+    let h1 = TrackHnd::new();
+    let t1 = gen_tx(h1.clone()).await;
+    t1.register_space_handler(TEST_SPACE_ID, h1.clone());
+    let u1 = h1.url();
+
+    let h2 = TrackHnd::new();
+    let t2 = gen_tx(h2.clone()).await;
+    t2.register_space_handler(TEST_SPACE_ID, h2.clone());
+    let u2 = h2.url();
+
+    // Nothing has been sent yet, so there are no connections to report.
+    assert!(t1.get_connected_peers().await.unwrap().is_empty());
+
+    t1.send_space_notify(
+        u2.clone(),
+        TEST_SPACE_ID,
+        bytes::Bytes::from_static(b"hello"),
+    )
+    .await
+    .unwrap();
+
+    // Both ends of the connection report the other peer.
+    assert_eq!(vec![u2.clone()], t1.get_connected_peers().await.unwrap());
+    iter_check!({
+        if t2.get_connected_peers().await.unwrap() == vec![u1.clone()] {
+            break;
+        }
+    });
+
+    // And the peer is gone again once the connection is closed.
+    t1.disconnect(u2.clone(), None).await;
+    assert!(t1.get_connected_peers().await.unwrap().is_empty());
 }
