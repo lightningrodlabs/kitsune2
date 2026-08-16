@@ -325,23 +325,48 @@ impl TxSpaceHandler for TxHandlerTranslator {
             .upgrade()
             .ok_or(K2Error::other("CoreSpace has been dropped."))?;
 
-        let blocked = match core_space
-            .peer_access_state
-            .get_access_decision(peer_url.clone())?
-        {
-            Some(access) => access.decision == AccessDecision::Blocked,
-            None => {
-                // This is normal for blocked peers, but could be a bug for others. Best to log at
-                // debug level which can be accessed if needed but won't create noisy logs if a
-                // blocked peer keeps sending messages.
-                tracing::debug!(
-                    "No access decision found for peer url: {:?}",
-                    peer_url
-                );
-                true
-            }
-        };
+        // Only an explicit `Blocked` decision means blocked. A peer we have
+        // no decision about is not blocked, it is unknown, and being unknown
+        // is answered by [`Self::is_access_granted`] instead — which is what
+        // keeps unknown from being a dead state that only the access module
+        // can talk a peer out of.
+        let blocked = matches!(
+            core_space
+                .peer_access_state
+                .get_access_decision(peer_url.clone())?,
+            Some(PeerAccess {
+                decision: AccessDecision::Blocked,
+                ..
+            })
+        );
         Ok(blocked)
+    }
+
+    fn access_module_id(&self) -> String {
+        HELLO_MOD_NAME.to_string()
+    }
+
+    fn is_access_granted(&self, peer_url: &Url) -> K2Result<bool> {
+        let core_space = self
+            .1
+            .upgrade()
+            .ok_or(K2Error::other("CoreSpace has been dropped."))?;
+
+        let granted = matches!(
+            core_space
+                .peer_access_state
+                .get_access_decision(peer_url.clone())?,
+            Some(PeerAccess {
+                decision: AccessDecision::Granted,
+                ..
+            })
+        );
+        if !granted {
+            // Normal for a peer we have not met yet, and noisy if such a peer
+            // keeps sending, so this stays at debug.
+            tracing::debug!(?peer_url, "No access grant recorded for peer url",);
+        }
+        Ok(granted)
     }
 
     fn ungranted_message_dropped(&self, peer: Url) {

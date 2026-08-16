@@ -307,6 +307,10 @@ pub async fn make_test_peer_light(builder: Arc<Builder>) -> TestPeerLight {
         ) -> K2Result<bool> {
             Ok(false)
         }
+
+        fn is_access_granted(&self, _peer_url: &Url) -> K2Result<bool> {
+            Ok(true)
+        }
     }
 
     let transport = builder
