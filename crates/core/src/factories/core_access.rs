@@ -19,8 +19,21 @@ use std::time::Duration;
 /// A URL with neither decision is unknown, which is not the same as blocked:
 /// an unknown peer can still reach the access module, and one exchange later
 /// it is either granted or still unknown.
+///
+/// # Keying
+///
+/// The trait takes URLs, because URLs are what the transport hands around, but
+/// decisions are keyed internally by the [`Url::peer_id`] segment. A peer holds
+/// several URLs at once — a global relay URL plus per-space ones — and the
+/// relay half changes on failover, so a decision keyed by the full URL would be
+/// lost the moment a granted peer reappeared through another relay, and a
+/// block would be shed the same way. The peer id is the part the transport
+/// authenticates, so it is the part an access decision is about.
+///
+/// A URL with no peer id in it cannot be the subject of a decision: reading one
+/// yields no decision, and writing one records nothing.
 pub struct CorePeerAccessState {
-    decisions: Arc<RwLock<HashMap<Url, PeerAccess>>>,
+    decisions: Arc<RwLock<HashMap<String, PeerAccess>>>,
     abort_handle: tokio::task::AbortHandle,
 }
 
@@ -44,7 +57,8 @@ impl CorePeerAccessState {
         blocks: DynBlocks,
         peer_store: &kitsune2_api::DynPeerStore,
     ) -> K2Result<Self> {
-        let decisions = Arc::new(RwLock::new(HashMap::new()));
+        let decisions: Arc<RwLock<HashMap<String, PeerAccess>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         peer_store.register_peer_update_listener(Arc::new({
             let known_peers = Arc::downgrade(&known_peers);
             let blocks = Arc::downgrade(&blocks);
@@ -75,6 +89,11 @@ impl CorePeerAccessState {
                         }
                     };
 
+                    let Some(peer_id) = peer_url.peer_id().map(str::to_string) else {
+                        tracing::debug!(?peer_url, "Not making an access decision, the peer url has no peer id");
+                        return;
+                    };
+
                     tracing::debug!("Making access decision for peer URL: {:?}", peer_url);
 
                     // Use known_peers (not peer_store) so we find blocked agents too.
@@ -95,13 +114,19 @@ impl CorePeerAccessState {
                     };
 
                     if agents_by_url.is_empty() {
-                        tracing::debug!("No agents found for url, clearing any decision: {:?}", peer_url);
-
-                        // Any existing decision can be removed
-                        decisions
-                            .write()
-                            .expect("poisoned")
-                            .remove(&peer_url);
+                        // Only a block this listener made is cleared here. A
+                        // grant is the access module's state and does not
+                        // follow agent info presence around: this listener
+                        // fires for whichever URL an updated info carries, and
+                        // a peer that has just moved relays has no agents at
+                        // its new URL yet.
+                        let mut decisions = decisions.write().expect("poisoned");
+                        if let Some(existing) = decisions.get(&peer_id)
+                            && existing.decision == AccessDecision::Blocked
+                        {
+                            tracing::debug!("No agents found for url, clearing the block on it: {:?}", peer_url);
+                            decisions.remove(&peer_id);
+                        }
                     } else {
                         let any_blocked = match blocks.is_any_blocked(agents_by_url).await {
                             Ok(any_blocked) => any_blocked,
@@ -127,20 +152,20 @@ impl CorePeerAccessState {
                         if any_blocked {
                             tracing::debug!("Access decision for peer URL {peer_url:?}: Blocked");
                             decisions.insert(
-                                peer_url,
+                                peer_id,
                                 PeerAccess {
                                     decision: AccessDecision::Blocked,
                                     decided_at: Timestamp::now(),
                                 },
                             );
-                        } else if let Some(existing) = decisions.get(&peer_url)
+                        } else if let Some(existing) = decisions.get(&peer_id)
                             && existing.decision == AccessDecision::Blocked
                         {
                             // The block no longer applies. Removing it puts
                             // the peer back to unknown rather than granted,
                             // so it has to prove itself again.
                             tracing::debug!("Clearing the block on peer URL {peer_url:?}, no agent at it is blocked any more");
-                            decisions.remove(&peer_url);
+                            decisions.remove(&peer_id);
                         }
                     }
                 })
@@ -187,11 +212,17 @@ impl PeerAccessState for CorePeerAccessState {
         &self,
         peer_url: Url,
     ) -> K2Result<Option<PeerAccess>> {
+        // A URL with no peer id names no peer to have decided anything about,
+        // so it is unknown rather than an error.
+        let Some(peer_id) = peer_url.peer_id() else {
+            return Ok(None);
+        };
+
         let decision = self
             .decisions
             .read()
             .expect("poisoned")
-            .get(&peer_url)
+            .get(peer_id)
             .cloned();
         Ok(decision)
     }
@@ -201,13 +232,21 @@ impl PeerAccessState for CorePeerAccessState {
         peer_url: Url,
         access: PeerAccess,
     ) -> K2Result<()> {
+        let Some(peer_id) = peer_url.peer_id() else {
+            tracing::debug!(
+                ?peer_url,
+                "Not recording an access decision, the peer url has no peer id"
+            );
+            return Ok(());
+        };
+
         let mut decisions = self.decisions.write().expect("poison");
 
         // Blocks always win. An explicit `Blocked` entry must not be
         // overwritten by a later `Granted`, which is what the access module
         // records after a successful proof-of-knowledge exchange.
         if access.decision == AccessDecision::Granted
-            && let Some(existing) = decisions.get(&peer_url)
+            && let Some(existing) = decisions.get(peer_id)
             && existing.decision == AccessDecision::Blocked
         {
             tracing::debug!(
@@ -217,12 +256,15 @@ impl PeerAccessState for CorePeerAccessState {
             return Ok(());
         }
 
-        decisions.insert(peer_url, access);
+        decisions.insert(peer_id.to_string(), access);
         Ok(())
     }
 
     fn remove_access_decision(&self, peer_url: Url) -> K2Result<()> {
-        self.decisions.write().expect("poison").remove(&peer_url);
+        let Some(peer_id) = peer_url.peer_id() else {
+            return Ok(());
+        };
+        self.decisions.write().expect("poison").remove(peer_id);
         Ok(())
     }
 }
@@ -570,6 +612,88 @@ mod test {
             .unwrap();
         let decision = access_state.get_access_decision(url).unwrap();
         assert_eq!(decision.map(|d| d.decision), Some(AccessDecision::Granted));
+    }
+
+    /// A peer that reappears through another relay keeps the grant it earned.
+    /// This is the whole point of keying decisions by peer id: the relay half
+    /// of a URL changes on failover, and a peer holds several URLs at once.
+    #[tokio::test]
+    async fn a_grant_follows_the_peer_id_across_urls() {
+        let via_relay_1 = Url::from_str("ws://relay-1.test:80/peer").unwrap();
+        let via_relay_2 = Url::from_str("ws://relay-2.test:80/peer").unwrap();
+        let access_state = empty_access_state();
+
+        access_state
+            .set_access_decision(via_relay_1.clone(), granted())
+            .unwrap();
+
+        let decision = access_state.get_access_decision(via_relay_2).unwrap();
+        assert_eq!(
+            decision.map(|d| d.decision),
+            Some(AccessDecision::Granted),
+            "a grant must survive the peer moving relays"
+        );
+    }
+
+    /// Sharing a relay host is not sharing an identity, so a grant must not
+    /// leak from one peer id to another at the same host.
+    #[tokio::test]
+    async fn a_grant_does_not_leak_to_another_peer_id() {
+        let granted_peer = Url::from_str("ws://relay.test:80/peer-a").unwrap();
+        let other_peer = Url::from_str("ws://relay.test:80/peer-b").unwrap();
+        let access_state = empty_access_state();
+
+        access_state
+            .set_access_decision(granted_peer, granted())
+            .unwrap();
+
+        assert_eq!(
+            access_state.get_access_decision(other_peer).unwrap(),
+            None,
+            "a grant must not extend to another peer at the same relay"
+        );
+    }
+
+    /// A block follows the peer id across relays too, so a blocked peer cannot
+    /// shed the block by reconnecting through another relay.
+    #[tokio::test]
+    async fn a_block_follows_the_peer_id_across_urls() {
+        let via_relay_1 = Url::from_str("ws://relay-1.test:80/peer").unwrap();
+        let via_relay_2 = Url::from_str("ws://relay-2.test:80/peer").unwrap();
+        let access_state = empty_access_state();
+
+        access_state
+            .set_access_decision(via_relay_1, blocked())
+            .unwrap();
+
+        // Including against a grant offered at the other URL: blocks win
+        // wherever the peer turns up.
+        access_state
+            .set_access_decision(via_relay_2.clone(), granted())
+            .unwrap();
+
+        let decision = access_state.get_access_decision(via_relay_2).unwrap();
+        assert_eq!(decision.map(|d| d.decision), Some(AccessDecision::Blocked));
+    }
+
+    /// A URL with no peer id names no peer, so it carries no decision and
+    /// writing one records nothing rather than failing.
+    #[tokio::test]
+    async fn a_url_without_a_peer_id_carries_no_decision() {
+        let server_url = Url::from_str("ws://relay.test:80").unwrap();
+        assert!(server_url.peer_id().is_none());
+        let access_state = empty_access_state();
+
+        access_state
+            .set_access_decision(server_url.clone(), granted())
+            .unwrap();
+        assert_eq!(
+            access_state
+                .get_access_decision(server_url.clone())
+                .unwrap(),
+            None
+        );
+        access_state.remove_access_decision(server_url).unwrap();
     }
 
     fn empty_access_state() -> CorePeerAccessState {
