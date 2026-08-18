@@ -76,12 +76,22 @@
 //!
 //! An exchange is initiated when a local agent joins the space (toward every
 //! URL in the peer store and every connected peer), when a new URL appears in
-//! the peer store with no access decision, and when an incoming message from
-//! an ungranted peer is dropped by the enforcement path. The last of those is
-//! what heals asymmetric access state: grant state is in-memory and
-//! restart-lossy, so without it a peer that forgot us would stay silently
-//! deaf until the next join. Explicitly blocked peers never trigger an
-//! exchange, because the denylist always wins.
+//! the peer store with no access decision, when an incoming message from an
+//! ungranted peer is dropped by the enforcement path, and when gossip reports
+//! that an initiation found nobody to gossip with.
+//!
+//! The third of those is what heals *asymmetric* access state: grant state is
+//! in-memory and restart-lossy, so without it a peer that forgot us would stay
+//! silently deaf until the next join. The fourth heals the *symmetric* case,
+//! where both sides forgot at once and so neither sends anything to be
+//! dropped: the other three triggers are all event-driven, and in symmetric
+//! loss no event occurs. Gossip's initiate timer is the only thing still
+//! firing, and "nobody to gossip with" is exactly the symptom, so gossip
+//! reports it through [`CoreHello::sweep`] rather than this module running a
+//! timer of its own.
+//!
+//! Explicitly blocked peers never trigger an exchange, because the denylist
+//! always wins.
 //!
 //! Rate limiting is the per-URL exchange state itself: at most one exchange
 //! is in flight per URL, at most
@@ -316,6 +326,7 @@ impl CoreHello {
             transport: Arc::downgrade(&transport),
             current_url,
             state: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(None),
         });
 
         transport.register_module_handler(
@@ -373,6 +384,29 @@ impl CoreHello {
         });
     }
 
+    /// Challenge every peer we know of that is neither granted nor waiting
+    /// out a retry backoff.
+    ///
+    /// This is the gossip-starvation trigger: gossip calls it when an
+    /// initiation finds nobody to gossip with, which is the only signal left
+    /// when two peers have symmetrically forgotten each other's grant. Because
+    /// gossip's timer fires on its own schedule and forced initiations can
+    /// come rather faster than that, the sweep is gated behind a minimum
+    /// interval of its own, on top of the per-URL backoff that already applies
+    /// to each individual exchange.
+    pub fn sweep(&self) {
+        let inner = self.inner.clone();
+        tokio::task::spawn(async move {
+            if !inner.claim_sweep() {
+                tracing::debug!(
+                    "Not sweeping for hello exchanges, one was done recently"
+                );
+                return;
+            }
+            inner.sweep().await;
+        });
+    }
+
     /// Notify the module that an incoming message from an ungranted peer was
     /// dropped.
     ///
@@ -384,6 +418,16 @@ impl CoreHello {
         });
     }
 }
+
+/// The shortest gap between two sweeps driven by [`CoreHello::sweep`].
+///
+/// Gossip force-initiates rather more often than its configured initiate
+/// interval, so the starvation trigger needs a floor of its own. It is a
+/// constant rather than a config knob because it only has to be short enough
+/// to heal a forgotten pair promptly and long enough not to walk the peer
+/// store in a loop; the per-URL backoff is what actually paces retries toward
+/// any one peer.
+const SWEEP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Tick often enough that a timed-out exchange is noticed promptly, without
 /// waking up pointlessly on a long timeout.
@@ -409,6 +453,7 @@ struct HelloInner {
     transport: WeakDynTransport,
     current_url: CurrentUrlFn,
     state: Mutex<HashMap<Url, PeerExchange>>,
+    last_sweep: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for HelloInner {
@@ -420,9 +465,30 @@ impl std::fmt::Debug for HelloInner {
 }
 
 impl HelloInner {
+    /// Take the right to sweep, if enough time has passed since the last one.
+    ///
+    /// Claiming marks the interval as consumed, so two starvation reports
+    /// arriving at once produce one sweep rather than two.
+    fn claim_sweep(&self) -> bool {
+        let mut last_sweep = self.last_sweep.lock().expect("poison");
+        match *last_sweep {
+            Some(at) if at.elapsed() < SWEEP_MIN_INTERVAL => false,
+            _ => {
+                *last_sweep = Some(Instant::now());
+                true
+            }
+        }
+    }
+
     /// Challenge every URL we know of: everyone in the peer store, and
     /// everyone we hold a connection to.
+    ///
+    /// [`HelloInner::initiate`] is what decides whom that actually reaches: a
+    /// peer that is already granted, blocked, mid-exchange or waiting out a
+    /// backoff is skipped there.
     async fn sweep(&self) {
+        *self.last_sweep.lock().expect("poison") = Some(Instant::now());
+
         let mut urls = std::collections::HashSet::new();
 
         match self.peer_store.get_all().await {
