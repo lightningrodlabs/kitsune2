@@ -43,15 +43,63 @@ pub type DynGossip = Arc<dyn Gossip>;
 /// This exists because gossip's initiate timer is the only thing still firing
 /// when a pair of peers has symmetrically forgotten that it granted the other
 /// access. Every other trigger the access module has is event-driven — a local
-/// agent joining, a new agent info arriving, an incoming message being dropped
-/// — and in symmetric grant loss no such event ever occurs, so the peers would
-/// stay mutually silent forever. "Nobody to gossip with" is exactly the
-/// symptom, so gossip reports it and the access module decides what to do
-/// about it.
+/// agent joining, a new agent info arriving, a message being dropped — and in
+/// symmetric grant loss no such event ever occurs, so the peers would stay
+/// mutually silent forever. "Nobody to gossip with" is exactly the symptom, so
+/// gossip reports it and the access module decides what to do about it.
 ///
 /// Implementations must be cheap and must not block: this is called from the
 /// initiate loop.
 pub type GossipNoTargetNotify = Arc<dyn Fn() + 'static + Send + Sync>;
+
+/// Whether a peer may be gossiped with at all.
+///
+/// Gossip decides *when* to talk to a peer; whether it is allowed to is an
+/// access decision, which belongs to the space. A peer that is not eligible is
+/// no more a gossip target than one that has no URL: sending to it would only
+/// be dropped by the transport's access gate, while gossip would sit on a
+/// round that was never delivered and initiate with nobody else until that
+/// round timed out.
+///
+/// Called from target selection, so it must be cheap, synchronous and
+/// non-blocking.
+pub type GossipPeerEligible = Arc<dyn Fn(&Url) -> bool + 'static + Send + Sync>;
+
+/// The hooks a space hands to the gossip module it owns.
+///
+/// These are bundled rather than passed one by one so that the conversation
+/// between a space and its gossip module can grow without growing
+/// [`GossipFactory::create`]'s parameter list every time.
+#[derive(Clone)]
+pub struct GossipSpaceHooks {
+    /// Whether a peer may be gossiped with. See [`GossipPeerEligible`].
+    pub peer_eligible: GossipPeerEligible,
+
+    /// Called when an initiation finds nobody eligible to gossip with. See
+    /// [`GossipNoTargetNotify`].
+    pub on_no_target: GossipNoTargetNotify,
+}
+
+impl std::fmt::Debug for GossipSpaceHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GossipSpaceHooks").finish()
+    }
+}
+
+impl GossipSpaceHooks {
+    /// Hooks that permit every peer and report nothing.
+    ///
+    /// This is for stub gossip modules and for tests that are about gossip
+    /// itself rather than about access. A space that enforces access must
+    /// supply its own `peer_eligible`, or gossip will keep choosing peers the
+    /// transport then refuses to send to.
+    pub fn permissive() -> Self {
+        Self {
+            peer_eligible: Arc::new(|_| true),
+            on_no_target: Arc::new(|| {}),
+        }
+    }
+}
 
 /// A factory for constructing [Gossip] instances.
 pub trait GossipFactory: 'static + Send + Sync + std::fmt::Debug {
@@ -64,8 +112,8 @@ pub trait GossipFactory: 'static + Send + Sync + std::fmt::Debug {
 
     /// Construct a gossip instance.
     ///
-    /// `on_no_target` is called whenever an initiation finds nobody to gossip
-    /// with; see [`GossipNoTargetNotify`].
+    /// `hooks` is how the owning space answers whom gossip may talk to, and
+    /// hears about it when there is nobody; see [`GossipSpaceHooks`].
     #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
@@ -77,7 +125,7 @@ pub trait GossipFactory: 'static + Send + Sync + std::fmt::Debug {
         op_store: DynOpStore,
         transport: DynTransport,
         fetch: DynFetch,
-        on_no_target: GossipNoTargetNotify,
+        hooks: GossipSpaceHooks,
     ) -> BoxFut<'static, K2Result<DynGossip>>;
 }
 
