@@ -49,7 +49,7 @@ impl GossipFactory for K2GossipFactory {
         op_store: DynOpStore,
         transport: DynTransport,
         fetch: DynFetch,
-        on_no_target: GossipNoTargetNotify,
+        hooks: GossipSpaceHooks,
     ) -> BoxFut<'static, K2Result<DynGossip>> {
         Box::pin(async move {
             let config =
@@ -65,7 +65,7 @@ impl GossipFactory for K2GossipFactory {
                 transport,
                 fetch,
                 builder.verifier.clone(),
-                on_no_target,
+                hooks,
             )
             .await?;
 
@@ -138,7 +138,7 @@ impl K2Gossip {
         transport: DynTransport,
         fetch: DynFetch,
         agent_verifier: DynVerifier,
-        on_no_target: GossipNoTargetNotify,
+        hooks: GossipSpaceHooks,
     ) -> K2Result<Arc<K2Gossip>> {
         // Initialise the DHT model from the op store.
         //
@@ -179,7 +179,7 @@ impl K2Gossip {
         let (force_initiate, initiate_task) = spawn_initiate_task(
             gossip.config.clone(),
             Arc::downgrade(&gossip),
-            on_no_target,
+            hooks,
         );
         gossip
             ._initiate_task
@@ -822,6 +822,25 @@ mod test {
             .insert(junk_agents.clone())
             .await
             .unwrap();
+
+        // Gossip only picks targets the space has granted access to, and
+        // these peers are gone, so they can never earn a grant by proving
+        // themselves. Grant them by hand: this test is about gossip working
+        // through unavailable peers, not about how a peer comes to be
+        // allowed in.
+        for agent in junk_agents.iter().chain(std::iter::once(&agent_2)) {
+            harness_1
+                .space
+                .peer_access_state()
+                .set_access_decision(
+                    agent.url.clone().unwrap(),
+                    PeerAccess {
+                        decision: AccessDecision::Granted,
+                        decided_at: Timestamp::now(),
+                    },
+                )
+                .unwrap();
+        }
 
         iter_check!(1000, 20, {
             let mut all_tried = true;

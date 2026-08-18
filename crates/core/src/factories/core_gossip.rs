@@ -37,7 +37,7 @@ impl GossipFactory for CoreGossipStubFactory {
         _op_store: DynOpStore,
         _transport: DynTransport,
         _fetch: DynFetch,
-        _on_no_target: GossipNoTargetNotify,
+        _hooks: GossipSpaceHooks,
     ) -> BoxFut<'static, K2Result<DynGossip>> {
         let out: DynGossip = Arc::new(CoreGossipStub);
         Box::pin(async move { Ok(out) })

@@ -195,15 +195,33 @@ impl SpaceFactory for CoreSpaceFactory {
                     op_store.clone(),
                     tx.clone(),
                     fetch.clone(),
-                    {
-                        let hello_cell = hello_cell.clone();
-                        Arc::new(move || {
-                            if let Some(hello) =
-                                hello_cell.get().and_then(Weak::upgrade)
-                            {
-                                hello.sweep();
-                            }
-                        })
+                    GossipSpaceHooks {
+                        // Gossip may only talk to peers this space has
+                        // granted. Unknown and blocked are both ineligible:
+                        // the transport would refuse to send to either.
+                        peer_eligible: {
+                            let peer_access_state = peer_access_state.clone();
+                            Arc::new(move |peer_url: &Url| {
+                                matches!(
+                                    peer_access_state
+                                        .get_access_decision(peer_url.clone()),
+                                    Ok(Some(PeerAccess {
+                                        decision: AccessDecision::Granted,
+                                        ..
+                                    }))
+                                )
+                            })
+                        },
+                        on_no_target: {
+                            let hello_cell = hello_cell.clone();
+                            Arc::new(move || {
+                                if let Some(hello) =
+                                    hello_cell.get().and_then(Weak::upgrade)
+                                {
+                                    hello.sweep();
+                                }
+                            })
+                        },
                     },
                 )
                 .await?;
