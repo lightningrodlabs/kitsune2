@@ -471,13 +471,20 @@ fn check_peer_access(
     );
     count(message_blocks_map);
 
-    // Tell the space that a peer it does not know is talking to us, so its
-    // access module can challenge that peer. Only for incoming messages: the
-    // sender of an incoming message is authenticated by the connection, so
-    // challenges flow back to the actual sender and nowhere else.
-    if !outgoing {
-        space_handler.ungranted_message_dropped(peer_url.clone());
-    }
+    // Tell the space that a message to or from a peer it has no grant for was
+    // dropped, so its access module can challenge that peer.
+    //
+    // Both directions, because both are dead ends otherwise. An incoming
+    // message means the peer still believes in a grant we have lost; an
+    // outgoing one means we still believe in a grant the peer has lost, and
+    // dropping it silently would leave gossip, fetch and publish talking into
+    // a void with nothing to heal the pair. Neither direction can be steered
+    // by an attacker: an incoming sender is authenticated by the connection,
+    // and an outgoing destination is one we chose ourselves.
+    //
+    // Never for an explicitly blocked peer, which returns above: the denylist
+    // is not something a peer can be challenged out of.
+    space_handler.ungranted_message_dropped(peer_url.clone());
 
     Ok(AccessOutcome::Ungranted)
 }
@@ -1084,13 +1091,16 @@ pub trait TxSpaceHandler: TxBaseHandler {
         Ok(false)
     }
 
-    /// Notification that an incoming message from an ungranted peer was
+    /// Notification that a message to or from a peer with no access grant was
     /// dropped.
     ///
     /// This is fire-and-forget. It gives the access module the chance to
     /// initiate an exchange toward that peer, so that an asymmetric access
-    /// state (we forgot the peer, the peer still thinks it is granted) heals
-    /// on the first dropped message rather than staying silently deaf.
+    /// state heals on the first dropped message rather than staying silently
+    /// deaf. It fires in both directions, since either side may be the one
+    /// that forgot: an incoming drop means the peer still believes in a grant
+    /// we have lost, an outgoing drop means we still believe in one the peer
+    /// has lost.
     ///
     /// This must not be called for peers that are explicitly blocked; the
     /// denylist always wins.
