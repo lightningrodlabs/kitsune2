@@ -77,6 +77,7 @@ pub struct Builder {
     /// The [`KnownPeersFactory`] to be used for creating [`KnownPeers`]
     /// instances.
     pub known_peers: DynKnownPeersFactory,
+
     /// The [`SpaceSecretFactory`] to be used for creating [`SpaceSecret`]
     /// instances, which provide the key material the access module proves
     /// knowledge of.
