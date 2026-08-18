@@ -4,7 +4,7 @@ use crate::factories::core_access::CorePeerAccessState;
 use crate::factories::core_hello::{CoreHello, CoreHelloModConfig};
 use crate::get_all_remote_agents;
 use kitsune2_api::*;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 /// CoreSpace configuration types.
 mod config {
@@ -176,6 +176,14 @@ impl SpaceFactory for CoreSpaceFactory {
                     tx.clone(),
                 )
                 .await?;
+            // Gossip is built before the access module but has to be able to
+            // reach it, because "nobody to gossip with" is how the access
+            // module hears that this node and a peer have symmetrically
+            // forgotten each other's grant. The cell is filled in as soon as
+            // the access module exists; a starvation report that somehow
+            // arrives before then simply finds it empty.
+            let hello_cell: Arc<OnceLock<Weak<CoreHello>>> =
+                Arc::new(OnceLock::new());
             let gossip = builder
                 .gossip
                 .create(
@@ -187,6 +195,16 @@ impl SpaceFactory for CoreSpaceFactory {
                     op_store.clone(),
                     tx.clone(),
                     fetch.clone(),
+                    {
+                        let hello_cell = hello_cell.clone();
+                        Arc::new(move || {
+                            if let Some(hello) =
+                                hello_cell.get().and_then(Weak::upgrade)
+                            {
+                                hello.sweep();
+                            }
+                        })
+                    },
                 )
                 .await?;
 
@@ -217,6 +235,7 @@ impl SpaceFactory for CoreSpaceFactory {
                 },
             )
             .await?;
+            let _ = hello_cell.set(Arc::downgrade(&hello));
 
             let out: DynSpace = Arc::new_cyclic(move |this| {
                 let current_url = tx.register_space_handler(
