@@ -33,14 +33,24 @@ pub struct PeerAccess {
 }
 
 /// Trait for tracking access state of peers.
+///
+/// Peers are named by URL here because URLs are what the transport passes
+/// around, but a decision is *about* the peer, not about the URL it was
+/// reached at. Implementations must therefore key decisions by the
+/// [`Url::peer_id`] segment, which is the part the transport authenticates and
+/// the part that survives a relay failover, and not by the full URL. A URL
+/// with no peer id in it names no peer, so it can carry no decision.
 pub trait PeerAccessState: 'static + Send + Sync + std::fmt::Debug {
-    /// Get a previously made access decision for a peer at the given URL.
+    /// Get a previously made access decision for the peer at the given URL.
+    ///
+    /// Returns `Ok(None)` for a URL with no peer id, which is unknown rather
+    /// than an error.
     fn get_access_decision(
         &self,
         peer_url: Url,
     ) -> K2Result<Option<PeerAccess>>;
 
-    /// Record an access decision for a peer at the given URL.
+    /// Record an access decision for the peer at the given URL.
     ///
     /// This is how the access module records the outcome of a successful
     /// proof-of-knowledge exchange.
@@ -49,17 +59,19 @@ pub trait PeerAccessState: 'static + Send + Sync + std::fmt::Debug {
     /// entry as final with respect to this method: a denylist entry always
     /// wins, so a later [`AccessDecision::Granted`] passed to this method must
     /// not overwrite it.
+    ///
+    /// A URL with no peer id records nothing, and is not an error.
     fn set_access_decision(
         &self,
         peer_url: Url,
         access: PeerAccess,
     ) -> K2Result<()>;
 
-    /// Remove any access decision for a peer at the given URL.
+    /// Remove any access decision for the peer at the given URL.
     ///
     /// After this call the peer is "unknown" again, which is the primitive
     /// behind decision pruning. It is not an error to remove a decision that
-    /// does not exist.
+    /// does not exist, or to pass a URL with no peer id.
     fn remove_access_decision(&self, peer_url: Url) -> K2Result<()>;
 }
 
