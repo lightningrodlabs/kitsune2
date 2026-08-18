@@ -783,7 +783,30 @@ async fn sending_to_an_ungranted_peer_is_dropped_locally() {
     h2.check_no_mod("test");
     h2.check_no_notify();
 
-    // An outgoing drop must not trigger a challenge: only the authenticated
-    // sender of an incoming message does that.
+    // And the outgoing drop told the space too, so the access module can
+    // challenge the peer we have lost the grant for. Without this, a module
+    // that keeps sending to a peer we have forgotten would talk into a void
+    // with nothing to heal the pair.
+    h1.check_ungranted_dropped(&u2).unwrap();
+}
+
+/// Sending to a peer we have explicitly blocked drops the message without
+/// challenging it. Blocking is not a state a peer may be talked out of, and
+/// the challenge is what would talk it out.
+#[tokio::test(flavor = "multi_thread")]
+async fn sending_to_a_blocked_peer_does_not_trigger_a_challenge() {
+    enable_tracing();
+
+    let (h1, t1, h2, _t2) = access_pair().await;
+    let u2 = h2.url();
+    // The *sender* considers the destination blocked.
+    h1.block();
+
+    send_all(&t1, &u2).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h2.check_no_mod(HELLO_MOD_NAME);
+    h2.check_no_mod("test");
+    h2.check_no_notify();
     h1.check_no_ungranted_dropped();
 }
