@@ -554,14 +554,14 @@ impl GossipFactory for StarvingGossipFactory {
         _op_store: DynOpStore,
         _transport: DynTransport,
         _fetch: DynFetch,
-        on_no_target: GossipNoTargetNotify,
+        hooks: GossipSpaceHooks,
     ) -> BoxFut<'static, K2Result<DynGossip>> {
         Box::pin(async move {
             let task = tokio::task::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(200))
                         .await;
-                    on_no_target();
+                    (hooks.on_no_target)();
                 }
             })
             .abort_handle();
