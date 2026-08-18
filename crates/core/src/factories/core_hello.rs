@@ -22,12 +22,12 @@
 //! ```
 //!
 //! Proofs are `HMAC-SHA256(k_hello, T)`, where `k_hello` is the space's
-//! `"k2-hello-v1"` derived key and `T` is a transcript that binds both nonces
-//! and both authenticated peer ids:
+//! `"k2-hello-v1"` derived key and `T` is a transcript that binds the protocol
+//! version, both nonces and both authenticated peer ids:
 //!
 //! ```text
-//! T_r = HELLO_PROOF_TAG || nonce_r || nonce_i || peer_id_r || peer_id_i
-//! T_i = HELLO_PROOF_TAG || nonce_i || nonce_r || peer_id_i || peer_id_r
+//! T_r = HELLO_PROOF_TAG || proto_ver || nonce_r || nonce_i || peer_id_r || peer_id_i
+//! T_i = HELLO_PROOF_TAG || proto_ver || nonce_i || nonce_r || peer_id_i || peer_id_r
 //! ```
 //!
 //! (See [`transcript`] for the exact framing; the variable-length fields are
@@ -36,6 +36,10 @@
 //! Protocol rules:
 //!
 //! - Nonces are fresh 32-byte values per exchange, never reused.
+//! - The protocol version bound into a proof is the one the *prover*
+//!   advertised, and the version a verifier binds is the one it read out of
+//!   the message it is verifying. A version rewritten in flight therefore
+//!   makes the proofs disagree instead of silently downgrading the exchange.
 //! - Self-nonce-first ordering makes the two proofs distinct bytes, which
 //!   prevents an attacker from reflecting a proof back at its author.
 //! - Proofs bind both **peer ids** — the [`Url::peer_id`](kitsune2_api::Url::peer_id)
@@ -212,6 +216,11 @@ enum Exchange {
 
         /// The nonce the peer sent.
         their_nonce: HelloNonce,
+
+        /// The protocol version the peer advertised in its `Initiate`. The
+        /// peer's proof binds it, so it has to be remembered until the
+        /// `Confirm` that carries that proof arrives.
+        their_proto_ver: u32,
     },
 
     /// We verified a `Respond` and sent a `Confirm`, and are waiting for the
@@ -703,6 +712,7 @@ impl HelloInner {
                             Exchange::Responding {
                                 our_nonce,
                                 their_nonce,
+                                their_proto_ver: init.proto_ver,
                             },
                             now,
                         ));
@@ -716,6 +726,7 @@ impl HelloInner {
                     Exchange::Responding {
                         our_nonce,
                         their_nonce: pending,
+                        ..
                     },
                     _,
                 )) if *pending == their_nonce => {
@@ -750,6 +761,7 @@ impl HelloInner {
                         Exchange::Responding {
                             our_nonce,
                             their_nonce,
+                            their_proto_ver: init.proto_ver,
                         },
                         now,
                     ));
@@ -765,8 +777,11 @@ impl HelloInner {
             }),
             // The responder proves first and discloses nothing.
             Answer::Respond(our_nonce) => {
+                // The proof binds the version this respond advertises, so a
+                // version rewritten in flight breaks verification.
                 let transcript = transcript(
                     HELLO_PROOF_TAG,
+                    HELLO_PROTO_VER,
                     &our_nonce,
                     &their_nonce,
                     our_peer_id,
@@ -831,8 +846,12 @@ impl HelloInner {
         // first. The peer id comes from the URL the transport gave us, which
         // is the identity the connection authenticated, so a proof relayed
         // from an honest member does not verify here.
+        // The version comes out of the message being verified rather than
+        // from the constant, so that the peer's proof only verifies over the
+        // version it actually advertised.
         let their_transcript = match transcript_for_urls(
             HELLO_PROOF_TAG,
+            respond.proto_ver,
             &their_nonce,
             &our_nonce,
             &peer_url,
@@ -867,8 +886,11 @@ impl HelloInner {
         // Our own proof is over our own transcript: our nonce and peer id
         // first, which is what makes the two proofs of one exchange different
         // bytes and stops either being reflected back at its author.
+        // Our own proof binds the version our `Initiate` advertised, which is
+        // always the one we speak.
         let our_transcript = match transcript_for_urls(
             HELLO_PROOF_TAG,
+            HELLO_PROTO_VER,
             &our_nonce,
             &their_nonce,
             &our_url,
@@ -912,16 +934,17 @@ impl HelloInner {
         our_url: Url,
         confirm: Confirm,
     ) {
-        let (our_nonce, their_nonce) = {
+        let (our_nonce, their_nonce, their_proto_ver) = {
             let state = self.state.lock().expect("poison");
             match state.get(&peer_url).and_then(|e| e.exchange.as_ref()) {
                 Some((
                     Exchange::Responding {
                         our_nonce,
                         their_nonce,
+                        their_proto_ver,
                     },
                     _,
-                )) => (*our_nonce, *their_nonce),
+                )) => (*our_nonce, *their_nonce, *their_proto_ver),
                 _ => {
                     tracing::debug!(
                         ?peer_url,
@@ -932,8 +955,11 @@ impl HelloInner {
             }
         };
 
+        // `Confirm` carries no version of its own: the initiator's proof binds
+        // the version its `Initiate` advertised, remembered when we answered.
         let their_transcript = match transcript_for_urls(
             HELLO_PROOF_TAG,
+            their_proto_ver,
             &their_nonce,
             &our_nonce,
             &peer_url,
