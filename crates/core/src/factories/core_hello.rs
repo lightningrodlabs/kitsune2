@@ -76,13 +76,18 @@
 //!
 //! An exchange is initiated when a local agent joins the space (toward every
 //! URL in the peer store and every connected peer), when a new URL appears in
-//! the peer store with no access decision, when an incoming message from an
+//! the peer store with no access decision, when a message to or from an
 //! ungranted peer is dropped by the enforcement path, and when gossip reports
 //! that an initiation found nobody to gossip with.
 //!
 //! The third of those is what heals *asymmetric* access state: grant state is
 //! in-memory and restart-lossy, so without it a peer that forgot us would stay
-//! silently deaf until the next join. The fourth heals the *symmetric* case,
+//! silently deaf until the next join. It fires in both directions — the spec
+//! describes only the incoming one, and the outgoing direction extends it,
+//! because a module that keeps sending to a peer whose grant we have lost is
+//! just as much of a dead end as one that keeps receiving. Which side forgot
+//! decides which direction sees the drop. The fourth heals the *symmetric*
+//! case,
 //! where both sides forgot at once and so neither sends anything to be
 //! dropped: the other three triggers are all event-driven, and in symmetric
 //! loss no event occurs. Gossip's initiate timer is the only thing still
