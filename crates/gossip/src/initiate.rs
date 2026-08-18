@@ -12,6 +12,7 @@ use tokio::task::AbortHandle;
 pub fn spawn_initiate_task(
     config: Arc<K2GossipConfig>,
     gossip: Weak<K2Gossip>,
+    on_no_target: GossipNoTargetNotify,
 ) -> (tokio::sync::mpsc::Sender<()>, AbortHandle) {
     tracing::info!("Starting initiate task");
 
@@ -142,7 +143,14 @@ pub fn spawn_initiate_task(
                     }
                 }
                 Ok(None) => {
-                    // Nobody to gossip with, expect `select_next_target` to have logged a reason
+                    // Nobody to gossip with, expect `select_next_target` to have logged a reason.
+                    //
+                    // This timer is the only thing still firing when a pair of
+                    // peers has symmetrically forgotten each other's access
+                    // grant, so report the starvation. It covers the
+                    // force-initiate path too: forcing only skips the delay
+                    // ahead of this same selection.
+                    on_no_target();
                 }
                 Err(e) => {
                     tracing::error!("Error selecting target: {:?}", e);
@@ -390,6 +398,116 @@ mod tests {
 
             (local_agent, agent_info_signed)
         }
+    }
+
+    /// Gossip reports a starved initiation, which is the only event still
+    /// firing when two peers have symmetrically forgotten each other's access
+    /// grant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notify_when_there_is_no_target() {
+        enable_tracing();
+
+        #[derive(Debug)]
+        struct NoopTxHandler;
+        impl kitsune2_api::TxBaseHandler for NoopTxHandler {}
+        impl kitsune2_api::TxHandler for NoopTxHandler {}
+
+        let builder =
+            Arc::new(default_test_builder().with_default_config().unwrap());
+        let transport = builder
+            .transport
+            .create(builder.clone(), Arc::new(NoopTxHandler))
+            .await
+            .unwrap();
+        let report = builder
+            .report
+            .create(builder.clone(), transport.clone())
+            .await
+            .unwrap();
+        let blocks = builder
+            .blocks
+            .create(builder.clone(), TEST_SPACE_ID)
+            .await
+            .unwrap();
+        let known_peers = builder
+            .known_peers
+            .create(builder.clone(), TEST_SPACE_ID)
+            .await
+            .unwrap();
+        let peer_store = builder
+            .peer_store
+            .create(builder.clone(), TEST_SPACE_ID, blocks, known_peers)
+            .await
+            .unwrap();
+        let local_agent_store = builder
+            .local_agent_store
+            .create(builder.clone())
+            .await
+            .unwrap();
+        let peer_meta_store = builder
+            .peer_meta_store
+            .create(builder.clone(), TEST_SPACE_ID)
+            .await
+            .unwrap();
+        let op_store = builder
+            .op_store
+            .create(builder.clone(), TEST_SPACE_ID)
+            .await
+            .unwrap();
+        let fetch = builder
+            .fetch
+            .create(
+                builder.clone(),
+                TEST_SPACE_ID,
+                report,
+                op_store.clone(),
+                peer_meta_store.clone(),
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+
+        // A local agent, so the initiate loop gets as far as looking for a
+        // target, but nobody at all to be that target.
+        local_agent_store
+            .add(Arc::new(TestLocalAgent::default()))
+            .await
+            .unwrap();
+
+        let starved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _gossip = crate::gossip::K2Gossip::create(
+            K2GossipConfig {
+                initiate_interval_ms: 5,
+                min_initiate_interval_ms: 5,
+                initial_initiate_interval_ms: 5,
+                initiate_jitter_ms: 0,
+                ..Default::default()
+            },
+            TEST_SPACE_ID,
+            peer_store,
+            local_agent_store,
+            peer_meta_store,
+            op_store,
+            transport,
+            fetch,
+            builder.verifier.clone(),
+            {
+                let starved = starved.clone();
+                Arc::new(move || {
+                    starved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while starved.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("gossip never reported having no target");
     }
 
     #[tokio::test]
