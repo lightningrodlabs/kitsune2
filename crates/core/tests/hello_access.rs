@@ -9,8 +9,8 @@
 use bytes::Bytes;
 use kitsune2_api::*;
 use kitsune2_core::factories::{
-    CoreSpaceSecretConfig, CoreSpaceSecretModConfig, MemBootstrapConfig,
-    MemBootstrapModConfig, encode_space_secret,
+    CoreGossipStub, CoreSpaceSecretConfig, CoreSpaceSecretModConfig,
+    MemBootstrapConfig, MemBootstrapModConfig, encode_space_secret,
 };
 use kitsune2_core::{Ed25519LocalAgent, default_test_builder};
 use kitsune2_test_utils::{enable_tracing, iter_check};
@@ -63,9 +63,18 @@ impl Node {
     /// A node whose bootstrap is shared with nobody, so it can only learn
     /// about peers from a hello exchange or from this test.
     async fn new() -> Self {
+        Self::new_with_gossip(None).await
+    }
+
+    /// The same, with a gossip module of the test's choosing.
+    async fn new_with_gossip(gossip: Option<DynGossipFactory>) -> Self {
         static ID: AtomicU64 = AtomicU64::new(0);
 
-        let builder = default_test_builder().with_default_config().unwrap();
+        let mut builder = default_test_builder();
+        if let Some(gossip) = gossip {
+            builder.gossip = gossip;
+        }
+        let builder = builder.with_default_config().unwrap();
         builder
             .config
             .set_module_config(&MemBootstrapModConfig {
@@ -513,5 +522,139 @@ async fn a_dropped_message_from_a_forgotten_peer_heals_the_pair() {
     assert!(
         !is_granted(&b1, &url2),
         "a blocked peer must not be re-granted by sending us messages"
+    );
+}
+
+/// A gossip module that reports starvation on a short timer, standing in for
+/// the real one.
+///
+/// `kitsune2_core` cannot depend on the gossip crate, and gossip's own
+/// initiate interval is far too long for a test, so this reports "nobody to
+/// gossip with" every 200ms. That is the only thing it does differently from
+/// the stub gossip module the other tests here run with.
+#[derive(Debug)]
+struct StarvingGossipFactory;
+
+impl GossipFactory for StarvingGossipFactory {
+    fn default_config(&self, _config: &mut Config) -> K2Result<()> {
+        Ok(())
+    }
+
+    fn validate_config(&self, _config: &Config) -> K2Result<()> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        _builder: Arc<Builder>,
+        _space_id: SpaceId,
+        _peer_store: DynPeerStore,
+        _local_agent_store: DynLocalAgentStore,
+        _peer_meta_store: DynPeerMetaStore,
+        _op_store: DynOpStore,
+        _transport: DynTransport,
+        _fetch: DynFetch,
+        on_no_target: GossipNoTargetNotify,
+    ) -> BoxFut<'static, K2Result<DynGossip>> {
+        Box::pin(async move {
+            let task = tokio::task::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(200))
+                        .await;
+                    on_no_target();
+                }
+            })
+            .abort_handle();
+            let out: DynGossip = Arc::new(StarvingGossip(task));
+            Ok(out)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct StarvingGossip(tokio::task::AbortHandle);
+
+impl Drop for StarvingGossip {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Gossip for StarvingGossip {
+    fn inform_ops_stored(
+        &self,
+        ops: Vec<StoredOp>,
+    ) -> BoxFut<'_, K2Result<()>> {
+        CoreGossipStub.inform_ops_stored(ops)
+    }
+
+    fn get_state_summary(
+        &self,
+        request: GossipStateSummaryRequest,
+    ) -> BoxFut<'_, K2Result<GossipStateSummary>> {
+        CoreGossipStub.get_state_summary(request)
+    }
+}
+
+/// Symmetric grant loss: both sides forget at once, so no dropped message can
+/// heal the pair — neither side sends anything to be dropped. Every other
+/// trigger is event-driven and no event happens, which leaves gossip's timer
+/// as the only thing still firing. Gossip finding nobody to talk to is the
+/// signal, and the access module sweeps on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn symmetric_grant_loss_is_healed_by_gossip_starvation() {
+    enable_tracing();
+
+    // The pair under test, whose gossip reports starvation.
+    let starving_1 =
+        Node::new_with_gossip(Some(Arc::new(StarvingGossipFactory))).await;
+    let starving_2 =
+        Node::new_with_gossip(Some(Arc::new(StarvingGossipFactory))).await;
+    let (s1, agent_s1) = starving_1.join(SPACE_A, None).await;
+    let (s2, agent_s2) = starving_2.join(SPACE_A, None).await;
+    let s1_url = url_of(&s1).await;
+    let s2_url = url_of(&s2).await;
+    introduce_and_await_grants(&s1, &agent_s1, &s2, &agent_s2).await;
+
+    // A control pair, identical but for gossip never reporting anything. It
+    // is what shows the healing below is the starvation trigger's doing and
+    // not some other trigger firing on its own.
+    let quiet_1 = Node::new().await;
+    let quiet_2 = Node::new().await;
+    let (q1, agent_q1) = quiet_1.join(SPACE_B, None).await;
+    let (q2, agent_q2) = quiet_2.join(SPACE_B, None).await;
+    let q1_url = url_of(&q1).await;
+    let q2_url = url_of(&q2).await;
+    introduce_and_await_grants(&q1, &agent_q1, &q2, &agent_q2).await;
+
+    // Both sides of both pairs forget, as an hourly prune on each would make
+    // them. No application traffic follows: nothing is sent from here on.
+    for (space, peer_url) in [
+        (&s1, &s2_url),
+        (&s2, &s1_url),
+        (&q1, &q2_url),
+        (&q2, &q1_url),
+    ] {
+        space
+            .peer_access_state()
+            .remove_access_decision(peer_url.clone())
+            .unwrap();
+    }
+    assert!(!is_granted(&s1, &s2_url) && !is_granted(&s2, &s1_url));
+    assert!(!is_granted(&q1, &q2_url) && !is_granted(&q2, &q1_url));
+
+    // The starving pair re-grants, driven only by gossip having nobody to
+    // gossip with. The budget covers the access module's own sweep interval.
+    iter_check!(30_000, 50, {
+        if is_granted(&s1, &s2_url) && is_granted(&s2, &s1_url) {
+            break;
+        }
+    });
+
+    // The control pair is still where it was left, so nothing else in the
+    // node re-grants a forgotten peer on its own.
+    assert!(
+        !is_granted(&q1, &q2_url) && !is_granted(&q2, &q1_url),
+        "a pair whose gossip reports nothing must stay forgotten"
     );
 }

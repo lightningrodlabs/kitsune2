@@ -49,6 +49,7 @@ impl GossipFactory for K2GossipFactory {
         op_store: DynOpStore,
         transport: DynTransport,
         fetch: DynFetch,
+        on_no_target: GossipNoTargetNotify,
     ) -> BoxFut<'static, K2Result<DynGossip>> {
         Box::pin(async move {
             let config =
@@ -64,6 +65,7 @@ impl GossipFactory for K2GossipFactory {
                 transport,
                 fetch,
                 builder.verifier.clone(),
+                on_no_target,
             )
             .await?;
 
@@ -136,6 +138,7 @@ impl K2Gossip {
         transport: DynTransport,
         fetch: DynFetch,
         agent_verifier: DynVerifier,
+        on_no_target: GossipNoTargetNotify,
     ) -> K2Result<Arc<K2Gossip>> {
         // Initialise the DHT model from the op store.
         //
@@ -173,8 +176,11 @@ impl K2Gossip {
             gossip.clone(),
         );
 
-        let (force_initiate, initiate_task) =
-            spawn_initiate_task(gossip.config.clone(), Arc::downgrade(&gossip));
+        let (force_initiate, initiate_task) = spawn_initiate_task(
+            gossip.config.clone(),
+            Arc::downgrade(&gossip),
+            on_no_target,
+        );
         gossip
             ._initiate_task
             .set(Some(DropAbortHandle {

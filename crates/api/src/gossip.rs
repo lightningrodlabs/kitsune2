@@ -37,6 +37,22 @@ pub trait Gossip: 'static + Send + Sync + std::fmt::Debug {
 /// Trait-object [Gossip].
 pub type DynGossip = Arc<dyn Gossip>;
 
+/// Notified each time a gossip initiation finds no peer eligible to gossip
+/// with.
+///
+/// This exists because gossip's initiate timer is the only thing still firing
+/// when a pair of peers has symmetrically forgotten that it granted the other
+/// access. Every other trigger the access module has is event-driven — a local
+/// agent joining, a new agent info arriving, an incoming message being dropped
+/// — and in symmetric grant loss no such event ever occurs, so the peers would
+/// stay mutually silent forever. "Nobody to gossip with" is exactly the
+/// symptom, so gossip reports it and the access module decides what to do
+/// about it.
+///
+/// Implementations must be cheap and must not block: this is called from the
+/// initiate loop.
+pub type GossipNoTargetNotify = Arc<dyn Fn() + 'static + Send + Sync>;
+
 /// A factory for constructing [Gossip] instances.
 pub trait GossipFactory: 'static + Send + Sync + std::fmt::Debug {
     /// Help the builder construct a default config from the chosen
@@ -47,6 +63,9 @@ pub trait GossipFactory: 'static + Send + Sync + std::fmt::Debug {
     fn validate_config(&self, config: &config::Config) -> K2Result<()>;
 
     /// Construct a gossip instance.
+    ///
+    /// `on_no_target` is called whenever an initiation finds nobody to gossip
+    /// with; see [`GossipNoTargetNotify`].
     #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
@@ -58,6 +77,7 @@ pub trait GossipFactory: 'static + Send + Sync + std::fmt::Debug {
         op_store: DynOpStore,
         transport: DynTransport,
         fetch: DynFetch,
+        on_no_target: GossipNoTargetNotify,
     ) -> BoxFut<'static, K2Result<DynGossip>>;
 }
 

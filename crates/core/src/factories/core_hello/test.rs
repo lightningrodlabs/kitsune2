@@ -759,6 +759,65 @@ async fn the_join_trigger_challenges_stored_and_connected_peers() {
     assert!(challenged.contains(&connected_url));
 }
 
+/// The gossip-starvation sweep challenges the peers we know of, but not more
+/// often than [`SWEEP_MIN_INTERVAL`]: gossip force-initiates faster than its
+/// configured interval, so the trigger needs a floor of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_starvation_sweep_is_rate_limited() {
+    let a = Node::new(URL_A).await;
+    let peer_url = Url::from_str(URL_B).unwrap();
+    a.transport.connected.lock().unwrap().push(peer_url.clone());
+
+    // Gossip reports starvation. The peer is unknown, so it gets challenged.
+    a.hello.sweep();
+    let challenged = await_challenge(&a, &peer_url).await;
+    assert!(challenged, "an unknown peer must be challenged");
+
+    // Abandon the exchange without penalty, so only the sweep interval is
+    // left to stop the next report from challenging again.
+    a.hello.inner.forget(&peer_url);
+
+    a.hello.sweep();
+    let challenged = await_challenge(&a, &peer_url).await;
+    assert!(!challenged, "a second sweep must wait out the min interval");
+}
+
+/// A peer whose exchange failed is not re-challenged by a sweep until its own
+/// backoff has elapsed, however often gossip reports starvation.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_starvation_sweep_respects_the_per_url_backoff() {
+    let a = Node::new(URL_A).await;
+    let peer_url = Url::from_str(URL_B).unwrap();
+    a.transport.connected.lock().unwrap().push(peer_url.clone());
+
+    // An exchange with this peer has failed, so it is waiting out a backoff.
+    a.hello.inner.initiate(peer_url.clone(), false).await;
+    a.transport.take();
+    a.hello.inner.fail(&peer_url);
+
+    // Wind the sweep interval back so only the backoff is in the way.
+    *a.hello.inner.last_sweep.lock().expect("poison") = None;
+
+    a.hello.sweep();
+    let challenged = await_challenge(&a, &peer_url).await;
+    assert!(
+        !challenged,
+        "a peer waiting out its backoff must not be challenged by a sweep"
+    );
+}
+
+/// Wait briefly for a sweep to challenge a URL. Sweeps are spawned, so a
+/// negative result has to be given time to be wrong.
+async fn await_challenge(node: &Node, peer_url: &Url) -> bool {
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if node.transport.take().iter().any(|(url, _)| url == peer_url) {
+            return true;
+        }
+    }
+    false
+}
+
 /// A transport that cannot list its connections is tolerated: the sweep still
 /// challenges the peers it found in the peer store.
 #[tokio::test(flavor = "multi_thread")]
