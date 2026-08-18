@@ -360,6 +360,58 @@ async fn a_reflected_proof_is_rejected() {
     assert!(b.transport.take().is_empty(), "nothing was disclosed");
 }
 
+/// A proof computed over one protocol version does not verify against
+/// another, which is what keeps a rewritten version field from silently
+/// downgrading an exchange.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proof_over_another_proto_ver_is_rejected() {
+    for (proof_ver, granted) in [(HELLO_PROTO_VER, true), (99, false)] {
+        let a = Node::new(URL_A).await;
+        let b = Node::new(URL_B).await;
+
+        // A challenges B, and we answer in B's place.
+        a.hello.inner.initiate(b.url.clone(), false).await;
+        let (_, initiate) = a.transport.take_one();
+        let HelloMsg::Initiate(initiate) = initiate else {
+            panic!("expected an initiate");
+        };
+        let nonce_i = to_nonce(&initiate.nonce_i).unwrap();
+        let nonce_r = [0x11; HELLO_NONCE_LEN];
+
+        // The answer advertises the version A speaks, but its proof is
+        // computed over `proof_ver` — which is what a version field rewritten
+        // in flight looks like to the verifier.
+        let proof_r = hello_proof(
+            &b.hello.inner.hello_key,
+            &transcript_for_urls(
+                HELLO_PROOF_TAG,
+                proof_ver,
+                &nonce_r,
+                &nonce_i,
+                &b.url,
+                &a.url,
+            )
+            .unwrap(),
+        );
+        a.deliver(
+            &b.url,
+            HelloMsg::Respond(Respond {
+                proto_ver: HELLO_PROTO_VER,
+                nonce_r: Bytes::copy_from_slice(&nonce_r),
+                proof_r,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            a.is_granted(&b.url),
+            granted,
+            "a proof over version {proof_ver} must {} verify against version {HELLO_PROTO_VER}",
+            if granted { "" } else { "not" }
+        );
+    }
+}
+
 /// A proof obtained from an honest member is useless over a connection
 /// authenticated as somebody else, because the proof binds both peer ids and
 /// the verifier takes the peer id from the connection.

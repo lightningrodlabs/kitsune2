@@ -22,22 +22,32 @@ pub type HelloNonce = [u8; HELLO_NONCE_LEN];
 /// The transcript is:
 ///
 /// ```text
-/// len(tag) || tag || nonce_self || nonce_peer
+/// len(tag) || tag || proto_ver || nonce_self || nonce_peer
 ///          || len(peer_id_self) || peer_id_self
 ///          || len(peer_id_peer) || peer_id_peer
 /// ```
 ///
-/// where each `len` is a big-endian `u32` byte count.
+/// where each `len` is a big-endian `u32` byte count and `proto_ver` is a
+/// big-endian `u32`.
 ///
 /// # Framing
 ///
-/// The nonces are fixed length ([`HELLO_NONCE_LEN`], enforced by the parameter
-/// types) so they are written bare. Every variable-length field — the tag and
-/// both peer ids — is length-prefixed. Peer ids are variable-length strings
-/// whose shape differs across transports, so bare-concatenating them would be
-/// ambiguous: `("ab", "c")` and `("a", "bc")` would produce identical
-/// transcripts, and a peer could pick an id that makes its transcript collide
-/// with another pair's.
+/// The protocol version and the nonces are fixed length (four bytes, and
+/// [`HELLO_NONCE_LEN`] enforced by the parameter types) so they are written
+/// bare. Every variable-length field — the tag and both peer ids — is
+/// length-prefixed. Peer ids are variable-length strings whose shape differs
+/// across transports, so bare-concatenating them would be ambiguous:
+/// `("ab", "c")` and `("a", "bc")` would produce identical transcripts, and a
+/// peer could pick an id that makes its transcript collide with another
+/// pair's.
+///
+/// # Protocol version
+///
+/// `proto_ver` is bound so that version negotiation cannot be downgraded by
+/// an attacker rewriting the version field of a message in flight: each side
+/// binds the version *it advertised*, so a rewrite makes the proofs disagree.
+/// The prover therefore passes the version it put in its own message and the
+/// verifier passes the version it read out of the message it is verifying.
 ///
 /// # Roles
 ///
@@ -50,6 +60,7 @@ pub type HelloNonce = [u8; HELLO_NONCE_LEN];
 /// URL, never full URLs; see [`transcript_for_urls`].
 pub fn transcript(
     tag: &str,
+    proto_ver: u32,
     nonce_self: &HelloNonce,
     nonce_peer: &HelloNonce,
     peer_id_self: &str,
@@ -57,6 +68,7 @@ pub fn transcript(
 ) -> Bytes {
     let mut out = BytesMut::with_capacity(
         4 + tag.len()
+            + 4
             + 2 * HELLO_NONCE_LEN
             + 4
             + peer_id_self.len()
@@ -65,6 +77,7 @@ pub fn transcript(
     );
 
     put_len_prefixed(&mut out, tag.as_bytes());
+    out.put_u32(proto_ver);
     out.put_slice(nonce_self);
     out.put_slice(nonce_peer);
     put_len_prefixed(&mut out, peer_id_self.as_bytes());
@@ -93,6 +106,7 @@ pub fn transcript(
 /// rather than proceed with an unbound transcript if one does.
 pub fn transcript_for_urls(
     tag: &str,
+    proto_ver: u32,
     nonce_self: &HelloNonce,
     nonce_peer: &HelloNonce,
     url_self: &Url,
@@ -111,6 +125,7 @@ pub fn transcript_for_urls(
 
     Ok(transcript(
         tag,
+        proto_ver,
         nonce_self,
         nonce_peer,
         peer_id_self,
@@ -129,11 +144,26 @@ mod test {
 
     const NONCE_A: HelloNonce = [0xaa; HELLO_NONCE_LEN];
     const NONCE_B: HelloNonce = [0xbb; HELLO_NONCE_LEN];
+    const VER: u32 = 1;
 
     #[test]
     fn transcript_is_deterministic() {
-        let a = transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "self", "peer");
-        let b = transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "self", "peer");
+        let a = transcript(
+            HELLO_PROOF_TAG,
+            VER,
+            &NONCE_A,
+            &NONCE_B,
+            "self",
+            "peer",
+        );
+        let b = transcript(
+            HELLO_PROOF_TAG,
+            VER,
+            &NONCE_A,
+            &NONCE_B,
+            "self",
+            "peer",
+        );
         assert_eq!(a, b);
     }
 
@@ -142,27 +172,65 @@ mod test {
         // The two sides of one exchange: each puts its own nonce and its own
         // peer id first. The resulting transcripts must differ, otherwise a
         // proof could be reflected back at its author.
-        let mine =
-            transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "alice", "bob");
-        let theirs =
-            transcript(HELLO_PROOF_TAG, &NONCE_B, &NONCE_A, "bob", "alice");
+        let mine = transcript(
+            HELLO_PROOF_TAG,
+            VER,
+            &NONCE_A,
+            &NONCE_B,
+            "alice",
+            "bob",
+        );
+        let theirs = transcript(
+            HELLO_PROOF_TAG,
+            VER,
+            &NONCE_B,
+            &NONCE_A,
+            "bob",
+            "alice",
+        );
         assert_ne!(mine, theirs);
     }
 
     #[test]
     fn transcript_differs_on_each_input() {
-        let base =
-            transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "alice", "bob");
+        let base = transcript(
+            HELLO_PROOF_TAG,
+            VER,
+            &NONCE_A,
+            &NONCE_B,
+            "alice",
+            "bob",
+        );
 
         assert_ne!(
             base,
-            transcript("k2-hello-proof-v2", &NONCE_A, &NONCE_B, "alice", "bob"),
+            transcript(
+                "k2-hello-proof-v2",
+                VER,
+                &NONCE_A,
+                &NONCE_B,
+                "alice",
+                "bob"
+            ),
             "tag must be bound"
         );
         assert_ne!(
             base,
             transcript(
                 HELLO_PROOF_TAG,
+                VER + 1,
+                &NONCE_A,
+                &NONCE_B,
+                "alice",
+                "bob"
+            ),
+            "protocol version must be bound"
+        );
+        assert_ne!(
+            base,
+            transcript(
+                HELLO_PROOF_TAG,
+                VER,
                 &[0xcc; HELLO_NONCE_LEN],
                 &NONCE_B,
                 "alice",
@@ -174,6 +242,7 @@ mod test {
             base,
             transcript(
                 HELLO_PROOF_TAG,
+                VER,
                 &NONCE_A,
                 &[0xcc; HELLO_NONCE_LEN],
                 "alice",
@@ -183,12 +252,26 @@ mod test {
         );
         assert_ne!(
             base,
-            transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "carol", "bob"),
+            transcript(
+                HELLO_PROOF_TAG,
+                VER,
+                &NONCE_A,
+                &NONCE_B,
+                "carol",
+                "bob"
+            ),
             "self peer id must be bound"
         );
         assert_ne!(
             base,
-            transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "alice", "carol"),
+            transcript(
+                HELLO_PROOF_TAG,
+                VER,
+                &NONCE_A,
+                &NONCE_B,
+                "alice",
+                "carol"
+            ),
             "peer peer id must be bound"
         );
     }
@@ -198,22 +281,23 @@ mod test {
         // Bare concatenation would make these two pairs produce identical
         // transcripts, letting a peer choose an id that collides with a
         // different pair.
-        let a = transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "ab", "c");
-        let b = transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "a", "bc");
+        let a = transcript(HELLO_PROOF_TAG, VER, &NONCE_A, &NONCE_B, "ab", "c");
+        let b = transcript(HELLO_PROOF_TAG, VER, &NONCE_A, &NONCE_B, "a", "bc");
         assert_ne!(a, b);
 
         // Same for the boundary between the tag and the rest.
-        let c = transcript("tagx", &NONCE_A, &NONCE_B, "a", "b");
-        let d = transcript("tag", &NONCE_A, &NONCE_B, "xa", "b");
+        let c = transcript("tagx", VER, &NONCE_A, &NONCE_B, "a", "b");
+        let d = transcript("tag", VER, &NONCE_A, &NONCE_B, "xa", "b");
         assert_ne!(c, d);
     }
 
     #[test]
     fn transcript_layout_is_as_documented() {
-        let t = transcript("t", &NONCE_A, &NONCE_B, "ab", "cde");
+        let t = transcript("t", 0x01020304, &NONCE_A, &NONCE_B, "ab", "cde");
         let mut expected = Vec::new();
         expected.extend_from_slice(&1u32.to_be_bytes());
         expected.extend_from_slice(b"t");
+        expected.extend_from_slice(&0x01020304u32.to_be_bytes());
         expected.extend_from_slice(&NONCE_A);
         expected.extend_from_slice(&NONCE_B);
         expected.extend_from_slice(&2u32.to_be_bytes());
@@ -234,6 +318,7 @@ mod test {
 
         let a = transcript_for_urls(
             HELLO_PROOF_TAG,
+            VER,
             &NONCE_A,
             &NONCE_B,
             &mine,
@@ -242,6 +327,7 @@ mod test {
         .unwrap();
         let b = transcript_for_urls(
             HELLO_PROOF_TAG,
+            VER,
             &NONCE_A,
             &NONCE_B,
             &mine_other_relay,
@@ -252,8 +338,41 @@ mod test {
 
         assert_eq!(
             a,
-            transcript(HELLO_PROOF_TAG, &NONCE_A, &NONCE_B, "alice", "bob")
+            transcript(
+                HELLO_PROOF_TAG,
+                VER,
+                &NONCE_A,
+                &NONCE_B,
+                "alice",
+                "bob"
+            )
         );
+    }
+
+    #[test]
+    fn transcript_for_urls_binds_the_protocol_version() {
+        let mine = Url::from_str("ws://relay.test:80/alice").unwrap();
+        let theirs = Url::from_str("ws://relay.test:80/bob").unwrap();
+
+        let a = transcript_for_urls(
+            HELLO_PROOF_TAG,
+            1,
+            &NONCE_A,
+            &NONCE_B,
+            &mine,
+            &theirs,
+        )
+        .unwrap();
+        let b = transcript_for_urls(
+            HELLO_PROOF_TAG,
+            2,
+            &NONCE_A,
+            &NONCE_B,
+            &mine,
+            &theirs,
+        )
+        .unwrap();
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -265,6 +384,7 @@ mod test {
         assert!(
             transcript_for_urls(
                 HELLO_PROOF_TAG,
+                VER,
                 &NONCE_A,
                 &NONCE_B,
                 &server_url,
@@ -276,6 +396,7 @@ mod test {
         assert!(
             transcript_for_urls(
                 HELLO_PROOF_TAG,
+                VER,
                 &NONCE_A,
                 &NONCE_B,
                 &peer_url,
