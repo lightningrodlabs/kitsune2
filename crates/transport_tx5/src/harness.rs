@@ -152,6 +152,10 @@ pub struct MockTxHandler {
     #[allow(clippy::type_complexity)]
     pub url_blocked:
         Arc<dyn Fn(&Url) -> K2Result<bool> + 'static + Send + Sync>,
+    /// Mock function to implement the [`TxSpaceHandler::is_access_granted()`] method.
+    #[allow(clippy::type_complexity)]
+    pub access_granted:
+        Arc<dyn Fn(&Url) -> K2Result<bool> + 'static + Send + Sync>,
 }
 
 impl std::fmt::Debug for MockTxHandler {
@@ -172,6 +176,7 @@ impl Default for MockTxHandler {
             set_unresp: Arc::new(|_, _| Ok(())),
             recv_mod_msg: Arc::new(|_, _, _, _| Ok(())),
             url_blocked: Arc::new(|_| Ok(false)),
+            access_granted: Arc::new(|_| Ok(true)),
         }
     }
 }
@@ -228,6 +233,10 @@ impl TxSpaceHandler for MockTxHandler {
 
     fn is_any_agent_at_url_blocked(&self, peer_url: &Url) -> K2Result<bool> {
         (self.url_blocked)(peer_url)
+    }
+
+    fn is_access_granted(&self, peer_url: &Url) -> K2Result<bool> {
+        (self.access_granted)(peer_url)
     }
 }
 
