@@ -1462,14 +1462,20 @@ async fn outgoing_notify_messages_to_blocked_peers_are_dropped() {
         .await
         .unwrap();
 
-    // Verify that Alice has blocked the message
+    // Verify that Alice has blocked the message. This is a lower bound rather
+    // than an exact total: a blocked peer is refused everything, so any other
+    // traffic the node aims at it in the meantime is dropped and counted too.
+    // The count observed here is remembered so that the check further down can
+    // still assert the counter went up again.
+    let mut blocked_outgoing = 0;
     iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
             && let Some(c) = space_blocks.get(&TEST_SPACE_ID)
-            && c.outgoing == 1
+            && c.outgoing >= 1
         {
+            blocked_outgoing = c.outgoing;
             break;
         }
     });
@@ -1518,13 +1524,17 @@ async fn outgoing_notify_messages_to_blocked_peers_are_dropped() {
         .await
         .unwrap();
 
-    // Verify that Alice's outgoing block count increased to 2.
+    // Verify that Alice's outgoing block count increased again. The
+    // comparison is against the count observed above rather than against a
+    // fixed total, because a blocked peer is refused everything: any other
+    // traffic the node aims at it in the meantime — the agent info publish
+    // that the second join broadcasts, say — is dropped and counted too.
     iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
             && let Some(c) = space_blocks.get(&TEST_SPACE_ID)
-            && c.outgoing == 2
+            && c.outgoing > blocked_outgoing
         {
             break;
         }
@@ -1629,14 +1639,20 @@ async fn outgoing_module_messages_to_blocked_peers_are_dropped() {
         .await
         .unwrap();
 
-    // Verify that Alice has blocked the message
+    // Verify that Alice has blocked the message. This is a lower bound rather
+    // than an exact total: a blocked peer is refused everything, so any other
+    // traffic the node aims at it in the meantime is dropped and counted too.
+    // The count observed here is remembered so that the check further down can
+    // still assert the counter went up again.
+    let mut blocked_outgoing = 0;
     iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
             && let Some(c) = space_blocks.get(&TEST_SPACE_ID)
-            && c.outgoing == 1
+            && c.outgoing >= 1
         {
+            blocked_outgoing = c.outgoing;
             break;
         }
     });
@@ -1686,13 +1702,17 @@ async fn outgoing_module_messages_to_blocked_peers_are_dropped() {
         .await
         .unwrap();
 
-    // Verify that Alice's outgoing block count increased to 2.
+    // Verify that Alice's outgoing block count increased again. The
+    // comparison is against the count observed above rather than against a
+    // fixed total, because a blocked peer is refused everything: any other
+    // traffic the node aims at it in the meantime — the agent info publish
+    // that the second join broadcasts, say — is dropped and counted too.
     iter_check!(5000, {
         let net_stats = transport_alice.dump_network_stats().await.unwrap();
         if let Some(space_blocks) =
             net_stats.blocked_message_counts.get(&peer_url_bob)
             && let Some(c) = space_blocks.get(&TEST_SPACE_ID)
-            && c.outgoing == 2
+            && c.outgoing > blocked_outgoing
         {
             break;
         }
