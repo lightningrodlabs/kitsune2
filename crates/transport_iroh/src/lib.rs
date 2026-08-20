@@ -829,11 +829,24 @@ impl IrohTransport {
 
     /// Choose which of our own URLs to advertise in a preflight to `peer_url`.
     ///
-    /// If the peer is on one of our per-space relays, return our URL on
-    /// that relay. If the peer is on our global relay, return our global
-    /// URL. If the peer is on an unknown relay, return `None` — the
-    /// preflight must fail rather than silently falling back to the wrong
-    /// relay.
+    /// We prefer to introduce ourselves on the relay the peer is already on:
+    /// first a per-space relay we share with it, then our global relay. If the
+    /// peer is on a relay we know nothing about, we fall back to our global
+    /// URL rather than refusing to speak.
+    ///
+    /// That fallback is not a compromise, it is the ordinary cross-relay case.
+    /// Iroh dials a peer through the relay that *peer* advertises, so what we
+    /// put in a preflight is the address we want to be reached back on — our
+    /// own home relay — and it is no less reachable for the peer being homed
+    /// somewhere else. Refusing instead makes any relay heterogeneity fatal
+    /// and permanent: the preflight fails in both directions and repeats
+    /// forever. And heterogeneity is normal. Nodes home onto whichever member
+    /// of a relay fleet is nearest, fall back to a public relay when
+    /// registration with the configured one fails, and drift apart as
+    /// configuration is rolled out.
+    ///
+    /// `None` therefore means only one thing: we have no URL of our own yet,
+    /// so there is nothing we could truthfully advertise.
     pub(crate) fn own_url_for_preflight(
         peer_url: &Url,
         space_relays: &HashMap<SpaceId, (RelayUrl, Option<Url>)>,
@@ -841,17 +854,24 @@ impl IrohTransport {
     ) -> Option<Url> {
         let peer_relay = match relay_url_from_peer_url(peer_url) {
             Ok(r) => r,
-            Err(_) => {
-                warn!(%peer_url, "Cannot extract relay from peer URL, failing preflight");
-                return None;
+            Err(err) => {
+                // Not fatal any more: we cannot prefer a relay we cannot
+                // read, but our global URL is still a good address to be
+                // reached back on.
+                debug!(
+                    ?err,
+                    %peer_url,
+                    "Cannot extract relay from peer URL, advertising our global URL"
+                );
+                return global_url.clone();
             }
         };
 
         for (relay_url, our_url) in space_relays.values() {
-            if *relay_url == peer_relay
+            if relays_match(relay_url, &peer_relay)
                 && let Some(url) = our_url
             {
-                info!(
+                debug!(
                     %peer_url,
                     own_url = %url,
                     "Using per-space URL for preflight"
@@ -860,19 +880,30 @@ impl IrohTransport {
             }
         }
 
-        if let Some(global) = global_url
-            && let Ok(our_relay) = relay_url_from_peer_url(global)
-            && our_relay == peer_relay
-        {
-            return Some(global.clone());
+        let Some(global) = global_url else {
+            warn!(
+                %peer_url,
+                %peer_relay,
+                "No url of our own yet, cannot preflight"
+            );
+            return None;
+        };
+
+        // Whether or not the peer shares our global relay, this is the
+        // address we want it to reach us on.
+        if !matches!(
+            relay_url_from_peer_url(global),
+            Ok(our_relay) if relays_match(&our_relay, &peer_relay)
+        ) {
+            debug!(
+                %peer_url,
+                %peer_relay,
+                own_url = %global,
+                "Peer is on another relay, advertising our global URL"
+            );
         }
 
-        warn!(
-            %peer_url,
-            %peer_relay,
-            "Peer is on unknown relay, failing preflight"
-        );
-        None
+        Some(global.clone())
     }
 
     /// Creates a new connection and its associated context for a peer.
