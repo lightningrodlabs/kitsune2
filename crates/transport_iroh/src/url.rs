@@ -52,6 +52,41 @@ pub(super) fn canonicalize_relay_url(
     Url::from_str(canonical_relay_url)
 }
 
+/// Whether two relay URLs name the same relay.
+///
+/// This is deliberately not `==`. The same relay reaches us written both ways
+/// round: a fully qualified host name may carry the DNS root's trailing dot
+/// (`relay.example.com.`) or not, depending on what resolved it and when, and
+/// the two spellings have been seen alternating between sessions of the same
+/// node. String equality would then decide that a peer sharing our relay is on
+/// a foreign one, so the comparison normalizes the host before making that
+/// call. Host comparison is also case insensitive, which URL parsing already
+/// guarantees for these schemes but which costs nothing to state.
+///
+/// Everything else — scheme, port and path — must match exactly, since those
+/// really do select different relays.
+pub(super) fn relays_match(a: &RelayUrl, b: &RelayUrl) -> bool {
+    fn normalized_host(url: &RelayUrl) -> Option<&str> {
+        url.host_str()
+            .map(|host| host.strip_suffix('.').unwrap_or(host))
+    }
+
+    if a.scheme() != b.scheme()
+        || a.port_or_known_default() != b.port_or_known_default()
+        || a.path() != b.path()
+    {
+        return false;
+    }
+
+    match (normalized_host(a), normalized_host(b)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        // Neither has a host to normalize, so there is nothing left that could
+        // differ beyond what was compared above.
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Extract the relay URL from a kitsune2 peer URL.
 ///
 /// Everything before the last path segment is the relay URL.
