@@ -156,6 +156,20 @@ impl TxImp for MemTransport {
         })
     }
 
+    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async move {
+            let (result_sender, result_receiver) =
+                tokio::sync::oneshot::channel();
+            match self.cmd_send.send(Cmd::Dial(peer, result_sender)) {
+                Err(_) => Err(K2Error::other("Connection Closed")),
+                Ok(_) => match result_receiver.await {
+                    Ok(result) => result,
+                    Err(_) => Err(K2Error::other("Connection Closed")),
+                },
+            }
+        })
+    }
+
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
         Box::pin(async move {
             let (result_sender, result_receiver) =
@@ -310,6 +324,10 @@ enum Cmd {
     /// to report back the result of handling the message by the receiving
     /// peer.
     Send(Url, bytes::Bytes, ResultSender),
+
+    /// Open a connection to a peer, or reuse the open one, and report once
+    /// its preflight exchange has completed.
+    Dial(Url, ResultSender),
 
     /// Report back the peer urls of all connections currently in the pool.
     GetConnectedPeers(tokio::sync::oneshot::Sender<Vec<Url>>),
@@ -483,6 +501,27 @@ async fn cmd_task(
             }
             Cmd::GetConnectedPeers(result_sender) => {
                 let _ = result_sender.send(con_pool.keys().cloned().collect());
+            }
+            Cmd::Dial(url, result_sender) => {
+                match get_transport_instances().connect(
+                    &cmd_send,
+                    &mut con_pool,
+                    &url,
+                    &this_url,
+                ) {
+                    Some(ready_data_send) => {
+                        tokio::task::spawn(async move {
+                            let result =
+                                ready_data_send.wait_ready().await.map(|_| ());
+                            let _ = result_sender.send(result);
+                        });
+                    }
+                    None => {
+                        let _ = result_sender.send(Err(K2Error::other(
+                            format!("no mem transport listening at {url}"),
+                        )));
+                    }
+                }
             }
             Cmd::Send(url, data, result_sender) => {
                 if let Some(ready_data_send) = get_transport_instances()

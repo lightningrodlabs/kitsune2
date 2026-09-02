@@ -96,6 +96,10 @@ impl TxImp for StubTxImp {
         Box::pin(async { unreachable!("StubTxImp::send should not be called") })
     }
 
+    fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async { unreachable!("StubTxImp::dial should not be called") })
+    }
+
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
