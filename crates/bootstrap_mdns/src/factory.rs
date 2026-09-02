@@ -1,13 +1,13 @@
-//! [`BootstrapFactory`] backed by mDNS LAN discovery + a lightweight
-//! peer-info-exchange protocol.
+//! [`BootstrapFactory`] backed by mDNS LAN discovery.
 
+use crate::browse::{LocalIdentity, browse_loop};
 use crate::config::{MdnsBootstrapConfig, MdnsBootstrapModConfig};
+use crate::dial_policy::DialPolicy;
 use crate::discovery::{self, MdnsService};
-use crate::session;
+use crate::fingerprint;
 use kitsune2_api::*;
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use tokio::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
 
@@ -27,16 +27,30 @@ impl BootstrapFactory for MdnsBootstrapFactory {
         config.set_module_config(&MdnsBootstrapModConfig::default())
     }
 
-    fn validate_config(&self, _config: &Config) -> K2Result<()> {
+    fn validate_config(&self, config: &Config) -> K2Result<()> {
+        let cfg: MdnsBootstrapModConfig = config.get_module_config()?;
+        let cfg = cfg.mdns_bootstrap;
+        if cfg.max_concurrent_dials == 0 {
+            return Err(K2Error::other(
+                "mdnsBootstrap.maxConcurrentDials must be at least 1",
+            ));
+        }
+        if !cfg.service_type.ends_with("._udp.local.")
+            && !cfg.service_type.ends_with("._tcp.local.")
+        {
+            return Err(K2Error::other(
+                "mdnsBootstrap.serviceType must be of the form _name._udp.local.",
+            ));
+        }
         Ok(())
     }
 
     fn create(
         &self,
         builder: Arc<Builder>,
-        peer_store: DynPeerStore,
+        _peer_store: DynPeerStore,
         space_id: SpaceId,
-        _tx: DynTransport,
+        tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         Box::pin(async move {
             let cfg: MdnsBootstrapModConfig =
@@ -47,13 +61,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 let out: DynBootstrap = Arc::new(NoopMdnsBootstrap);
                 return Ok(out);
             }
-            let boot = MdnsBootstrap::start(
-                cfg.mdns_bootstrap,
-                builder,
-                peer_store,
-                space_id,
-            )
-            .await?;
+            let boot = MdnsBootstrap::start(cfg.mdns_bootstrap, space_id, tx)?;
             let out: DynBootstrap = Arc::new(boot);
             Ok(out)
         })
@@ -67,24 +75,21 @@ impl Bootstrap for NoopMdnsBootstrap {
     fn put(&self, _info: Arc<AgentInfoSigned>) {}
 }
 
-/// Shared mutable cache of the local agent infos this node is willing to
-/// serve to discovered peers. [`Bootstrap::put`] updates this; the session
-/// accept task reads it.
-type InfoCache = Arc<Mutex<Vec<Arc<AgentInfoSigned>>>>;
-
-/// The live mDNS bootstrap for one space.
+/// The live mDNS discovery for one space.
+///
+/// Browsing starts immediately. Announcing waits for the first local agent
+/// info that carries a URL, because the URL is the whole payload: a peer
+/// that hears us needs something to dial.
 #[derive(Debug)]
 pub struct MdnsBootstrap {
-    _service: Arc<MdnsService>,
-    infos: InfoCache,
+    service: MdnsService,
+    identity: Arc<LocalIdentity>,
     space_id: SpaceId,
-    accept_task: JoinHandle<()>,
     browse_task: JoinHandle<()>,
 }
 
 impl Drop for MdnsBootstrap {
     fn drop(&mut self) {
-        self.accept_task.abort();
         self.browse_task.abort();
     }
 }
@@ -98,167 +103,56 @@ impl Bootstrap for MdnsBootstrap {
             );
             return;
         }
-        let mut guard = self.infos.lock().expect("infos lock");
-        // Replace any existing entry for this agent; prune expired.
-        let now = Timestamp::now();
-        guard.retain(|i| i.agent != info.agent && i.expires_at > now);
-        guard.push(info);
+        // A tombstone has no URL and withdraws nothing: other local agents
+        // may still be reachable at the URL we announce, and if none are,
+        // the announcement dies with this instance.
+        let Some(url) = info.url.clone().filter(|_| !info.is_tombstone) else {
+            trace!("mdns: ignoring put without a url");
+            return;
+        };
+        self.identity.set_url(url.clone());
+        match self.service.advertise(&url) {
+            Ok(()) => trace!(%url, "mdns: advertising peer url"),
+            Err(err) => warn!(?err, %url, "mdns: failed to advertise peer url"),
+        }
     }
 }
 
 impl MdnsBootstrap {
-    async fn start(
+    fn start(
         cfg: MdnsBootstrapConfig,
-        builder: Arc<Builder>,
-        peer_store: DynPeerStore,
         space_id: SpaceId,
+        tx: DynTransport,
     ) -> K2Result<Self> {
-        let listener = TcpListener::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| K2Error::other_src("mdns listener bind", e))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| K2Error::other_src("mdns listener addr", e))?
-            .port();
-
         let addrs = discovery::local_addrs()?;
-        let service = Arc::new(MdnsService::register(
-            &cfg.service_type,
-            &space_id,
-            port,
-            addrs,
-        )?);
-
-        let infos: InfoCache = Arc::new(Mutex::new(Vec::new()));
-
-        let accept_task = tokio::spawn(accept_loop(
-            listener,
-            space_id.clone(),
-            infos.clone(),
-            peer_store.clone(),
-            builder.verifier.clone(),
+        let service = MdnsService::start(&cfg.service_type, &space_id, addrs)?;
+        let identity =
+            Arc::new(LocalIdentity::new(service.fullname().to_string()));
+        let policy = Arc::new(DialPolicy::new(
+            Duration::from_millis(cfg.dial_cooldown_ms as u64),
+            cfg.max_concurrent_dials as usize,
         ));
 
-        let browse_rx = service.browse(&cfg.service_type)?;
+        let browse_rx = service.browse()?;
         let browse_task = tokio::spawn(browse_loop(
             browse_rx,
-            service.clone(),
-            space_id.clone(),
-            infos.clone(),
-            peer_store.clone(),
-            builder.verifier.clone(),
+            fingerprint::space_fingerprint(&space_id),
+            identity.clone(),
+            tx,
+            policy,
         ));
 
-        debug!(?space_id, port, "mdns bootstrap started");
+        debug!(
+            ?space_id,
+            fullname = service.fullname(),
+            "mdns bootstrap started"
+        );
 
         Ok(Self {
-            _service: service,
-            infos,
+            service,
+            identity,
             space_id,
-            accept_task,
             browse_task,
         })
-    }
-}
-
-async fn accept_loop(
-    listener: TcpListener,
-    space_id: SpaceId,
-    infos: InfoCache,
-    peer_store: DynPeerStore,
-    verifier: DynVerifier,
-) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                trace!(%peer_addr, "mdns: accepted incoming session");
-                let space_id = space_id.clone();
-                let infos = infos.clone();
-                let peer_store = peer_store.clone();
-                let verifier = verifier.clone();
-                tokio::spawn(async move {
-                    run_session_and_insert(
-                        stream, space_id, infos, peer_store, verifier,
-                    )
-                    .await;
-                });
-            }
-            Err(err) => {
-                warn!(?err, "mdns: accept error");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
-    }
-}
-
-async fn browse_loop(
-    rx: flume::Receiver<mdns_sd::ServiceEvent>,
-    service: Arc<MdnsService>,
-    space_id: SpaceId,
-    infos: InfoCache,
-    peer_store: DynPeerStore,
-    verifier: DynVerifier,
-) {
-    let fp = crate::proto::space_fingerprint(&space_id);
-    while let Ok(event) = rx.recv_async().await {
-        let Some(peer) =
-            discovery::resolved_to_peer(&event, &fp, service.fullname())
-        else {
-            continue;
-        };
-        trace!(addr = %peer.addr, fullname = %peer.fullname, "mdns: discovered peer");
-
-        let space_id = space_id.clone();
-        let infos = infos.clone();
-        let peer_store = peer_store.clone();
-        let verifier = verifier.clone();
-        tokio::spawn(async move {
-            match connect_with_timeout(peer.addr).await {
-                Ok(stream) => {
-                    run_session_and_insert(
-                        stream, space_id, infos, peer_store, verifier,
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    debug!(?err, addr = %peer.addr, "mdns: dial failed");
-                }
-            }
-        });
-    }
-}
-
-async fn connect_with_timeout(addr: SocketAddr) -> K2Result<TcpStream> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| K2Error::other("mdns dial timeout"))?
-    .map_err(|e| K2Error::other_src("mdns dial", e))
-}
-
-async fn run_session_and_insert(
-    stream: TcpStream,
-    space_id: SpaceId,
-    infos: InfoCache,
-    peer_store: DynPeerStore,
-    verifier: DynVerifier,
-) {
-    let local = infos.lock().expect("infos lock").clone();
-    match session::run(stream, space_id.clone(), local, verifier).await {
-        Ok(discovered) if !discovered.is_empty() => {
-            debug!(
-                n = discovered.len(),
-                "mdns: inserting discovered agent infos"
-            );
-            if let Err(err) = peer_store.insert(discovered).await {
-                warn!(?err, "mdns: peer_store insert failed");
-            }
-        }
-        Ok(_) => {}
-        Err(err) => {
-            debug!(?err, "mdns: session failed");
-        }
     }
 }
