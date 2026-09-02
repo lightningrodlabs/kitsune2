@@ -74,6 +74,8 @@ hkdf = "0.13.0"
 hmac = "0.13.0"
 # alternative transport implementation using iroh
 iroh = "1.0.0"
+# mDNS address lookup service for iroh, used for LAN discovery in the iroh transport
+iroh-mdns-address-lookup = "0.5.0"
 # automock traits for tests
 mockall = "0.15"
 # watchable stream of values used in iroh transport

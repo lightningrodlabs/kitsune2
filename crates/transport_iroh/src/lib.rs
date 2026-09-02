@@ -228,6 +228,7 @@ use url::*;
 mod connection;
 mod connection_context;
 mod endpoint;
+mod lan_discovery;
 mod stream;
 use connection_context::*;
 #[cfg(feature = "metrics")]
@@ -306,6 +307,19 @@ pub mod config {
         #[serde(default = "default_relay_keepalive_interval_s")]
         #[cfg_attr(feature = "schema", schemars(default))]
         pub relay_keepalive_interval_s: u32,
+
+        /// Enable mDNS-based LAN discovery so that two nodes on the same
+        /// local network can dial each other by iroh EndpointId without a
+        /// relay. Requires the `mdns` cargo feature on
+        /// `kitsune2_transport_iroh`.
+        ///
+        /// Note: this only provides *dialability*. Agent-info distribution
+        /// over the LAN is the job of the `kitsune2_bootstrap_mdns` crate.
+        ///
+        /// Default: false.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub enable_lan_discovery: bool,
     }
 
     fn default_relay_keepalive_interval_s() -> u32 {
@@ -322,6 +336,7 @@ pub mod config {
                 auth_material_relay_base64: None,
                 relay_keepalive_interval_s: default_relay_keepalive_interval_s(
                 ),
+                enable_lan_discovery: false,
             }
         }
     }
@@ -374,6 +389,11 @@ impl TransportFactory for IrohTransportFactory {
                 return Err(K2Error::other("Disallowed plaintext relay URL"));
             }
         }
+
+        lan_discovery::validate_lan_discovery_config(
+            config.iroh_transport.enable_lan_discovery,
+        )
+        .map_err(K2Error::other)?;
 
         Ok(())
     }
@@ -536,6 +556,11 @@ impl IrohTransport {
             );
         }
 
+        builder = lan_discovery::maybe_enable_lan_discovery(
+            builder,
+            config.enable_lan_discovery,
+        );
+
         let endpoint = builder.bind().await.map_err(|err| {
             K2Error::other_src("Failed to bind iroh endpoint", err)
         })?;
@@ -598,7 +623,7 @@ impl IrohTransport {
             None
         };
 
-        let endpoint = Arc::new(IrohEndpoint::new(endpoint));
+        let endpoint: DynIrohEndpoint = Arc::new(IrohEndpoint::new(endpoint));
         let local_url = Arc::new(RwLock::new(None));
         let connections = Arc::new(RwLock::new(HashMap::new()));
         let connection_locks = Arc::new(Mutex::new(HashMap::new()));
@@ -627,6 +652,18 @@ impl IrohTransport {
                 ?relay_url,
                 "Relay inserted into endpoint, waiting for address assignment"
             );
+        }
+
+        if config.enable_lan_discovery
+            && let Some(relay_url_str) = &config.relay_url
+        {
+            Self::announce_url_from_configured_relay(
+                &endpoint,
+                &handler,
+                &local_url,
+                relay_url_str,
+            )
+            .await?;
         }
 
         let space_relays: SpaceRelays = Arc::new(RwLock::new(HashMap::new()));
@@ -662,6 +699,42 @@ impl IrohTransport {
             space_relays,
         });
         Ok(out)
+    }
+
+    /// The iroh id of our own endpoint.
+    fn local_endpoint_id(endpoint: &DynIrohEndpoint) -> K2Result<EndpointId> {
+        Ok(EndpointId::from(
+            iroh::PublicKey::from_bytes(&endpoint.id_bytes()).map_err(|e| {
+                K2Error::other_src("invalid endpoint public key", e)
+            })?,
+        ))
+    }
+
+    /// Announce the peer URL that the configured relay fully determines,
+    /// without waiting for the relay handshake.
+    ///
+    /// With LAN discovery on, peers can reach this node over mDNS-discovered
+    /// direct paths even while the relay is unreachable, so the node has to
+    /// be addressable from the start. The address watcher announces the same
+    /// URL again once the relay actually connects. Without LAN discovery a
+    /// node is only reachable via its relay, so an early announcement would
+    /// only invite dials that cannot succeed yet.
+    async fn announce_url_from_configured_relay(
+        endpoint: &DynIrohEndpoint,
+        handler: &Arc<TxImpHnd>,
+        local_url: &Arc<RwLock<Option<Url>>>,
+        relay_url_str: &str,
+    ) -> K2Result<()> {
+        let relay_url = RelayUrl::from_str(relay_url_str)
+            .map_err(|err| K2Error::other_src("Invalid relay URL", err))?;
+        let url = canonicalize_relay_url(
+            &relay_url,
+            Self::local_endpoint_id(endpoint)?,
+        )?;
+        info!(%url, "Announcing peer URL derived from configured relay");
+        *local_url.write().expect("poisoned") = Some(url.clone());
+        handler.new_listening_address(url, None).await;
+        Ok(())
     }
 
     /// Keep the endpoint public key registered with the bootstrap server's
@@ -1094,12 +1167,10 @@ impl IrohTransport {
             )
             .await;
 
-        let endpoint_id = EndpointId::from(
-            iroh::PublicKey::from_bytes(&endpoint.id_bytes()).map_err(|e| {
-                K2Error::other_src("invalid endpoint public key", e)
-            })?,
-        );
-        let local_url = canonicalize_relay_url(&relay_url_parsed, endpoint_id)?;
+        let local_url = canonicalize_relay_url(
+            &relay_url_parsed,
+            Self::local_endpoint_id(&endpoint)?,
+        )?;
 
         info!(
             %local_url,
