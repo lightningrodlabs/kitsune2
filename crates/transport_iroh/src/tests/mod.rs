@@ -4,6 +4,8 @@ use super::*;
 
 mod close;
 mod connect_failure;
+mod dial;
+mod fakes;
 mod frame;
 mod relay_qad;
 mod simultaneous_open;
