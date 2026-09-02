@@ -84,6 +84,7 @@ impl BrowseState {
     }
 
     /// How many spaces are registered.
+    #[cfg(test)]
     pub fn space_count(&self) -> usize {
         self.spaces.len()
     }

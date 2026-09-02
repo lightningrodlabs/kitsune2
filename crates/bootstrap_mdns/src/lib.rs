@@ -15,8 +15,29 @@
 //! prove knowledge of the space's secret, proves the same in return, and only
 //! then are signed agent infos exchanged and stored. This crate never inserts
 //! anything into the peer store and never sees an agent info from the LAN, so
-//! a spoofed announcement can at most cause one rate-limited dial to a peer
-//! that then fails the access exchange.
+//! a spoofed announcement can at most cause bounded dials to a peer that
+//! then fails the access exchange: once when the announcement is first
+//! heard, then at most once per `redialIntervalMs` with exponential backoff
+//! for as long as it stays announced and unconnected, under the
+//! `maxConcurrentDials` in-flight cap.
+//!
+//! ## Wiring
+//!
+//! The factory reports honestly when its daemon cannot start. Whether a
+//! space may run without LAN discovery is decided where the bootstrap stack
+//! is assembled, and the intended wiring — the one Holochain uses — makes
+//! the WAN bootstrap mandatory and the LAN one optional:
+//!
+//! ```ignore
+//! CompositeBootstrapFactory::create(vec![
+//!     CoreBootstrapFactory::create(),
+//!     OptionalBootstrapFactory::create(MdnsBootstrapFactory::create()),
+//! ])
+//! ```
+//!
+//! One factory keeps one mDNS daemon per service type, shared by every
+//! space announcing under it: one browse, one reconciliation ticker, one
+//! hostname.
 //!
 //! ## Privacy
 //!
@@ -42,16 +63,17 @@
 //! this crate usable over any transport and out of the way of transport
 //! API churn.
 
-pub mod browse;
 pub mod config;
-pub mod dials;
-pub mod discovery;
 pub mod fingerprint;
-pub mod shared;
-pub mod space;
 
+mod browse;
+mod dials;
+mod discovery;
 mod factory;
-pub use factory::*;
+mod shared;
+mod space;
+
+pub use factory::MdnsBootstrapFactory;
 
 #[cfg(test)]
 mod test_support;

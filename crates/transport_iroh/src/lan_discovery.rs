@@ -13,13 +13,22 @@
 //! wants to know *before* dialling whether a LAN path exists: when the home
 //! relay is known to be down and the dial would otherwise be skipped.
 //!
-//! mDNS answers are unauthenticated, so the pre-resolve keeps only
-//! addresses a LAN peer could actually have ([`is_lan_scoped`]); an answer
-//! must not be able to steer a dial at an arbitrary public address. iroh's
-//! own in-connect lookup applies no such filter. In both cases the QUIC
-//! handshake pins the peer's `EndpointId`, so a spoofed address can only
-//! waste a connect attempt or bounce traffic off a third party — a
-//! DoS/reflection concern, not an impersonation one.
+//! mDNS answers are unauthenticated, so the transport keeps only addresses
+//! a LAN peer could actually have from the pre-resolve ([`is_lan_scoped`]);
+//! an answer must not be able to steer a dial at an arbitrary public
+//! address. iroh's own in-connect lookup applies no such filter. In both
+//! cases the QUIC handshake pins the peer's `EndpointId`, so a spoofed
+//! address can only waste a connect attempt or bounce traffic off a third
+//! party — a DoS/reflection concern, not an impersonation one.
+//!
+//! Two IPv6 cases are deliberately outside the filter. Link-local
+//! (`fe80::/10`) addresses arrive from the lookup without a scope id and
+//! cannot be dialled, and a failed dial would mark the peer unresponsive,
+//! so they are dropped. A LAN numbered with global-unicast addresses
+//! (SLAAC from a delegated prefix) is not recognised as a LAN, so the
+//! relay-down bypass does not serve it; the relay-up path, where iroh's
+//! in-connect lookup is unfiltered, is unaffected. Both are known
+//! limitations.
 
 use std::time::Duration;
 
@@ -31,13 +40,13 @@ use std::time::Duration;
 pub(crate) const LAN_LOOKUP_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Ask the endpoint's address lookup services (mDNS) for direct IP
-/// addresses of the given peer.
+/// addresses of the given peer, as answered.
 ///
 /// Returns the addresses from the first lookup item that carries at least
 /// one IP address, or an empty list if none arrives within `timeout`. The
 /// mDNS service answers from its passive cache, so a known LAN peer resolves
 /// almost immediately; for an unknown peer it stays silent, which is what
-/// the timeout bounds.
+/// the timeout bounds. Which of the answers to trust is the caller's call.
 #[cfg(feature = "mdns")]
 pub(crate) async fn resolve_direct_addrs(
     endpoint: &iroh::Endpoint,
@@ -59,12 +68,7 @@ pub(crate) async fn resolve_direct_addrs(
                         .into_endpoint_addr()
                         .addrs
                         .into_iter()
-                        .filter(|addr| match addr {
-                            iroh::TransportAddr::Ip(sock) => {
-                                is_lan_scoped(sock.ip())
-                            }
-                            _ => false,
-                        })
+                        .filter(|addr| addr.is_ip())
                         .collect();
                     if !addrs.is_empty() {
                         return addrs;
@@ -95,17 +99,24 @@ pub(crate) async fn resolve_direct_addrs(
         .unwrap_or_default()
 }
 
-/// Whether `ip` is one a peer on the same LAN could hold: RFC 1918 private
-/// or link-local for IPv4, unique-local (`fc00::/7`) or link-local for
-/// IPv6. IPv4-mapped IPv6 addresses are judged by the IPv4 they carry.
-#[cfg(any(test, feature = "mdns"))]
+/// Whether `ip` is one a peer on the same LAN could hold and that this
+/// node can dial: RFC 1918 private, link-local or carrier-grade NAT
+/// (`100.64.0.0/10`) for IPv4, unique-local (`fc00::/7`) for IPv6.
+/// IPv4-mapped IPv6 addresses are judged by the IPv4 they carry. IPv6
+/// link-local is excluded on purpose: without a scope id it is not
+/// dialable (see the module doc).
 pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
+    fn v4_lan(v4: Ipv4Addr) -> bool {
+        let [a, b, _, _] = v4.octets();
+        let cgnat = a == 100 && (64..128).contains(&b);
+        v4.is_private() || v4.is_link_local() || cgnat
+    }
     match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => v4_lan(v4),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => v4.is_private() || v4.is_link_local(),
-            None => v6.is_unique_local() || v6.is_unicast_link_local(),
+            Some(v4) => v4_lan(v4),
+            None => v6.is_unique_local(),
         },
     }
 }
@@ -156,22 +167,27 @@ mod scope_tests {
     use super::is_lan_scoped;
 
     #[test]
-    fn lan_scoped_admits_only_private_and_link_local_addresses() {
+    fn lan_scoped_admits_only_dialable_local_addresses() {
         let cases: &[(&str, bool)] = &[
             ("10.0.0.1", true),
             ("172.16.0.1", true),
             ("172.31.255.254", true),
             ("192.168.1.20", true),
             ("169.254.7.7", true),
+            ("100.64.0.1", true),
+            ("100.127.255.254", true),
             ("fd00::20", true),
             ("fc00::1", true),
-            ("fe80::1", true),
             ("::ffff:192.168.1.20", true),
+            ("::ffff:100.100.1.1", true),
+            ("100.63.255.255", false),
+            ("100.128.0.0", false),
             ("172.32.0.1", false),
             ("8.8.8.8", false),
             ("203.0.113.9", false),
             ("127.0.0.1", false),
             ("0.0.0.0", false),
+            ("fe80::1", false),
             ("2001:db8::20", false),
             ("::1", false),
             ("::ffff:8.8.8.8", false),

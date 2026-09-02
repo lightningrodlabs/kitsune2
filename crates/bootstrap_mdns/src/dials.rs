@@ -211,6 +211,7 @@ impl Announcements {
     }
 
     /// Every URL some record currently names.
+    #[cfg(test)]
     pub fn urls(&self) -> Vec<Url> {
         self.records
             .lock()
