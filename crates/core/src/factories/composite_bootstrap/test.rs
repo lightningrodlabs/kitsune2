@@ -141,35 +141,19 @@ async fn create_composite(
 }
 
 #[tokio::test]
-async fn a_failing_inner_factory_is_skipped_and_the_rest_still_serve_puts() {
+async fn a_failing_inner_factory_fails_the_composite() {
     let survivor = Arc::new(RecordingBootstrap::default());
     let composite = CompositeBootstrapFactory::create(vec![
-        Arc::new(FailingBootstrapFactory),
         Arc::new(RecordingBootstrapFactory {
             instance: survivor.clone(),
         }),
-    ]);
-
-    let (bootstrap, space_id) = create_composite(composite).await;
-    let bootstrap = bootstrap.expect(
-        "one working inner bootstrap is enough to create the composite",
-    );
-
-    let agent = AgentBuilder::default()
-        .with_space(space_id)
-        .build(TestLocalAgent::default());
-    bootstrap.put(agent);
-
-    assert_eq!(survivor.puts.lock().unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn the_composite_fails_only_when_every_inner_factory_fails() {
-    let composite = CompositeBootstrapFactory::create(vec![
-        Arc::new(FailingBootstrapFactory),
         Arc::new(FailingBootstrapFactory),
     ]);
 
     let (bootstrap, _) = create_composite(composite).await;
-    assert!(bootstrap.is_err());
+    let err = bootstrap.expect_err("a failing inner factory is an error");
+    assert!(
+        err.to_string().contains("this bootstrap cannot start"),
+        "the inner error is propagated: {err}"
+    );
 }

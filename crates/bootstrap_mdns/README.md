@@ -65,8 +65,8 @@ use kitsune2_bootstrap_mdns::MdnsBootstrapFactory;
 use kitsune2_core::factories::{CompositeBootstrapFactory, CoreBootstrapFactory};
 
 // Run WAN bootstrap and LAN mDNS discovery side by side. `put` fans out
-// to both. If the LAN side cannot start on this host it is logged and
-// skipped; the WAN bootstrap carries on alone.
+// to both. If the mDNS daemon cannot start on this host the mDNS factory
+// logs a warning and hands out a no-op; the WAN bootstrap carries on alone.
 let bootstrap: DynBootstrapFactory = CompositeBootstrapFactory::create(vec![
     CoreBootstrapFactory::create(),
     MdnsBootstrapFactory::create(),

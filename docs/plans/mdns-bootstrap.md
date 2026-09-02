@@ -16,10 +16,12 @@ Branch: `feat/mdns-bootstrap-hello` (based on the hello access module line)
   run the preflight, sending nothing else. `BootstrapFactory::create`
   receives the space's transport.
 - `crates/core` — `CompositeBootstrapFactory` stacks several
-  `BootstrapFactory`s over one peer store and fails open: an inner factory
-  that cannot start is skipped.
+  `BootstrapFactory`s over one peer store; an inner factory that fails
+  fails the space, as it would alone.
 - `crates/bootstrap_mdns` — `MdnsBootstrapFactory`: announce the space
   fingerprint and our peer URL, browse for the same, `dial` what matches.
+  Fails open: a daemon that cannot start yields a no-op bootstrap with a
+  warning, so the WAN bootstrap is never lost over the LAN one.
 - `crates/kitsune2/tests/mdns_lan.rs` (feature `mdns`, gated on
   `KITSUNE2_LAN_TEST=1`) — two production-wired nodes, unreachable relay,
   no bootstrap server, each ends up with the other's agent info.
