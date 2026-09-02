@@ -22,9 +22,9 @@ pub(crate) type DaemonStart =
 /// creation tries again. Long enough that fifty spaces starting at once
 /// cost one attempt, short enough that a node which gains a network later
 /// recovers.
-pub const FAILED_START_RETRY: Duration = Duration::from_secs(60);
+pub(crate) const FAILED_START_RETRY: Duration = Duration::from_secs(60);
 
-/// The [`BootstrapFactory`] that produces [`MdnsBootstrap`] instances.
+/// The [`BootstrapFactory`] behind mDNS LAN discovery.
 ///
 /// One factory owns one mDNS daemon per service type, started the first
 /// time an enabled space asks for that type and kept for the factory's
@@ -183,10 +183,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 builder.config.get_module_config()?;
             let cfg = cfg.mdns_bootstrap;
             if !cfg.enabled {
-                // Disabled: produce a no-op bootstrap so the builder stack
-                // stays uniform.
-                let out: DynBootstrap = Arc::new(DisabledMdnsBootstrap);
-                return Ok(out);
+                return Ok(noop());
             }
             // The fingerprint comes first so that the space is ready to
             // join the moment the daemon is up and replays what the LAN
@@ -203,12 +200,18 @@ impl BootstrapFactory for MdnsBootstrapFactory {
     }
 }
 
-/// What a space gets while mDNS discovery is switched off in config.
-#[derive(Debug)]
-struct DisabledMdnsBootstrap;
+/// What a space gets while mDNS discovery is switched off in config: a
+/// bootstrap that accepts puts and does nothing, so the builder stack
+/// stays uniform.
+fn noop() -> DynBootstrap {
+    #[derive(Debug)]
+    struct DisabledMdnsBootstrap;
 
-impl Bootstrap for DisabledMdnsBootstrap {
-    fn put(&self, _info: Arc<AgentInfoSigned>) {}
+    impl Bootstrap for DisabledMdnsBootstrap {
+        fn put(&self, _info: Arc<AgentInfoSigned>) {}
+    }
+
+    Arc::new(DisabledMdnsBootstrap)
 }
 
 /// One space's membership of the shared mDNS presence.
@@ -219,7 +222,7 @@ impl Bootstrap for DisabledMdnsBootstrap {
 /// the handle withdraws the space's record, stops routing records to it
 /// and aborts its dials in flight.
 #[derive(Debug)]
-pub struct MdnsBootstrap {
+pub(crate) struct MdnsBootstrap {
     shared: Arc<SharedMdns>,
     entry: Arc<SpaceEntry>,
 }

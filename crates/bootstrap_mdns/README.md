@@ -17,16 +17,25 @@ someone else's job.
    derives for the purpose `"k2-mdns-v1"`, and `url`, the kitsune2 peer
    URL. The instance name is a random token per space, the port is zero,
    and the daemon fills in and maintains the host's interface addresses.
-   The record is replaced when the URL changes. All spaces of one process
-   share one daemon, one browse and one hostname.
+   The record is replaced when the URL changes. All spaces of one factory
+   that announce under the same `serviceType` share one daemon, one
+   browse, one reconciliation ticker and one hostname.
 2. **Browse.** Every resolved record that carries our fingerprint and a
    parseable peer URL — and is not our own instance or our own URL — is a
-   candidate.
-3. **Dial.** A candidate is handed to `Transport::dial(space, url)` when
-   it is first heard, and again every `redialIntervalMs` for as long as the
-   LAN announces it and the transport reports no connection to it, with at
-   most `maxConcurrentDials` in flight. That opens a transport connection
-   and runs its preflight.
+   candidate. Records are tracked by name, so a restarted peer whose old
+   record lingers next to its new one stays known until both are gone;
+   the latest record of every name heard is kept (up to 1024) and replayed
+   to a space that joins later, since mDNS delivers a record only once.
+3. **Dial.** Once the space has a URL of its own (before that it cannot be
+   dialled back or preflight), a candidate is handed to
+   `Transport::dial(space, url)` when it is first heard. While the LAN
+   keeps announcing it and the transport reports no connection to it, it
+   is dialled again after one `redialIntervalMs`, then two, four, up to
+   sixteen intervals between dials; a fresh announcement restarts the
+   short schedule, and a peer the space blocks is forgotten until it is
+   announced again. At most `maxConcurrentDials` dials are in flight and
+   at most 256 URLs are remembered per space. A dial opens a transport
+   connection and runs its preflight.
 4. **Hand over.** The space's access module (the *hello* module in
    `kitsune2_core`) sees the new connection, challenges the peer to prove
    knowledge of the space secret, proves the same in return, and only then
@@ -42,8 +51,8 @@ signature, and carries no wire protocol of its own.
   compute it. The peer URL is public by nature — it is what bootstrap
   servers hand out.
 - mDNS is unauthenticated, so discovery decides nothing. A spoofed
-  announcement can at most cause one rate-limited dial to a peer that then
-  fails the access exchange.
+  announcement can at most cause bounded dials to a peer that then fails
+  the access exchange.
 - When no space secret is configured, kitsune2 uses the space id as the
   secret, and an adversary holding a list of candidate space ids can then
   derive each fingerprint and confirm which spaces are present on the LAN.
@@ -54,7 +63,7 @@ signature, and carries no wire protocol of its own.
 | Passive LAN listener learning `space_id` | Learns only the fingerprint |
 | Active LAN attacker injecting fake peer info | Nothing to inject: no peer info travels over mDNS |
 | Active attacker impersonating a member | Fails the access module's proof-of-knowledge |
-| Announcement flood | Bounded by the per-URL cooldown and the in-flight cap |
+| Announcement flood | Each URL is dialled once on first sighting, then at most once per `redialIntervalMs` with exponential backoff (up to 16 intervals) while unconnected, under the `maxConcurrentDials` in-flight cap; at most 256 URLs are kept per space |
 | Adversary with a candidate `space_id` list confirming presence | **Not prevented** for spaces with no configured secret |
 
 ## Typical setup
@@ -62,14 +71,18 @@ signature, and carries no wire protocol of its own.
 ```rust
 use kitsune2_api::DynBootstrapFactory;
 use kitsune2_bootstrap_mdns::MdnsBootstrapFactory;
-use kitsune2_core::factories::{CompositeBootstrapFactory, CoreBootstrapFactory};
+use kitsune2_core::factories::{
+    CompositeBootstrapFactory, CoreBootstrapFactory, OptionalBootstrapFactory,
+};
 
 // Run WAN bootstrap and LAN mDNS discovery side by side. `put` fans out
-// to both. If the mDNS daemon cannot start on this host the mDNS factory
-// logs a warning and hands out a no-op; the WAN bootstrap carries on alone.
+// to both. The mDNS factory fails honestly when its daemon cannot start;
+// the `Optional` wrapper is what turns that into a warning and a no-op
+// for the space, so the WAN bootstrap carries on alone. This is the
+// intended wiring, and the one Holochain uses.
 let bootstrap: DynBootstrapFactory = CompositeBootstrapFactory::create(vec![
     CoreBootstrapFactory::create(),
-    MdnsBootstrapFactory::create(),
+    OptionalBootstrapFactory::create(MdnsBootstrapFactory::create()),
 ]);
 ```
 
@@ -134,6 +147,13 @@ KITSUNE2_LAN_TEST=1 cargo test -p kitsune2 --features mdns --test mdns_lan
   completes covers only the global `relay_url`; a per-space relay only
   yields its URL once the relay handshake has run, so a space on a
   per-space relay is announced later.
+- With per-space relays the announced URL can differ from the URL the
+  transport keys its connection by, in which case the peer looks
+  unconnected every round and is dialled again each interval. Holochain
+  does not use per-space relays.
+- `Transport::dial` returning `DialOutcome` and `TxImp::dial` being a
+  required method break external transport implementors. That is accepted
+  on this fork branch.
 
 ## Follow-ups
 
@@ -149,5 +169,3 @@ KITSUNE2_LAN_TEST=1 cargo test -p kitsune2 --features mdns --test mdns_lan
   authenticated transport connection.
 - **Not a replacement for WAN bootstrap** when nodes are not on the same
   LAN. Compose it with `CoreBootstrapFactory` for mixed deployments.
-- **Not live to interface changes.** The addresses in the announcement are
-  fixed when the bootstrap starts.

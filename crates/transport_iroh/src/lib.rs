@@ -985,12 +985,15 @@ impl IrohTransport {
         Some(global.clone())
     }
 
-    /// Direct addresses that LAN discovery knows for `endpoint_id`; none
-    /// when LAN discovery is off.
+    /// Direct addresses that LAN discovery knows for `endpoint_id` and
+    /// that a LAN peer could actually hold; none when LAN discovery is
+    /// off.
     ///
     /// Only consulted when the home relay is known to be down. On the
     /// relay-up path iroh runs its own lookup while the connect is in
-    /// flight, so a lookup here would only add latency to every dial.
+    /// flight, so a lookup here would only add latency to every dial. The
+    /// lookup's answers are unauthenticated, so anything that is not a
+    /// LAN address is dropped rather than dialled.
     async fn lan_direct_addrs(
         &self,
         endpoint_id: EndpointId,
@@ -998,12 +1001,28 @@ impl IrohTransport {
         if !self.config.enable_lan_discovery {
             return Vec::new();
         }
-        self.endpoint
+        let (lan, other): (Vec<_>, Vec<_>) = self
+            .endpoint
             .discover_direct_addrs(
                 endpoint_id,
                 lan_discovery::LAN_LOOKUP_TIMEOUT,
             )
             .await
+            .into_iter()
+            .partition(|addr| match addr {
+                iroh::TransportAddr::Ip(sock) => {
+                    lan_discovery::is_lan_scoped(sock.ip())
+                }
+                _ => false,
+            });
+        if !other.is_empty() {
+            debug!(
+                %endpoint_id,
+                ?other,
+                "ignoring LAN-discovered addresses that are not LAN-scoped"
+            );
+        }
+        lan
     }
 
     /// Creates a new connection and its associated context for a peer.

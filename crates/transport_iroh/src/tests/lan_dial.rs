@@ -78,6 +78,41 @@ async fn relay_down_dials_lan_addresses_when_discovery_knows_them() {
     );
 }
 
+/// An mDNS answer is unauthenticated: an address that no LAN peer could
+/// hold is not dialled, and with nothing else known the attempt is
+/// skipped as if the lookup had been silent.
+#[tokio::test]
+async fn relay_down_ignores_addresses_that_are_not_lan_scoped() {
+    let public: SocketAddr = "203.0.113.9:4433".parse().unwrap();
+    let endpoint = Arc::new(FakeEndpoint {
+        relay_known_down: true,
+        direct_addrs: vec![TransportAddr::Ip(public)],
+        ..Default::default()
+    });
+
+    let (err, calls) = attempt(endpoint.clone(), lan_config()).await;
+
+    assert!(err.contains(RELAY_NOT_CONNECTED_ERR), "got: {err}");
+    assert!(endpoint.connect_targets.lock().unwrap().is_empty());
+    assert!(calls.lock().unwrap().is_empty());
+
+    // Mixed answers keep only the LAN address.
+    let endpoint = Arc::new(FakeEndpoint {
+        connect: connect_fails("no route"),
+        relay_known_down: true,
+        direct_addrs: vec![
+            TransportAddr::Ip(public),
+            TransportAddr::Ip(lan_addr()),
+        ],
+        ..Default::default()
+    });
+    let _ = attempt(endpoint.clone(), lan_config()).await;
+    let targets = endpoint.connect_targets.lock().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert!(targets[0].addrs.contains(&TransportAddr::Ip(lan_addr())));
+    assert!(!targets[0].addrs.contains(&TransportAddr::Ip(public)));
+}
+
 /// With the relay known down and nothing known on the LAN, the attempt is
 /// skipped without touching the peer's standing.
 #[tokio::test]

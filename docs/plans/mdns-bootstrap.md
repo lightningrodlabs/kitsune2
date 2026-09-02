@@ -12,16 +12,21 @@ Branch: `feat/mdns-bootstrap-hello` (based on the hello access module line)
   unreachable is still addressable; lets a LAN path through the
   relay-down guard. All iroh surface for this lives in
   `crates/transport_iroh/src/lan_discovery.rs`.
-- `crates/api` — `Transport::dial(url)`: open (or reuse) a connection and
-  run the preflight, sending nothing else. `BootstrapFactory::create`
-  receives the space's transport.
+- `crates/api` — `Transport::dial(space, url) -> DialOutcome`: open (or
+  reuse) a connection and run the preflight, sending nothing else; a peer
+  blocked in the space is not dialled and the outcome says so.
+  `BootstrapFactory::create` receives the space's transport.
 - `crates/core` — `CompositeBootstrapFactory` stacks several
   `BootstrapFactory`s over one peer store; an inner factory that fails
-  fails the space, as it would alone.
+  fails the space, as it would alone, and an empty composite is an error.
+  `OptionalBootstrapFactory` wraps a factory whose failure to start the
+  space may survive: a warning and a no-op bootstrap. The intended
+  wiring, which Holochain uses, is
+  `Composite([Core, Optional(Mdns)])`.
 - `crates/bootstrap_mdns` — `MdnsBootstrapFactory`: announce the space
   fingerprint and our peer URL, browse for the same, `dial` what matches.
-  Fails open: a daemon that cannot start yields a no-op bootstrap with a
-  warning, so the WAN bootstrap is never lost over the LAN one.
+  Fails honestly when the daemon cannot start; whether that is fatal is
+  the wrapper's call.
 - `crates/kitsune2/tests/mdns_lan.rs` (feature `mdns`, gated on
   `KITSUNE2_LAN_TEST=1`) — two production-wired nodes, unreachable relay,
   no bootstrap server, each ends up with the other's agent info.
@@ -74,9 +79,13 @@ preflight exchanges agent infos (Holochain's does) gets the faster
 - **Passive LAN listener** sees all mDNS broadcasts. Learns the space
   fingerprint and a peer URL, both of which are already public to any
   bootstrap server.
-- **Active LAN attacker** can spoof mDNS records. Can cause a dial — one
-  per URL per cooldown, at most `maxConcurrentDials` in flight — to a peer
-  that then fails the hello exchange. Cannot put anything in a peer store.
+- **Active LAN attacker** can spoof mDNS records. Can cause bounded dials
+  to a peer that then fails the hello exchange: once when the URL is first
+  heard, then at most once per `redialIntervalMs` with exponential backoff
+  (up to sixteen intervals) while it stays announced and unconnected, at
+  most `maxConcurrentDials` in flight and at most 256 URLs remembered per
+  space. A peer the space blocks is forgotten until announced afresh.
+  Cannot put anything in a peer store.
 - **Adversary with a candidate space_id list** can derive fingerprints
   and confirm presence for spaces that configure no secret (the open-space
   default, where the space id is the secret). Spaces with a real secret
@@ -100,14 +109,23 @@ the hello proof uses, so a non-member cannot compute it. With no secret
 configured kitsune2 falls back to the space id, and the candidate-list
 attack in the threat model applies to that default.
 
-One `mdns-sd` daemon serves every space of a process: one browse, one
-hostname, and a registry that routes each resolved record to the space
-whose fingerprint it carries.
+One `mdns-sd` daemon per factory per service type serves every space
+announcing under it: one browse, one reconciliation ticker, one hostname,
+and a registry that routes each resolved record to the space whose
+fingerprint it carries. A daemon that fails to start is not retried for a
+minute, so many spaces created together cost one attempt.
+
+Records are tracked by name per space, so a restarted peer whose old record
+lingers next to its new one stays known until both are gone. The browse
+loop keeps the latest record of every name it hears (up to 1024) and
+replays the matching ones to a space that joins later, since mDNS delivers
+an unchanged record only once.
 
 The URL is taken from the local agent infos delivered through
-`Bootstrap::put`; browsing starts immediately, announcing waits for the
-first put that carries a URL, and the record is re-registered when the URL
-changes. Tombstones are ignored.
+`Bootstrap::put`; browsing starts immediately, announcing — and dialling,
+since before the first URL the space has no handler registered and no
+agent to preflight with — waits for the first put that carries a URL, and
+the record is re-registered when the URL changes. Tombstones are ignored.
 
 ## Configuration
 
@@ -152,6 +170,18 @@ a relay.
   derives the peer URL from the global `relay_url` alone. Per-space relays
   get their URL from the relay handshake, so a space on a per-space relay
   is not addressable on the LAN until that handshake completes.
+- With per-space relays the announced URL can differ from the URL the
+  transport keys its connection by; such a peer looks unconnected every
+  round and is dialled again each interval. Holochain does not use
+  per-space relays.
+- The relay-down LAN bypass in `transport_iroh` only trusts LAN-scoped
+  addresses (RFC 1918, IPv4 link-local, CGNAT, IPv6 ULA). IPv6 link-local
+  is dropped because the lookup delivers it without a scope id, and a LAN
+  numbered with global-unicast IPv6 is not recognised; iroh's unfiltered
+  in-connect lookup on the relay-up path is unaffected.
+- The api change (`TxImp::dial` required, `Transport::dial` returning
+  `DialOutcome`) breaks external transport implementors. Accepted on this
+  fork branch.
 
 ## Follow-ups
 
