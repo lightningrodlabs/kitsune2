@@ -985,6 +985,54 @@ impl IrohTransport {
         Some(global.clone())
     }
 
+    /// Direct addresses that LAN discovery knows for `endpoint_id`; none
+    /// when LAN discovery is off.
+    ///
+    /// Only consulted when the home relay is known to be down. On the
+    /// relay-up path iroh runs its own lookup while the connect is in
+    /// flight, so a lookup here would only add latency to every dial.
+    async fn lan_direct_addrs(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Vec<iroh::TransportAddr> {
+        if !self.config.enable_lan_discovery {
+            return Vec::new();
+        }
+        self.endpoint
+            .discover_direct_addrs(
+                endpoint_id,
+                lan_discovery::LAN_LOOKUP_TIMEOUT,
+            )
+            .await
+    }
+
+    /// Whether a failed connect attempt is evidence against the peer.
+    ///
+    /// With LAN discovery on, dials go out while our own relay is down or
+    /// still connecting, and a failure then is as likely ours as theirs; the
+    /// peer only takes the blame when our relay was up for the attempt.
+    fn connect_failure_blames_peer(&self) -> bool {
+        !self.config.enable_lan_discovery
+            || self.endpoint.is_home_relay_connected()
+    }
+
+    /// Mark the peer unresponsive after a failed connect attempt, when that
+    /// failure says something about the peer.
+    async fn record_connect_failure(&self, remote_url: &Url) {
+        if !self.connect_failure_blames_peer() {
+            debug!(
+                ?remote_url,
+                "connect failed while our relay is not connected, \
+                 peer will not be marked unresponsive"
+            );
+            return;
+        }
+        let _ = self
+            .handler
+            .set_unresponsive(remote_url.clone(), Timestamp::now())
+            .await;
+    }
+
     /// Creates a new connection and its associated context for a peer.
     ///
     /// The connection is established and the preflight frame is sent. If this
@@ -992,25 +1040,35 @@ impl IrohTransport {
     /// preflight, the context is dropped and an error returned.
     async fn create_connection_and_context(
         &self,
-        target: EndpointAddr,
+        mut target: EndpointAddr,
         remote_url: Url,
     ) -> K2Result<Arc<ConnectionContext>> {
         // Guard: if the relay has explicitly failed (Disconnected state), skip
-        // the attempt entirely. A 60-second QUIC timeout while the relay is
-        // recovering would falsely mark the peer as unresponsive (e.g. after
-        // Android doze mode kills the network).
+        // the attempt unless the peer is reachable over the LAN. A 60-second
+        // QUIC timeout while the relay is recovering would falsely mark the
+        // peer as unresponsive (e.g. after Android doze mode kills the
+        // network).
         //
         // We check for Disconnected specifically — not Connecting — because
         // Connecting at startup is normal and we must not block those attempts.
         // Disconnected means iroh detected an actual failure and has recorded
         // a last_error; Connecting means iroh is still dialling.
         if self.endpoint.is_home_relay_known_down() {
+            let lan_addrs = self.lan_direct_addrs(target.id).await;
+            if lan_addrs.is_empty() {
+                debug!(
+                    ?remote_url,
+                    "skipping outbound connection: relay known down, \
+                     peer will not be marked unresponsive"
+                );
+                return Err(K2Error::other(RELAY_NOT_CONNECTED_ERR));
+            }
             debug!(
-                ?remote_url,
-                "skipping outbound connection: relay known down, \
-                 peer will not be marked unresponsive"
+                remote = ?remote_url.peer_id(),
+                ?lan_addrs,
+                "Relay known down, dialling LAN-discovered direct addresses"
             );
-            return Err(K2Error::other(RELAY_NOT_CONNECTED_ERR));
+            target.addrs.extend(lan_addrs);
         }
 
         // Establish connection
@@ -1023,21 +1081,11 @@ impl IrohTransport {
         .await
         {
             Err(e) => {
-                // On connection establishment error, mark the peer unresponsive
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
-
+                self.record_connect_failure(&remote_url).await;
                 Err(K2Error::other_src("iroh connect timed out", e))
             }
             Ok(Err(e)) => {
-                // On connection establishment error, mark the peer unresponsive
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
-
+                self.record_connect_failure(&remote_url).await;
                 Err(K2Error::other_src("iroh connect error", e))
             }
             Ok(Ok(conn)) => Ok(conn),

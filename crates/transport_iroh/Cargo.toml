@@ -14,6 +14,8 @@ edition.workspace = true
 base64 = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true, features = ["tls-aws-lc-rs"] }
+# used to drive iroh address lookup streams when the `mdns` feature is enabled
+futures = { workspace = true, optional = true }
 # mDNS LAN discovery, only with the `mdns` feature
 iroh-mdns-address-lookup = { workspace = true, optional = true }
 kitsune2_bootstrap_client = { workspace = true }
@@ -74,4 +76,4 @@ metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # dial each other by iroh EndpointId without a relay. This only provides
 # dialability — it does not distribute Kitsune2 AgentInfoSigned; that is the
 # job of the `kitsune2_bootstrap_mdns` crate.
-mdns = ["dep:iroh-mdns-address-lookup"]
+mdns = ["dep:iroh-mdns-address-lookup", "dep:futures"]

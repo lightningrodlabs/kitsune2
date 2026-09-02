@@ -15,7 +15,7 @@ use crate::test_utils::MockTxHandler;
 use crate::tests::support::StubTxImp;
 use crate::{IrohTransport, IrohTransportConfig};
 use bytes::Bytes;
-use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayUrl};
+use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayUrl, TransportAddr};
 use kitsune2_api::{
     BoxFut, DefaultTransport, K2Error, K2Result, Timestamp, TxImpHnd, Url,
 };
@@ -23,6 +23,7 @@ use kitsune2_test_utils::space::TEST_SPACE_ID;
 use n0_watcher::Disconnected;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 /// What [`FakeEndpoint::connect`] does with a dial target.
 pub(super) type ConnectFn = Arc<
@@ -53,6 +54,12 @@ pub(super) struct FakeEndpoint {
     pub connect: ConnectFn,
     /// Every `EndpointAddr` handed to `connect`, in order.
     pub connect_targets: Arc<Mutex<Vec<EndpointAddr>>>,
+    /// What `is_home_relay_known_down` reports.
+    pub relay_known_down: bool,
+    /// What `is_home_relay_connected` reports.
+    pub relay_connected: bool,
+    /// What `discover_direct_addrs` reports for any peer.
+    pub direct_addrs: Vec<TransportAddr>,
 }
 
 impl Default for FakeEndpoint {
@@ -60,6 +67,9 @@ impl Default for FakeEndpoint {
         Self {
             connect: connect_fails("connect not configured for this test"),
             connect_targets: Arc::new(Mutex::new(Vec::new())),
+            relay_known_down: false,
+            relay_connected: true,
+            direct_addrs: Vec::new(),
         }
     }
 }
@@ -115,7 +125,20 @@ impl Endpoint for FakeEndpoint {
     }
 
     fn is_home_relay_known_down(&self) -> bool {
-        false
+        self.relay_known_down
+    }
+
+    fn is_home_relay_connected(&self) -> bool {
+        self.relay_connected
+    }
+
+    fn discover_direct_addrs(
+        &self,
+        _endpoint_id: EndpointId,
+        _timeout: Duration,
+    ) -> BoxFut<'_, Vec<TransportAddr>> {
+        let addrs = self.direct_addrs.clone();
+        Box::pin(async move { addrs })
     }
 }
 
