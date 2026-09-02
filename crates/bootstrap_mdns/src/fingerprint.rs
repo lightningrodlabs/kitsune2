@@ -1,49 +1,110 @@
 //! The space commitment that is broadcast over mDNS.
 //!
 //! A node must be able to tell which LAN announcements belong to a space it
-//! is in without telling the LAN which spaces those are. The fingerprint is a
-//! plain hash of the space id under a fixed domain tag: members of the space
-//! can compute and match it, a passive observer only learns that some space
-//! exists. An observer holding a list of candidate space ids can still
-//! confirm a match by hashing each candidate, which is an accepted limit of
-//! any discovery scheme that matches on a shared identifier.
+//! is in without telling the LAN which spaces those are. The fingerprint is
+//! key material derived from the space secret for this one purpose, the
+//! same way the hello module derives its proof key: members of the space
+//! can compute and match it, while a non-member cannot compute it at all,
+//! and learning it reveals neither the secret nor any other derived key.
+//!
+//! When the host configures no space secret, kitsune2 falls back to using
+//! the space id as the secret. The fingerprint is then computable by anyone
+//! holding a candidate space id, which is an accepted limit of that default
+//! rather than of this scheme.
 
-use kitsune2_api::SpaceId;
-use sha2::{Digest, Sha256};
+use base64::prelude::*;
+use bytes::Bytes;
+use kitsune2_api::{Builder, K2Result, SpaceId};
+use std::sync::Arc;
 
-/// Domain tag mixed into the fingerprint hash, so that a space id hashed for
-/// some other purpose can never collide with an mDNS announcement.
-pub const FP_DOMAIN_TAG: &[u8] = b"k2-mdns-v1";
+/// The purpose under which the fingerprint is derived from the space
+/// secret. See [`SpaceSecret::derive_key`](kitsune2_api::SpaceSecret::derive_key).
+pub const MDNS_KEY_PURPOSE: &str = "k2-mdns-v1";
 
-/// Length of a space fingerprint in bytes.
-pub const FP_LEN: usize = 32;
+/// The commitment a space announces and matches on.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SpaceFingerprint(Bytes);
 
-/// A space fingerprint: `SHA-256(space_id || FP_DOMAIN_TAG)`.
-pub type SpaceFingerprint = [u8; FP_LEN];
+impl std::fmt::Debug for SpaceFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpaceFingerprint({})", self.encode())
+    }
+}
 
-/// Compute the fingerprint that identifies `space_id` on the LAN.
-pub fn space_fingerprint(space_id: &SpaceId) -> SpaceFingerprint {
-    let mut h = Sha256::new();
-    h.update(space_id.as_ref());
-    h.update(FP_DOMAIN_TAG);
-    h.finalize().into()
+impl From<Bytes> for SpaceFingerprint {
+    fn from(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+}
+
+impl SpaceFingerprint {
+    /// Derive the fingerprint of `space_id` from the builder's space secret.
+    pub async fn derive(
+        builder: &Arc<Builder>,
+        space_id: &SpaceId,
+    ) -> K2Result<Self> {
+        let secret = builder
+            .space_secret
+            .create(builder.clone(), space_id.clone())
+            .await?;
+        let key = secret
+            .derive_key(space_id.clone(), MDNS_KEY_PURPOSE)
+            .await?;
+        Ok(Self(key))
+    }
+
+    /// The TXT encoding: url-safe base64 without padding.
+    pub fn encode(&self) -> String {
+        BASE64_URL_SAFE_NO_PAD.encode(&self.0)
+    }
+
+    /// Parse a TXT value produced by [`encode`](Self::encode).
+    pub fn decode(txt: &str) -> Option<Self> {
+        let bytes = BASE64_URL_SAFE_NO_PAD.decode(txt).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(Self(bytes.into()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn space(bytes: &[u8]) -> SpaceId {
-        SpaceId::from(bytes::Bytes::copy_from_slice(bytes))
+    fn fp(bytes: &[u8]) -> SpaceFingerprint {
+        SpaceFingerprint::from(Bytes::copy_from_slice(bytes))
     }
 
     #[test]
-    fn fingerprint_is_stable_and_unique() {
-        let a = space_fingerprint(&space(b"alpha"));
-        let b = space_fingerprint(&space(b"beta"));
-        let a2 = space_fingerprint(&space(b"alpha"));
+    fn encode_round_trips_through_decode() {
+        let a = fp(&[7u8; 32]);
+        let txt = a.encode();
+        assert!(!txt.contains('='), "no padding: {txt}");
+        assert_eq!(SpaceFingerprint::decode(&txt), Some(a));
+    }
+
+    #[test]
+    fn decode_rejects_what_encode_never_produces() {
+        assert!(SpaceFingerprint::decode("").is_none());
+        assert!(SpaceFingerprint::decode("not base64!").is_none());
+        assert!(SpaceFingerprint::decode("AAAA====").is_none());
+    }
+
+    #[tokio::test]
+    async fn derivation_is_stable_per_space_and_distinct_across_spaces() {
+        let builder = Arc::new(
+            kitsune2_core::default_test_builder()
+                .with_default_config()
+                .unwrap(),
+        );
+        let alpha = SpaceId::from(Bytes::from_static(b"alpha"));
+        let beta = SpaceId::from(Bytes::from_static(b"beta"));
+        let a = SpaceFingerprint::derive(&builder, &alpha).await.unwrap();
+        let a2 = SpaceFingerprint::derive(&builder, &alpha).await.unwrap();
+        let b = SpaceFingerprint::derive(&builder, &beta).await.unwrap();
         assert_eq!(a, a2);
         assert_ne!(a, b);
-        assert_eq!(a.len(), FP_LEN);
+        assert_ne!(a.0, alpha.0.0, "the fingerprint is not the space id");
     }
 }

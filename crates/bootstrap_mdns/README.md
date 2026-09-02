@@ -12,11 +12,13 @@ someone else's job.
 ## How it works
 
 1. **Announce.** Once a local agent has a peer URL (delivered through
-   `Bootstrap::put`), the node registers `_kitsune2._udp.local.` with two
-   TXT fields: `spacefp`, the hex of `SHA-256(space_id || "k2-mdns-v1")`,
-   and `url`, the kitsune2 peer URL. The instance name is a random token,
-   the port is zero, and the record names every non-loopback interface
-   address. The record is replaced when the URL changes.
+   `Bootstrap::put`), the space registers `_kitsune2._udp.local.` with two
+   TXT fields: `spacefp`, the url-safe base64 of the key the space secret
+   derives for the purpose `"k2-mdns-v1"`, and `url`, the kitsune2 peer
+   URL. The instance name is a random token per space, the port is zero,
+   and the daemon fills in and maintains the host's interface addresses.
+   The record is replaced when the URL changes. All spaces of one process
+   share one daemon, one browse and one hostname.
 2. **Browse.** Every resolved record that carries our fingerprint and a
    parseable peer URL — and is not our own instance or our own URL — is a
    candidate.
@@ -35,14 +37,17 @@ signature, and carries no wire protocol of its own.
 
 ## Privacy and trust
 
-- The raw `SpaceId` is never sent over mDNS; only the fingerprint is. The
-  peer URL is public by nature — it is what bootstrap servers hand out.
+- The raw `SpaceId` is never sent over mDNS; only the fingerprint is, and
+  the fingerprint is derived from the space secret, so a non-member cannot
+  compute it. The peer URL is public by nature — it is what bootstrap
+  servers hand out.
 - mDNS is unauthenticated, so discovery decides nothing. A spoofed
   announcement can at most cause one rate-limited dial to a peer that then
   fails the access exchange.
-- An adversary holding a list of candidate space ids can hash each one and
-  confirm which of them are present on the LAN. This is an inherent limit
-  of any discovery scheme that matches on a shared identifier.
+- When no space secret is configured, kitsune2 uses the space id as the
+  secret, and an adversary holding a list of candidate space ids can then
+  derive each fingerprint and confirm which spaces are present on the LAN.
+  That is a limit of the open-space default.
 
 | Threat | Outcome |
 | --- | --- |
@@ -50,7 +55,7 @@ signature, and carries no wire protocol of its own.
 | Active LAN attacker injecting fake peer info | Nothing to inject: no peer info travels over mDNS |
 | Active attacker impersonating a member | Fails the access module's proof-of-knowledge |
 | Announcement flood | Bounded by the per-URL cooldown and the in-flight cap |
-| Adversary with a candidate `space_id` list confirming presence | **Not prevented** |
+| Adversary with a candidate `space_id` list confirming presence | **Not prevented** for spaces with no configured secret |
 
 ## Typical setup
 

@@ -57,7 +57,7 @@ impl SharedMdns {
     ) -> Arc<SpaceEntry> {
         let entry = SpaceEntry::new(
             space_id,
-            fp,
+            fp.clone(),
             self.daemon.clone(),
             tx,
             max_concurrent_dials,

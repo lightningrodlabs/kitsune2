@@ -164,7 +164,9 @@ async fn a_record_for_one_space_never_dials_for_another() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &fingerprint::space_fingerprint(&space_a),
+        &SpaceFingerprint::derive(&h.builder, &space_a)
+            .await
+            .unwrap(),
         PEER_A,
     ));
     settle().await;
@@ -196,12 +198,16 @@ async fn dropping_one_space_leaves_the_other_browsing() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &fingerprint::space_fingerprint(&space_a),
+        &SpaceFingerprint::derive(&h.builder, &space_a)
+            .await
+            .unwrap(),
         PEER_A,
     ));
     h.daemon.deliver(resolved_peer(
         "peer-2",
-        &fingerprint::space_fingerprint(&space_b),
+        &SpaceFingerprint::derive(&h.builder, &space_b)
+            .await
+            .unwrap(),
         PEER_B,
     ));
     settle().await;
@@ -220,7 +226,9 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &fingerprint::space_fingerprint(&space_a),
+        &SpaceFingerprint::derive(&h.builder, &space_a)
+            .await
+            .unwrap(),
         PEER_A,
     ));
     settle().await;
