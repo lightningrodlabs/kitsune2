@@ -20,6 +20,9 @@ pub use core_local_agent_store::*;
 mod core_bootstrap;
 pub use core_bootstrap::*;
 
+mod composite_bootstrap;
+pub use composite_bootstrap::*;
+
 mod mem_peer_meta_store;
 pub use mem_peer_meta_store::*;
 
