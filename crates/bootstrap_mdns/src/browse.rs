@@ -1,211 +1,245 @@
-//! The browse loop: turn matching announcements into transport dials.
+//! The browse loop: route each announcement heard on the LAN to the space
+//! it belongs to.
 //!
-//! Nothing here touches the peer store. A dial makes the transport open a
-//! connection and run its preflight; from there the access module takes
-//! over, proves that both sides know the space's secret, and only then
-//! exchanges agent infos. All discovery has to do is make the connection
-//! happen.
+//! One loop serves every space on the shared daemon. A resolved record is
+//! matched by its fingerprint against the registry of spaces this node is
+//! in, and handed to that space's entry, which decides whether to dial.
+//! Nothing here touches the peer store: a dial makes the transport open a
+//! connection and run its preflight, and from there the access module
+//! proves that both sides know the space's secret before any agent info
+//! changes hands.
 
-use crate::dial_policy::DialPolicy;
 use crate::discovery;
 use crate::fingerprint::SpaceFingerprint;
-use kitsune2_api::{DynTransport, SpaceId, Url};
+use crate::space::SpaceEntry;
+use kitsune2_api::Url;
 use mdns_sd::ServiceEvent;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, trace};
+use tracing::trace;
 
-/// What this node looks like on the LAN, so the browse loop can recognise
-/// its own announcements. The instance name is fixed for the life of the
-/// service; the URL follows whatever is currently advertised.
-#[derive(Debug)]
-pub struct LocalIdentity {
-    fullname: String,
-    url: Mutex<Option<Url>>,
-}
+/// The spaces currently sharing the daemon, by the fingerprint they
+/// announce and match on.
+pub type Registry = Mutex<HashMap<SpaceFingerprint, Arc<SpaceEntry>>>;
 
-impl LocalIdentity {
-    /// An identity with the given mDNS instance fullname and no URL yet.
-    pub fn new(fullname: String) -> Self {
-        Self {
-            fullname,
-            url: Mutex::new(None),
-        }
-    }
-
-    /// Record the URL we are currently announcing.
-    pub fn set_url(&self, url: Url) {
-        *self.url.lock().expect("identity poisoned") = Some(url);
-    }
-
-    fn url(&self) -> Option<Url> {
-        self.url.lock().expect("identity poisoned").clone()
-    }
-}
-
-/// Consume browse events until the source closes, dialling every peer that
-/// passes the announcement filter and the dial policy.
-///
-/// Dials run in their own tasks so that a slow connect never holds up the
-/// event stream; the policy's in-flight cap bounds how many run at once.
+/// Consume browse events until the source closes.
 pub async fn browse_loop(
     rx: flume::Receiver<ServiceEvent>,
-    space_id: SpaceId,
-    fp: SpaceFingerprint,
-    identity: Arc<LocalIdentity>,
-    tx: DynTransport,
-    policy: Arc<DialPolicy>,
+    registry: Arc<Registry>,
 ) {
+    // Withdrawal events carry only the record's name, so what each name
+    // last announced is kept here to know what to forget.
+    let mut announced: HashMap<String, (SpaceFingerprint, Url)> =
+        HashMap::new();
     while let Ok(event) = rx.recv_async().await {
-        let self_url = identity.url();
-        let Some(peer) = discovery::resolved_to_peer(
-            &event,
-            &fp,
-            &identity.fullname,
-            self_url.as_ref(),
-        ) else {
-            continue;
-        };
-        if !policy.claim(&peer.url) {
-            trace!(url = %peer.url, "mdns: peer within dial cooldown, skipping");
-            continue;
-        }
-        debug!(url = %peer.url, fullname = %peer.fullname, "mdns: discovered peer, dialling");
-
-        let tx = tx.clone();
-        let policy = policy.clone();
-        let space_id = space_id.clone();
-        tokio::spawn(async move {
-            let _slot = policy.acquire_slot().await;
-            match tx.dial(space_id, peer.url.clone()).await {
-                Ok(()) => debug!(url = %peer.url, "mdns: dial succeeded"),
-                Err(err) => debug!(?err, url = %peer.url, "mdns: dial failed"),
+        match event {
+            ServiceEvent::ServiceResolved(svc) => {
+                let Some((fp, url)) = discovery::parse_record(&svc) else {
+                    trace!(fullname = %svc.fullname, "mdns: ignoring record without a usable spacefp and url");
+                    continue;
+                };
+                let Some(entry) = lookup(&registry, &fp) else {
+                    trace!(fullname = %svc.fullname, "mdns: record for a space this node is not in");
+                    continue;
+                };
+                if entry.is_own_record(&svc.fullname, &url) {
+                    continue;
+                }
+                if let Some((_, previous)) =
+                    announced.insert(svc.fullname.clone(), (fp, url.clone()))
+                    && previous != url
+                {
+                    entry.record_removed(&previous);
+                }
+                trace!(fullname = %svc.fullname, %url, "mdns: resolved record");
+                entry.record_resolved(url);
             }
-        });
+            ServiceEvent::ServiceRemoved(_, fullname) => {
+                if let Some((fp, url)) = announced.remove(&fullname)
+                    && let Some(entry) = lookup(&registry, &fp)
+                {
+                    entry.record_removed(&url);
+                }
+            }
+            _ => {}
+        }
     }
     trace!("mdns: browse event source closed, browse loop ending");
+}
+
+fn lookup(
+    registry: &Registry,
+    fp: &SpaceFingerprint,
+) -> Option<Arc<SpaceEntry>> {
+    registry.lock().expect("poison").get(fp).cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::Daemon as _;
     use crate::discovery::test_support::*;
     use crate::fingerprint::space_fingerprint;
-    use kitsune2_api::{MockTransport, SpaceId};
+    use kitsune2_api::{DynTransport, MockTransport, SpaceId};
     use std::time::Duration;
 
-    const SELF: &str = "self-instance";
-    const SELF_URL: &str = "ws://self.test:80/selfpeer";
     const PEER_A: &str = "ws://a.test:80/peera";
     const PEER_B: &str = "ws://b.test:80/peerb";
+    const SELF_URL: &str = "ws://self.test:80/selfpeer";
 
-    fn space() -> SpaceId {
-        SpaceId::from(bytes::Bytes::from_static(b"space"))
+    fn url(s: &str) -> Url {
+        Url::from_str(s).unwrap()
     }
 
-    /// A transport that only records which URLs it was asked to dial.
+    /// A transport that records its dials and never reports a connection.
     fn recording_transport() -> (DynTransport, Arc<Mutex<Vec<Url>>>) {
         let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut mock = MockTransport::new();
         let record = dials.clone();
-        mock.expect_dial().returning(move |_space_id, url| {
+        let mut mock = MockTransport::new();
+        mock.expect_dial().returning(move |_space, url| {
             record.lock().unwrap().push(url);
             Box::pin(async { Ok(()) })
         });
+        mock.expect_get_connected_peers()
+            .returning(|| Box::pin(async { Ok(Vec::new()) }));
         (Arc::new(mock), dials)
     }
 
+    struct Harness {
+        daemon: Arc<FakeDaemon>,
+        registry: Arc<Registry>,
+        _loop_task: tokio::task::JoinHandle<()>,
+    }
+
+    fn harness() -> Harness {
+        let daemon = FakeDaemon::new();
+        let registry: Arc<Registry> = Arc::new(Mutex::new(HashMap::new()));
+        let rx = daemon.browse().unwrap();
+        let loop_task = tokio::spawn(browse_loop(rx, registry.clone()));
+        Harness {
+            daemon,
+            registry,
+            _loop_task: loop_task,
+        }
+    }
+
+    fn join(
+        h: &Harness,
+        space: &[u8],
+    ) -> (Arc<SpaceEntry>, Arc<Mutex<Vec<Url>>>) {
+        let space_id = SpaceId::from(bytes::Bytes::copy_from_slice(space));
+        let (tx, dials) = recording_transport();
+        let entry = SpaceEntry::new(
+            space_id.clone(),
+            space_fingerprint(&space_id),
+            h.daemon.clone(),
+            tx,
+            4,
+        );
+        h.registry
+            .lock()
+            .unwrap()
+            .insert(*entry.fingerprint(), entry.clone());
+        (entry, dials)
+    }
+
     async fn settle() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
-    async fn dials_each_discovered_peer_once_within_cooldown() {
-        let (tx, dials) = recording_transport();
-        let (event_tx, event_rx) = flume::unbounded();
-        let identity = Arc::new(LocalIdentity::new(fullname(SELF)));
-        identity.set_url(Url::from_str(SELF_URL).unwrap());
-        let policy = Arc::new(DialPolicy::new(Duration::from_secs(60), 4));
-        let fp = space_fingerprint(&space());
-        let fp_hex = hex::encode(fp);
+    async fn records_are_routed_to_the_space_they_commit_to() {
+        let h = harness();
+        let (a, dials_a) = join(&h, b"space-a");
+        let (b, dials_b) = join(&h, b"space-b");
 
-        let loop_task = tokio::spawn(browse_loop(
-            event_rx,
-            space(),
-            fp,
-            identity,
-            tx,
-            policy,
-        ));
-
-        // The same peer resolved three times, a second peer once, our own
-        // record, a record for another space and a resolve without a URL.
-        for _ in 0..3 {
-            event_tx
-                .send(resolved(
-                    "peer-a",
-                    &[("spacefp", &fp_hex), ("url", PEER_A)],
-                ))
-                .unwrap();
-        }
-        event_tx
-            .send(resolved("peer-b", &[("spacefp", &fp_hex), ("url", PEER_B)]))
-            .unwrap();
-        event_tx
-            .send(resolved(SELF, &[("spacefp", &fp_hex), ("url", SELF_URL)]))
-            .unwrap();
-        event_tx
-            .send(resolved(
-                "peer-c",
-                &[("spacefp", &hex::encode([9u8; 32])), ("url", PEER_A)],
-            ))
-            .unwrap();
-        event_tx
-            .send(resolved("peer-d", &[("spacefp", &fp_hex)]))
-            .unwrap();
+        h.daemon
+            .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
+        h.daemon
+            .deliver(resolved_peer("peer-2", b.fingerprint(), PEER_B));
+        h.daemon
+            .deliver(resolved_peer("peer-3", &[9u8; 32], PEER_A));
+        h.daemon.deliver(resolved("peer-4", &[("url", PEER_A)]));
         settle().await;
 
-        let mut dialled = dials.lock().unwrap().clone();
-        dialled.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        assert_eq!(
-            dialled,
-            vec![
-                Url::from_str(PEER_A).unwrap(),
-                Url::from_str(PEER_B).unwrap()
-            ]
-        );
-
-        // Closing the event source ends the loop.
-        drop(event_tx);
-        tokio::time::timeout(Duration::from_secs(1), loop_task)
-            .await
-            .expect("browse loop should end when its source closes")
-            .unwrap();
+        assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
     }
 
     #[tokio::test]
-    async fn a_peer_announced_under_our_own_url_is_not_dialled() {
-        let (tx, dials) = recording_transport();
-        let (event_tx, event_rx) = flume::unbounded();
-        let identity = Arc::new(LocalIdentity::new(fullname(SELF)));
-        let policy = Arc::new(DialPolicy::new(Duration::from_secs(60), 4));
-        let fp = space_fingerprint(&space());
-        let fp_hex = hex::encode(fp);
-        let _loop_task = tokio::spawn(browse_loop(
-            event_rx,
-            space(),
-            fp,
-            identity.clone(),
-            tx,
-            policy,
-        ));
+    async fn our_own_record_is_not_dialled() {
+        let h = harness();
+        let (a, dials) = join(&h, b"space-a");
+        a.advertise(&url(SELF_URL)).unwrap();
 
-        // Before we know our URL an announcement naming it is dialled, as
-        // it would be for any other peer; once we know it, it is ours.
-        identity.set_url(Url::from_str(SELF_URL).unwrap());
-        event_tx
-            .send(resolved("echo", &[("spacefp", &fp_hex), ("url", SELF_URL)]))
-            .unwrap();
+        // Our record heard back by name, and an echo of our URL under
+        // another name.
+        let own_instance = a.fullname().replace(SERVICE_TYPE, "");
+        h.daemon.deliver(resolved_peer(
+            own_instance.trim_end_matches('.'),
+            a.fingerprint(),
+            PEER_A,
+        ));
+        h.daemon
+            .deliver(resolved_peer("echo", a.fingerprint(), SELF_URL));
         settle().await;
         assert!(dials.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_record_is_forgotten() {
+        let h = harness();
+        let (a, dials) = join(&h, b"space-a");
+
+        h.daemon
+            .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
+        settle().await;
+        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+
+        h.daemon.deliver(removed("peer-1"));
+        settle().await;
+        a.redial_unconnected().await;
+        settle().await;
+        assert_eq!(dials.lock().unwrap().len(), 1, "nothing left to redial");
+
+        // Heard again, it is new again.
+        h.daemon
+            .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
+        settle().await;
+        assert_eq!(dials.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_record_that_changes_its_url_forgets_the_old_one() {
+        let h = harness();
+        let (a, dials) = join(&h, b"space-a");
+
+        h.daemon
+            .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
+        h.daemon
+            .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_B));
+        settle().await;
+        dials.lock().unwrap().clear();
+
+        a.redial_unconnected().await;
+        settle().await;
+        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_B)]);
+    }
+
+    #[tokio::test]
+    async fn a_space_that_left_no_longer_receives_records() {
+        let h = harness();
+        let (a, dials_a) = join(&h, b"space-a");
+        let (b, dials_b) = join(&h, b"space-b");
+        h.registry.lock().unwrap().remove(a.fingerprint());
+
+        h.daemon
+            .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
+        h.daemon
+            .deliver(resolved_peer("peer-2", b.fingerprint(), PEER_B));
+        settle().await;
+
+        assert!(dials_a.lock().unwrap().is_empty());
+        assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
     }
 }

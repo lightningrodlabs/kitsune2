@@ -2538,6 +2538,8 @@ dependencies = [
  "hex",
  "if-addrs",
  "kitsune2_api",
+ "kitsune2_core",
+ "kitsune2_test_utils",
  "mdns-sd",
  "rand 0.10.2",
  "schemars",

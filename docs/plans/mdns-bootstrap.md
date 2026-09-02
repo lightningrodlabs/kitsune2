@@ -103,7 +103,7 @@ changes. Tombstones are ignored.
   "mdnsBootstrap": {
     "enabled": false,
     "serviceType": "_kitsune2._udp.local.",
-    "dialCooldownMs": 60000,
+    "redialIntervalMs": 30000,
     "maxConcurrentDials": 4
   },
   "irohTransport": { "enableLanDiscovery": false }

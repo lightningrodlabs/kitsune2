@@ -42,9 +42,11 @@
 
 pub mod browse;
 pub mod config;
-pub mod dial_policy;
+pub mod dials;
 pub mod discovery;
 pub mod fingerprint;
+pub mod shared;
+pub mod space;
 
 mod factory;
 pub use factory::*;
