@@ -132,7 +132,20 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 let out: DynBootstrap = Arc::new(NoopMdnsBootstrap);
                 return Ok(out);
             }
-            let shared = inner.shared(&cfg.service_type).await?;
+            // The LAN path is the optional one: a host without multicast
+            // must not lose its other bootstraps over it.
+            let shared = match inner.shared(&cfg.service_type).await {
+                Ok(shared) => shared,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        ?space_id,
+                        "mdns bootstrap could not start, LAN discovery is off for this space"
+                    );
+                    let out: DynBootstrap = Arc::new(NoopMdnsBootstrap);
+                    return Ok(out);
+                }
+            };
             let fp = SpaceFingerprint::derive(&builder, &space_id).await?;
             let boot = MdnsBootstrap::join(shared, &cfg, space_id, fp, tx);
             let out: DynBootstrap = Arc::new(boot);

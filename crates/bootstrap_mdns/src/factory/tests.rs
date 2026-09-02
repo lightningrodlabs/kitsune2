@@ -239,3 +239,52 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
     assert!(count >= 2, "expected redials, saw {count} dials");
     assert!(dials.lock().unwrap().iter().all(|u| u == &url(PEER_A)));
 }
+
+/// The LAN path is the optional one: a daemon that cannot start on this
+/// host must not cost the space its other bootstraps.
+#[tokio::test]
+async fn a_failing_daemon_start_yields_a_noop_bootstrap() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let factory = {
+        let starts = starts.clone();
+        Arc::new(MdnsBootstrapFactory::with_daemon_start(Arc::new(
+            move |_service_type| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                Err(K2Error::other("no multicast on this host"))
+            },
+        )))
+    };
+    let builder = Builder {
+        bootstrap: factory.clone(),
+        ..kitsune2_core::default_test_builder()
+    }
+    .with_default_config()
+    .unwrap();
+    builder
+        .config
+        .set_module_config(&MdnsBootstrapModConfig {
+            mdns_bootstrap: enabled(),
+        })
+        .unwrap();
+    let h = Harness {
+        factory,
+        daemon: FakeDaemon::new(),
+        starts,
+        builder: Arc::new(builder),
+    };
+
+    let (boot, space_id, dials) = create_space(&h, b"space-a", vec![]).await;
+    assert_eq!(h.starts.load(Ordering::SeqCst), 1);
+    assert!(h.factory.shared_if_started().is_none());
+
+    // The no-op accepts puts and never dials.
+    boot.put(
+        AgentBuilder::default()
+            .with_space(space_id)
+            .with_url(Some(url(PEER_A)))
+            .build(TestLocalAgent::default()),
+    );
+    settle().await;
+    assert!(dials.lock().unwrap().is_empty());
+    assert!(h.daemon.registered.lock().unwrap().is_empty());
+}
