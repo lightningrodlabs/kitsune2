@@ -51,6 +51,36 @@ impl Default for MdnsBootstrapConfig {
     }
 }
 
+/// The longest service label mDNS-SD allows, in bytes, not counting the
+/// leading underscore. The daemon enforces this inside its own thread after
+/// `register` has already returned success, so a longer label would browse
+/// but never announce; checking it here turns that silence into a config
+/// error.
+pub const SERVICE_LABEL_MAX_LEN: usize = 15;
+
+/// Check that `service_type` is a service type this crate can announce
+/// under: `_<label>._udp.local.` or `_<label>._tcp.local.` with a label of
+/// 1 to [`SERVICE_LABEL_MAX_LEN`] bytes.
+pub fn validate_service_type(service_type: &str) -> Result<(), String> {
+    let label = service_type
+        .strip_suffix("._udp.local.")
+        .or_else(|| service_type.strip_suffix("._tcp.local."))
+        .and_then(|name| name.strip_prefix('_'))
+        .filter(|label| !label.is_empty() && !label.contains('.'))
+        .ok_or_else(|| {
+            format!(
+                "mdnsBootstrap.serviceType must be of the form _name._udp.local., got {service_type:?}"
+            )
+        })?;
+    if label.len() > SERVICE_LABEL_MAX_LEN {
+        return Err(format!(
+            "mdnsBootstrap.serviceType label {label:?} is {} bytes, the mDNS limit is {SERVICE_LABEL_MAX_LEN}",
+            label.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Module-level configuration for [`MdnsBootstrapFactory`](crate::MdnsBootstrapFactory).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -58,4 +88,39 @@ impl Default for MdnsBootstrapConfig {
 pub struct MdnsBootstrapModConfig {
     /// mDNS bootstrap configuration.
     pub mdns_bootstrap: MdnsBootstrapConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_service_type_is_valid() {
+        validate_service_type(&MdnsBootstrapConfig::default().service_type)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fifteen_byte_label_is_the_longest_allowed() {
+        validate_service_type("_abcdefghijklmno._udp.local.").unwrap();
+        validate_service_type("_abcdefghijklmno._tcp.local.").unwrap();
+        let err = validate_service_type("_abcdefghijklmnop._udp.local.")
+            .expect_err("16-byte label");
+        assert!(err.contains("16 bytes"), "{err}");
+    }
+
+    #[test]
+    fn malformed_service_types_are_rejected() {
+        for bad in [
+            "",
+            "_udp.local.",
+            "kitsune2._udp.local.",
+            "_._udp.local.",
+            "_kitsune2._udp.local",
+            "_kitsune2.local.",
+            "_a._sub._kitsune2._udp.local.",
+        ] {
+            assert!(validate_service_type(bad).is_err(), "{bad:?}");
+        }
+    }
 }
