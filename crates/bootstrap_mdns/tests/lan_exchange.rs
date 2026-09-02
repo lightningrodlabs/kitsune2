@@ -13,6 +13,7 @@ use kitsune2_bootstrap_mdns::config::{
 };
 use kitsune2_core::factories::{MemBlocksFactory, MemPeerStoreFactory};
 use kitsune2_test_utils::agent::{AgentBuilder, TestLocalAgent, TestVerifier};
+use kitsune2_test_utils::tx_handler::TestTxHandler;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,8 +88,19 @@ async fn mk_node(
         .await
         .unwrap();
 
+    let tx = builder
+        .transport
+        .create(
+            builder.clone(),
+            TestTxHandler::create(
+                Arc::new(tokio::sync::OnceCell::new()),
+                Arc::new(TestVerifier),
+            ),
+        )
+        .await
+        .unwrap();
     let bootstrap = factory
-        .create(builder.clone(), peer_store.clone(), space_id)
+        .create(builder.clone(), peer_store.clone(), space_id, tx)
         .await
         .unwrap();
 

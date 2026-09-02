@@ -140,7 +140,12 @@ impl SpaceFactory for CoreSpaceFactory {
 
             let bootstrap = builder
                 .bootstrap
-                .create(builder.clone(), peer_store.clone(), space_id.clone())
+                .create(
+                    builder.clone(),
+                    peer_store.clone(),
+                    space_id.clone(),
+                    tx.clone(),
+                )
                 .await?;
             let local_agent_store =
                 builder.local_agent_store.create(builder.clone()).await?;

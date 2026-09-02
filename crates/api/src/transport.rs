@@ -568,6 +568,18 @@ pub trait TxImp: 'static + Send + Sync + std::fmt::Debug {
     /// peer, opening a connection if needed.
     fn send(&self, peer: Url, data: bytes::Bytes) -> BoxFut<'_, K2Result<()>>;
 
+    /// Establish a connection to the remote peer, or reuse the one already
+    /// open, and complete the preflight exchange on it. Nothing else is sent:
+    /// the point is to make the peer known to both transports so that the
+    /// usual post-connect handling (peer store insertion, access grants) can
+    /// run, without any module having a message to deliver yet.
+    ///
+    /// Transports without a connection phase have nothing to establish, so the
+    /// default implementation succeeds without doing anything.
+    fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Get the list of connected peers.
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>>;
 
@@ -664,6 +676,13 @@ pub trait Transport: 'static + Send + Sync + std::fmt::Debug {
         module: String,
         data: bytes::Bytes,
     ) -> BoxFut<'_, K2Result<()>>;
+
+    /// Establish a connection to the remote peer, or reuse the one already
+    /// open, and complete the preflight exchange on it without sending any
+    /// application data. Used by discovery mechanisms that learn a peer URL
+    /// and want the peer introduced to this node before any module has a
+    /// reason to message it.
+    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>>;
 
     /// Get the list of connected peers.
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>>;
@@ -920,6 +939,10 @@ impl Transport for DefaultTransport {
             .encode()?;
             self.imp.send(peer_url, enc).await
         })
+    }
+
+    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
+        self.imp.dial(peer)
     }
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
