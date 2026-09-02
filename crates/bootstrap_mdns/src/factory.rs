@@ -8,21 +8,28 @@ use crate::fingerprint::SpaceFingerprint;
 use crate::shared::SharedMdns;
 use crate::space::SpaceEntry;
 use kitsune2_api::*;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::task::JoinHandle;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
 /// How the factory starts its mDNS daemon for a service type. Injectable
 /// so that the factory can be exercised without multicast.
-pub type DaemonStart =
+pub(crate) type DaemonStart =
     Arc<dyn Fn(&str) -> K2Result<DynDaemon> + Send + Sync + 'static>;
+
+/// How long a daemon that failed to start is left alone before a space
+/// creation tries again. Long enough that fifty spaces starting at once
+/// cost one attempt, short enough that a node which gains a network later
+/// recovers.
+pub const FAILED_START_RETRY: Duration = Duration::from_secs(60);
 
 /// The [`BootstrapFactory`] that produces [`MdnsBootstrap`] instances.
 ///
-/// One factory owns one mDNS daemon, started the first time an enabled
-/// space is created and kept for the factory's life; every space created
-/// through it shares that daemon and its single browse.
+/// One factory owns one mDNS daemon per service type, started the first
+/// time an enabled space asks for that type and kept for the factory's
+/// life; every space on the same type shares that daemon, its single
+/// browse and its reconciliation ticker.
 pub struct MdnsBootstrapFactory {
     inner: Arc<FactoryInner>,
 }
@@ -30,15 +37,26 @@ pub struct MdnsBootstrapFactory {
 /// The state a factory's `create` futures share with it: they outlive the
 /// borrow of the factory, so it lives behind an `Arc`.
 struct FactoryInner {
-    shared: tokio::sync::OnceCell<Arc<SharedMdns>>,
+    /// One slot per service type, held across a start so that spaces
+    /// created together do not race to start the same daemon.
+    daemons: tokio::sync::Mutex<HashMap<String, DaemonSlot>>,
     daemon_start: DaemonStart,
+}
+
+/// What a service type's daemon is doing.
+enum DaemonSlot {
+    Running(Arc<SharedMdns>),
+    /// The last start failed at `at`; retried after [`FAILED_START_RETRY`].
+    Failed {
+        at: Instant,
+        err: String,
+    },
 }
 
 impl std::fmt::Debug for MdnsBootstrapFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MdnsBootstrapFactory")
-            .field("shared", &self.inner.shared.get())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -48,43 +66,81 @@ impl MdnsBootstrapFactory {
         Arc::new(Self::with_daemon_start(Arc::new(start_mdns_sd_daemon)))
     }
 
-    /// A factory whose daemon comes from `daemon_start`.
+    /// A factory whose daemons come from `daemon_start`.
     pub(crate) fn with_daemon_start(daemon_start: DaemonStart) -> Self {
         Self {
             inner: Arc::new(FactoryInner {
-                shared: tokio::sync::OnceCell::new(),
+                daemons: tokio::sync::Mutex::new(HashMap::new()),
                 daemon_start,
             }),
         }
     }
 
-    /// The shared presence, if a space has started it.
+    /// The shared presence for `service_type`, if a space has started it.
     #[cfg(test)]
-    pub(crate) fn shared_if_started(&self) -> Option<Arc<SharedMdns>> {
-        self.inner.shared.get().cloned()
+    pub(crate) fn shared_for(
+        &self,
+        service_type: &str,
+    ) -> Option<Arc<SharedMdns>> {
+        match self
+            .inner
+            .daemons
+            .try_lock()
+            .expect("unlocked")
+            .get(service_type)
+        {
+            Some(DaemonSlot::Running(shared)) => Some(shared.clone()),
+            _ => None,
+        }
     }
 }
 
 impl FactoryInner {
-    /// The process-wide mDNS presence, started on first use.
+    /// The shared mDNS presence for the space's service type, started on
+    /// first use. The reconciliation interval is that of the space which
+    /// starts the daemon; later spaces on the same service type share it.
     ///
     /// Starting the daemon binds sockets and spawns a thread, so it runs on
     /// the blocking pool.
-    async fn shared(&self, service_type: &str) -> K2Result<Arc<SharedMdns>> {
-        self.shared
-            .get_or_try_init(|| async {
-                let start = self.daemon_start.clone();
-                let service_type = service_type.to_string();
-                let daemon =
-                    tokio::task::spawn_blocking(move || start(&service_type))
-                        .await
-                        .map_err(|e| {
-                            K2Error::other_src("mdns daemon start task", e)
-                        })??;
-                SharedMdns::start(daemon)
-            })
+    async fn shared(
+        &self,
+        cfg: &MdnsBootstrapConfig,
+        tx: DynTransport,
+    ) -> K2Result<Arc<SharedMdns>> {
+        let mut daemons = self.daemons.lock().await;
+        match daemons.get(&cfg.service_type) {
+            Some(DaemonSlot::Running(shared)) => return Ok(shared.clone()),
+            Some(DaemonSlot::Failed { at, err })
+                if at.elapsed() < FAILED_START_RETRY =>
+            {
+                return Err(K2Error::other(format!(
+                    "mdns daemon start failed {:?} ago, not retrying yet: {err}",
+                    at.elapsed()
+                )));
+            }
+            _ => {}
+        }
+        let start = self.daemon_start.clone();
+        let service_type = cfg.service_type.clone();
+        let started = tokio::task::spawn_blocking(move || start(&service_type))
             .await
-            .cloned()
+            .map_err(|e| K2Error::other_src("mdns daemon start task", e))
+            .and_then(|daemon| {
+                SharedMdns::start(
+                    daemon?,
+                    tx,
+                    Duration::from_millis(cfg.redial_interval_ms as u64),
+                )
+            });
+        let slot = match &started {
+            Ok(shared) => DaemonSlot::Running(shared.clone()),
+            Err(err) => DaemonSlot::Failed {
+                at: Instant::now(),
+                err: err.to_string(),
+            },
+        };
+        daemons.insert(cfg.service_type.clone(), slot);
+        started
     }
 }
 
@@ -139,7 +195,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
             // discovery is decided by whoever assembles the bootstrap
             // stack.
             let fp = SpaceFingerprint::derive(&builder, &space_id).await?;
-            let shared = inner.shared(&cfg.service_type).await?;
+            let shared = inner.shared(&cfg, tx.clone()).await?;
             let boot = MdnsBootstrap::join(shared, &cfg, space_id, fp, tx);
             let out: DynBootstrap = Arc::new(boot);
             Ok(out)
@@ -166,12 +222,10 @@ impl Bootstrap for DisabledMdnsBootstrap {
 pub struct MdnsBootstrap {
     shared: Arc<SharedMdns>,
     entry: Arc<SpaceEntry>,
-    redial_task: JoinHandle<()>,
 }
 
 impl Drop for MdnsBootstrap {
     fn drop(&mut self) {
-        self.redial_task.abort();
         self.shared.leave(&self.entry);
     }
 }
@@ -217,34 +271,12 @@ impl MdnsBootstrap {
             tx,
             cfg.max_concurrent_dials as usize,
         );
-        let redial_task = tokio::spawn(redial_loop(
-            entry.clone(),
-            Duration::from_millis(cfg.redial_interval_ms as u64),
-        ));
         debug!(
             ?space_id,
             fullname = %entry.fullname(),
             "mdns bootstrap joined the shared daemon"
         );
-        Self {
-            shared,
-            entry,
-            redial_task,
-        }
-    }
-}
-
-/// Every `interval`, dial the announced peers the transport is not
-/// connected to.
-async fn redial_loop(entry: Arc<SpaceEntry>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick completes immediately; announcements dial themselves
-    // on arrival, so the first round of reconciliation waits an interval.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        entry.reconcile_from_transport().await;
+        Self { shared, entry }
     }
 }
 

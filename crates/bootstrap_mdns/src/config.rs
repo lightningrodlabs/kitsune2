@@ -23,10 +23,17 @@ pub struct MdnsBootstrapConfig {
     pub service_type: String,
 
     /// How often, in milliseconds, announced peers the transport is not
-    /// connected to are dialled again. A peer is dialled once when its
-    /// announcement is first heard; if that dial fails — commonly because
-    /// the peer's transport record has not reached this node yet — this is
-    /// what retries it, for as long as the LAN keeps announcing the peer.
+    /// connected to are considered for another dial. A peer is dialled
+    /// once when its announcement is first heard; if that dial fails —
+    /// commonly because the peer's transport record has not reached this
+    /// node yet — it is retried after one interval, then two, four, up to
+    /// sixteen intervals between dials, for as long as the LAN keeps
+    /// announcing the peer. A fresh announcement restarts the short
+    /// schedule.
+    ///
+    /// All spaces announcing under one `serviceType` share one
+    /// reconciliation ticker, whose interval is that of the space that
+    /// started it.
     ///
     /// Default: 30 seconds.
     #[cfg_attr(feature = "schema", schemars(default))]

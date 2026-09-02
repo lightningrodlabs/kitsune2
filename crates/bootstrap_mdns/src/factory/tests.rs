@@ -4,32 +4,32 @@
 use super::*;
 use crate::test_support::*;
 use kitsune2_test_utils::agent::{AgentBuilder, TestLocalAgent};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 const PEER_A: &str = "ws://a.test:80/peera";
 const PEER_B: &str = "ws://b.test:80/peerb";
+const SELF_URL: &str = "ws://self.test:80/selfpeer";
+const OTHER_TYPE: &str = "_k2other._udp.local.";
 
 struct Harness {
     factory: Arc<MdnsBootstrapFactory>,
     daemon: Arc<FakeDaemon>,
-    /// How many times the daemon-start hook ran.
-    starts: Arc<AtomicUsize>,
+    /// The service type of every daemon-start hook run, in order.
+    starts: Arc<Mutex<Vec<String>>>,
     builder: Arc<Builder>,
 }
 
-fn harness(cfg: MdnsBootstrapConfig) -> Harness {
-    let daemon = FakeDaemon::new();
-    let starts = Arc::new(AtomicUsize::new(0));
-    let factory = {
-        let daemon = daemon.clone();
-        let starts = starts.clone();
-        Arc::new(MdnsBootstrapFactory::with_daemon_start(Arc::new(
-            move |_service_type| {
-                starts.fetch_add(1, Ordering::SeqCst);
-                Ok(daemon.clone() as DynDaemon)
-            },
-        )))
-    };
+impl Harness {
+    fn start_count(&self) -> usize {
+        self.starts.lock().unwrap().len()
+    }
+}
+
+/// A builder over `factory` whose mDNS config is `cfg`.
+fn builder_with(
+    factory: &Arc<MdnsBootstrapFactory>,
+    cfg: MdnsBootstrapConfig,
+) -> Arc<Builder> {
     let builder = Builder {
         bootstrap: factory.clone(),
         ..kitsune2_core::default_test_builder()
@@ -42,12 +42,47 @@ fn harness(cfg: MdnsBootstrapConfig) -> Harness {
             mdns_bootstrap: cfg,
         })
         .unwrap();
+    Arc::new(builder)
+}
+
+/// A harness whose daemon-start hook runs `start`.
+fn harness_with(
+    cfg: MdnsBootstrapConfig,
+    start: impl Fn(&str, &Arc<FakeDaemon>) -> K2Result<DynDaemon>
+    + Send
+    + Sync
+    + 'static,
+) -> Harness {
+    let daemon = FakeDaemon::new();
+    let starts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let factory = {
+        let daemon = daemon.clone();
+        let starts = starts.clone();
+        Arc::new(MdnsBootstrapFactory::with_daemon_start(Arc::new(
+            move |service_type| {
+                starts.lock().unwrap().push(service_type.to_string());
+                start(service_type, &daemon)
+            },
+        )))
+    };
+    let builder = builder_with(&factory, cfg);
     Harness {
         factory,
         daemon,
         starts,
-        builder: Arc::new(builder),
+        builder,
     }
+}
+
+fn harness(cfg: MdnsBootstrapConfig) -> Harness {
+    harness_with(cfg, |_, daemon| Ok(daemon.clone() as DynDaemon))
+}
+
+/// A harness whose daemon never starts.
+fn failing_harness() -> Harness {
+    harness_with(enabled(), |_, _| {
+        Err(K2Error::other("no multicast on this host"))
+    })
 }
 
 fn enabled() -> MdnsBootstrapConfig {
@@ -79,14 +114,26 @@ async fn create_space(
     space: &[u8],
     connected: Vec<Url>,
 ) -> (DynBootstrap, SpaceId, Dials) {
+    let (boot, space_id, dials) =
+        try_create_space(h, &h.builder, space, connected).await;
+    (boot.unwrap(), space_id, dials)
+}
+
+/// Create a space's bootstrap through `builder`'s factory, returning the
+/// result with the dials its transport recorded.
+async fn try_create_space(
+    h: &Harness,
+    builder: &Arc<Builder>,
+    space: &[u8],
+    connected: Vec<Url>,
+) -> (K2Result<DynBootstrap>, SpaceId, Dials) {
     let space_id = space_id(space);
     let (tx, dials) = recording_transport(connected);
     let peer_store = peer_store(h, &space_id).await;
     let boot = h
         .factory
-        .create(h.builder.clone(), peer_store, space_id.clone(), tx)
-        .await
-        .unwrap();
+        .create(builder.clone(), peer_store, space_id.clone(), tx)
+        .await;
     (boot, space_id, dials)
 }
 
@@ -101,15 +148,17 @@ fn put(boot: &DynBootstrap, space: &SpaceId, url: &Url) {
     );
 }
 
-const SELF_URL: &str = "ws://self.test:80/selfpeer";
+async fn fp_of(h: &Harness, space: &SpaceId) -> SpaceFingerprint {
+    SpaceFingerprint::derive(&h.builder, space).await.unwrap()
+}
 
 #[tokio::test]
 async fn spaces_share_one_daemon_and_announce_their_own_records() {
     let h = harness(enabled());
     let (boot_a, space_a, _) = create_space(&h, b"space-a", vec![]).await;
     let (boot_b, space_b, _) = create_space(&h, b"space-b", vec![]).await;
-    assert_eq!(h.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(h.factory.shared_if_started().unwrap().space_count(), 2);
+    assert_eq!(h.start_count(), 1);
+    assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 2);
 
     put(&boot_a, &space_a, &url(PEER_A));
     put(&boot_b, &space_b, &url(PEER_A));
@@ -128,8 +177,8 @@ async fn spaces_share_one_daemon_and_announce_their_own_records() {
 async fn a_disabled_factory_starts_no_daemon() {
     let h = harness(MdnsBootstrapConfig::default());
     let (_boot, _, _) = create_space(&h, b"space-a", vec![]).await;
-    assert_eq!(h.starts.load(Ordering::SeqCst), 0);
-    assert!(h.factory.shared_if_started().is_none());
+    assert_eq!(h.start_count(), 0);
+    assert!(h.factory.shared_for(SERVICE_TYPE).is_none());
 }
 
 #[tokio::test]
@@ -145,9 +194,7 @@ async fn a_record_for_one_space_never_dials_for_another() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &SpaceFingerprint::derive(&h.builder, &space_a)
-            .await
-            .unwrap(),
+        &fp_of(&h, &space_a).await,
         PEER_A,
     ));
     settle().await;
@@ -166,7 +213,7 @@ async fn dropping_one_space_leaves_the_other_browsing() {
     settle().await;
 
     drop(boot_a);
-    assert_eq!(h.factory.shared_if_started().unwrap().space_count(), 1);
+    assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 1);
     assert_eq!(
         h.daemon.unregistered.lock().unwrap().len(),
         1,
@@ -175,16 +222,12 @@ async fn dropping_one_space_leaves_the_other_browsing() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &SpaceFingerprint::derive(&h.builder, &space_a)
-            .await
-            .unwrap(),
+        &fp_of(&h, &space_a).await,
         PEER_A,
     ));
     h.daemon.deliver(resolved_peer(
         "peer-2",
-        &SpaceFingerprint::derive(&h.builder, &space_b)
-            .await
-            .unwrap(),
+        &fp_of(&h, &space_b).await,
         PEER_B,
     ));
     settle().await;
@@ -205,9 +248,7 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &SpaceFingerprint::derive(&h.builder, &space_a)
-            .await
-            .unwrap(),
+        &fp_of(&h, &space_a).await,
         PEER_A,
     ));
     settle().await;
@@ -220,52 +261,6 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
     assert!(dials.lock().unwrap().iter().all(|u| u == &url(PEER_A)));
 }
 
-/// A daemon that cannot start is reported as the error it is; making the
-/// LAN path optional is the wrapping factory's job.
-#[tokio::test]
-async fn a_failing_daemon_start_fails_create() {
-    let starts = Arc::new(AtomicUsize::new(0));
-    let factory = {
-        let starts = starts.clone();
-        Arc::new(MdnsBootstrapFactory::with_daemon_start(Arc::new(
-            move |_service_type| {
-                starts.fetch_add(1, Ordering::SeqCst);
-                Err(K2Error::other("no multicast on this host"))
-            },
-        )))
-    };
-    let builder = Builder {
-        bootstrap: factory.clone(),
-        ..kitsune2_core::default_test_builder()
-    }
-    .with_default_config()
-    .unwrap();
-    builder
-        .config
-        .set_module_config(&MdnsBootstrapModConfig {
-            mdns_bootstrap: enabled(),
-        })
-        .unwrap();
-    let h = Harness {
-        factory,
-        daemon: FakeDaemon::new(),
-        starts,
-        builder: Arc::new(builder),
-    };
-
-    let space_id = space_id(b"space-a");
-    let (tx, _) = recording_transport(vec![]);
-    let peer_store = peer_store(&h, &space_id).await;
-    let err = h
-        .factory
-        .create(h.builder.clone(), peer_store, space_id, tx)
-        .await
-        .expect_err("a daemon that cannot start fails the create");
-    assert!(err.to_string().contains("no multicast"), "{err}");
-    assert_eq!(h.starts.load(Ordering::SeqCst), 1);
-    assert!(h.factory.shared_if_started().is_none());
-}
-
 /// A record heard before the space's first put is dialled by that put:
 /// the URL is what makes the space dialable, and the LAN does not repeat
 /// itself.
@@ -276,9 +271,7 @@ async fn the_first_put_dials_what_was_heard_before_it() {
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &SpaceFingerprint::derive(&h.builder, &space_a)
-            .await
-            .unwrap(),
+        &fp_of(&h, &space_a).await,
         PEER_A,
     ));
     settle().await;
@@ -298,9 +291,7 @@ async fn a_space_created_later_hears_records_resolved_before_it() {
     let space_b = space_id(b"space-b");
     h.daemon.deliver(resolved_peer(
         "peer-1",
-        &SpaceFingerprint::derive(&h.builder, &space_b)
-            .await
-            .unwrap(),
+        &fp_of(&h, &space_b).await,
         PEER_B,
     ));
     settle().await;
@@ -309,4 +300,64 @@ async fn a_space_created_later_hears_records_resolved_before_it() {
     put(&boot_b, &space_b, &url(SELF_URL));
     settle().await;
     assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
+}
+
+/// A daemon that cannot start is reported as the error it is; making the
+/// LAN path optional is the wrapping factory's job.
+#[tokio::test]
+async fn a_failing_daemon_start_fails_create() {
+    let h = failing_harness();
+
+    let (boot, _, _) =
+        try_create_space(&h, &h.builder, b"space-a", vec![]).await;
+    let err = boot.expect_err("a daemon that cannot start fails the create");
+    assert!(err.to_string().contains("no multicast"), "{err}");
+    assert_eq!(h.start_count(), 1);
+    assert!(h.factory.shared_for(SERVICE_TYPE).is_none());
+}
+
+/// Fifty spaces created on a host without multicast must not cost fifty
+/// daemon start attempts: the failure is remembered for a while.
+#[tokio::test]
+async fn a_failed_start_is_not_retried_within_the_window() {
+    let h = failing_harness();
+
+    let (first, _, _) =
+        try_create_space(&h, &h.builder, b"space-a", vec![]).await;
+    let (second, _, _) =
+        try_create_space(&h, &h.builder, b"space-b", vec![]).await;
+    assert!(first.is_err());
+    let err = second.expect_err("still failing").to_string();
+    assert!(err.contains("not retrying yet"), "{err}");
+    assert!(
+        err.contains("no multicast"),
+        "the original error is kept: {err}"
+    );
+    assert_eq!(h.start_count(), 1, "one start attempt for both spaces");
+}
+
+/// A space whose config names another service type gets a daemon of its
+/// own rather than silently joining the first one.
+#[tokio::test]
+async fn each_service_type_gets_its_own_daemon() {
+    let h = harness(enabled());
+    let other = builder_with(
+        &h.factory,
+        MdnsBootstrapConfig {
+            service_type: OTHER_TYPE.into(),
+            ..enabled()
+        },
+    );
+
+    let (_boot_a, _, _) = create_space(&h, b"space-a", vec![]).await;
+    let (boot_b, _, _) = try_create_space(&h, &other, b"space-b", vec![]).await;
+    let _boot_b = boot_b.unwrap();
+    let (_boot_c, _, _) = create_space(&h, b"space-c", vec![]).await;
+
+    assert_eq!(
+        *h.starts.lock().unwrap(),
+        vec![SERVICE_TYPE.to_string(), OTHER_TYPE.to_string()]
+    );
+    assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 2);
+    assert_eq!(h.factory.shared_for(OTHER_TYPE).unwrap().space_count(), 1);
 }

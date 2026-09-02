@@ -88,6 +88,11 @@ impl BrowseState {
         self.spaces.len()
     }
 
+    /// Every registered space.
+    pub fn entries(&self) -> Vec<Arc<SpaceEntry>> {
+        self.spaces.values().cloned().collect()
+    }
+
     fn space(&self, fp: &str) -> Option<Arc<SpaceEntry>> {
         self.spaces.get(fp).cloned()
     }
