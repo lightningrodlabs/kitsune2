@@ -523,6 +523,10 @@ impl Endpoint for ConnectingEndpoint {
         Box::new(PendingWatcher)
     }
 
+    fn is_home_relay_connected(&self) -> bool {
+        true
+    }
+
     fn accept(&self) -> BoxFut<'_, Option<K2Result<DynConnection>>> {
         Box::pin(std::future::pending())
     }

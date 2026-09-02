@@ -8,8 +8,11 @@ mod connection_registry;
 mod dial;
 mod fakes;
 mod frame;
+mod lan_dial;
 mod relay_lifecycle;
 mod relay_qad;
+#[cfg(feature = "test-utils")]
+mod relay_status;
 mod simultaneous_open;
 mod stream;
 mod support;
