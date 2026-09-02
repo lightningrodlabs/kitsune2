@@ -4,12 +4,13 @@
 //! would be without LAN discovery, and forgiven when it next connects.
 
 use super::fakes::*;
+use super::support::{UnresponsiveCalls, build_recording_handler, remote_url};
 use crate::url::endpoint_from_url;
 use crate::{IrohTransportConfig, RELAY_NOT_CONNECTED_ERR};
 use iroh::TransportAddr;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 fn lan_config() -> IrohTransportConfig {
     IrohTransportConfig {
@@ -31,12 +32,13 @@ async fn attempt(
     endpoint: Arc<FakeEndpoint>,
     config: IrohTransportConfig,
 ) -> (String, UnresponsiveCalls) {
-    let calls: UnresponsiveCalls = Arc::new(Mutex::new(Vec::new()));
-    let remote_url = fake_remote_url();
+    let recorder = build_recording_handler();
+    let calls = recorder.unresponsive_calls.clone();
+    let remote_url = remote_url();
     let target = endpoint_from_url(&remote_url).unwrap();
     let transport = build_transport(
         endpoint,
-        build_handler_with_space(calls.clone()),
+        recorder.handler,
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(RwLock::new(Some(fake_local_url()))),
         config,
@@ -125,5 +127,5 @@ async fn connect_failure_blames_peer_with_lan_discovery_on() {
 
     assert!(err.contains("iroh connect error"), "got: {err}");
     assert_eq!(calls.lock().unwrap().len(), 1);
-    assert_eq!(calls.lock().unwrap()[0].0, fake_remote_url());
+    assert_eq!(calls.lock().unwrap()[0].0, remote_url());
 }

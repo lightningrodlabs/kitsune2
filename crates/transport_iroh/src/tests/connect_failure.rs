@@ -6,10 +6,11 @@
 //! that are difficult to trigger reproducibly via the real iroh stack.
 
 use super::fakes::*;
+use super::support::{build_recording_handler, remote_url};
 use crate::IrohTransportConfig;
 use crate::url::endpoint_from_url;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 fn config() -> IrohTransportConfig {
@@ -27,15 +28,16 @@ fn config() -> IrohTransportConfig {
 /// and surface a clear error.
 #[tokio::test]
 async fn marks_unresponsive_when_iroh_connect_returns_error() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls.clone());
+    let recorder = build_recording_handler();
+    let calls = recorder.unresponsive_calls.clone();
+    let handler = recorder.handler;
 
     let endpoint = Arc::new(FakeEndpoint {
         connect: connect_fails("timed out"),
         ..Default::default()
     });
 
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let target = endpoint_from_url(&remote_url).unwrap();
 
     let connections = Arc::new(RwLock::new(HashMap::new()));
@@ -80,15 +82,16 @@ async fn marks_unresponsive_when_iroh_connect_returns_error() {
 /// guarantee must hold.
 #[tokio::test]
 async fn marks_unresponsive_when_outer_connect_timeout_fires() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls.clone());
+    let recorder = build_recording_handler();
+    let calls = recorder.unresponsive_calls.clone();
+    let handler = recorder.handler;
 
     let endpoint = Arc::new(FakeEndpoint {
         connect: connect_hangs(),
         ..Default::default()
     });
 
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let target = endpoint_from_url(&remote_url).unwrap();
 
     let connections = Arc::new(RwLock::new(HashMap::new()));

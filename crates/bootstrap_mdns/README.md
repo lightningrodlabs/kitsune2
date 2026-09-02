@@ -118,6 +118,30 @@ a multicast-capable interface:
 KITSUNE2_LAN_TEST=1 cargo test -p kitsune2 --features mdns --test mdns_lan
 ```
 
+## Rejected alternatives
+
+- **Carrying the fingerprint in iroh's own mDNS user-data.** iroh's
+  address lookup already announces every endpoint on the LAN, and its
+  records can carry user data, so the fingerprint could ride along and
+  this crate could disappear. Rejected: this module is transport-agnostic
+  by design, and the hello layer it hands over to assumes discovery that
+  does not depend on the transport, so binding "which peers to dial" to
+  iroh's record format would tie both to one transport's mDNS.
+
+## Known limitations
+
+- The early peer URL that a node announces before its relay handshake
+  completes covers only the global `relay_url`; a per-space relay only
+  yields its URL once the relay handshake has run, so a space on a
+  per-space relay is announced later.
+
+## Follow-ups
+
+- A `peer_connect`-driven hello challenge. A bare kitsune2 node puts
+  nothing in the peer store when an mDNS dial lands, so today the hello
+  exchange waits for gossip's starvation sweep; challenging on connect
+  would make LAN discovery independent of gossip's timing.
+
 ## Non-goals
 
 - **Not a peer-info channel.** No `AgentInfoSigned` travels over mDNS or

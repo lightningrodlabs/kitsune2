@@ -137,6 +137,29 @@ a relay.
 4. No iroh types cross module boundaries: this crate sees `Url`s only.
 5. The e2e test is the canary to run on every iroh bump.
 
+## Rejected alternatives
+
+- **Fingerprint in iroh's mDNS user-data.** iroh's address lookup records
+  can carry user data, so the fingerprint could ride on the transport's
+  own announcement and `kitsune2_bootstrap_mdns` could go. Rejected: the
+  module is transport-agnostic, and access5's hello layer assumes a
+  transport-independent discovery; the transport's mDNS stays a
+  dialability mechanism only (migration rule 1).
+
+## Known limitations
+
+- The early URL announce (`transport_iroh`, on `enable_lan_discovery`)
+  derives the peer URL from the global `relay_url` alone. Per-space relays
+  get their URL from the relay handshake, so a space on a per-space relay
+  is not addressable on the LAN until that handshake completes.
+
+## Follow-ups
+
+- A `peer_connect`-driven hello challenge, so that a bare kitsune2 node
+  does not depend on gossip's starvation sweep to start the proof
+  exchange after an mDNS dial. The e2e's shortened gossip interval is a
+  stand-in for this.
+
 ## Follow-on: bootstrap-server hardening
 
 Out of scope here. A compromised WAN bootstrap server leaks every
