@@ -349,6 +349,30 @@ impl TxBaseHandler for TxHandlerTranslator {
             }
         })
     }
+
+    /// A peer that has just completed a connection with us is responsive by
+    /// definition, so any unresponsive mark it carries from an earlier failed
+    /// dial is stale. The transport calls this synchronously on its connect
+    /// path, so the store update runs in its own task.
+    fn peer_connect(&self, peer: Url) -> K2Result<()> {
+        let Some(core_space) = self.1.upgrade() else {
+            return Ok(());
+        };
+        tokio::task::spawn(async move {
+            if let Err(err) = core_space
+                .peer_meta_store
+                .clear_unresponsive(peer.clone())
+                .await
+            {
+                tracing::debug!(
+                    ?err,
+                    ?peer,
+                    "Failed to clear the unresponsive mark for a peer that connected"
+                );
+            }
+        });
+        Ok(())
+    }
 }
 
 impl TxSpaceHandler for TxHandlerTranslator {

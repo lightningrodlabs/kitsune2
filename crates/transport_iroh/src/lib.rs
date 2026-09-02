@@ -999,33 +999,6 @@ impl IrohTransport {
             .await
     }
 
-    /// Whether a failed connect attempt is evidence against the peer.
-    ///
-    /// With LAN discovery on, dials go out while our own relay is down or
-    /// still connecting, and a failure then is as likely ours as theirs; the
-    /// peer only takes the blame when our relay was up for the attempt.
-    fn connect_failure_blames_peer(&self) -> bool {
-        !self.config.enable_lan_discovery
-            || self.endpoint.is_home_relay_connected()
-    }
-
-    /// Mark the peer unresponsive after a failed connect attempt, when that
-    /// failure says something about the peer.
-    async fn record_connect_failure(&self, remote_url: &Url) {
-        if !self.connect_failure_blames_peer() {
-            debug!(
-                ?remote_url,
-                "connect failed while our relay is not connected, \
-                 peer will not be marked unresponsive"
-            );
-            return;
-        }
-        let _ = self
-            .handler
-            .set_unresponsive(remote_url.clone(), Timestamp::now())
-            .await;
-    }
-
     /// Creates a new connection and its associated context for a peer.
     ///
     /// The connection is established and the preflight frame is sent. If this
@@ -1074,11 +1047,20 @@ impl IrohTransport {
         .await
         {
             Err(e) => {
-                self.record_connect_failure(&remote_url).await;
+                // A peer that cannot be reached is marked unresponsive so the
+                // modules stop paying the connect timeout for it. The mark is
+                // lifted the moment a connection with the peer completes.
+                let _ = self
+                    .handler
+                    .set_unresponsive(remote_url.clone(), Timestamp::now())
+                    .await;
                 Err(K2Error::other_src("iroh connect timed out", e))
             }
             Ok(Err(e)) => {
-                self.record_connect_failure(&remote_url).await;
+                let _ = self
+                    .handler
+                    .set_unresponsive(remote_url.clone(), Timestamp::now())
+                    .await;
                 Err(K2Error::other_src("iroh connect error", e))
             }
             Ok(Ok(conn)) => Ok(conn),

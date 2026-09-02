@@ -56,8 +56,6 @@ pub(super) struct FakeEndpoint {
     pub connect_targets: Arc<Mutex<Vec<EndpointAddr>>>,
     /// What `is_home_relay_known_down` reports.
     pub relay_known_down: bool,
-    /// What `is_home_relay_connected` reports.
-    pub relay_connected: bool,
     /// What `discover_direct_addrs` reports for any peer.
     pub direct_addrs: Vec<TransportAddr>,
 }
@@ -68,7 +66,6 @@ impl Default for FakeEndpoint {
             connect: connect_fails("connect not configured for this test"),
             connect_targets: Arc::new(Mutex::new(Vec::new())),
             relay_known_down: false,
-            relay_connected: true,
             direct_addrs: Vec::new(),
         }
     }
@@ -126,10 +123,6 @@ impl Endpoint for FakeEndpoint {
 
     fn is_home_relay_known_down(&self) -> bool {
         self.relay_known_down
-    }
-
-    fn is_home_relay_connected(&self) -> bool {
-        self.relay_connected
     }
 
     fn discover_direct_addrs(

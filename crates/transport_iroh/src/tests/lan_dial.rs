@@ -1,6 +1,7 @@
 //! Unit tests for how LAN discovery changes outbound connection attempts:
-//! the relay-down guard lets a known LAN path through, and a failed dial
-//! only counts against the peer when our own relay was up for it.
+//! the relay-down guard lets a known LAN path through, and nothing else
+//! about a failed dial changes — the peer is marked unresponsive as it
+//! would be without LAN discovery, and forgiven when it next connects.
 
 use super::fakes::*;
 use crate::url::endpoint_from_url;
@@ -54,7 +55,6 @@ async fn relay_down_dials_lan_addresses_when_discovery_knows_them() {
     let endpoint = Arc::new(FakeEndpoint {
         connect: connect_fails("no route"),
         relay_known_down: true,
-        relay_connected: false,
         direct_addrs: vec![TransportAddr::Ip(lan_addr())],
         ..Default::default()
     });
@@ -81,7 +81,6 @@ async fn relay_down_dials_lan_addresses_when_discovery_knows_them() {
 async fn relay_down_without_lan_addresses_skips_the_dial() {
     let endpoint = Arc::new(FakeEndpoint {
         relay_known_down: true,
-        relay_connected: false,
         ..Default::default()
     });
 
@@ -99,7 +98,6 @@ async fn relay_down_without_lan_addresses_skips_the_dial() {
 async fn relay_down_guard_ignores_discovery_when_lan_discovery_is_off() {
     let endpoint = Arc::new(FakeEndpoint {
         relay_known_down: true,
-        relay_connected: false,
         direct_addrs: vec![TransportAddr::Ip(lan_addr())],
         ..Default::default()
     });
@@ -111,31 +109,14 @@ async fn relay_down_guard_ignores_discovery_when_lan_discovery_is_off() {
     assert!(endpoint.connect_targets.lock().unwrap().is_empty());
 }
 
-/// A failed dial while our relay is not connected says nothing about the
-/// peer, so it is not marked unresponsive.
+/// A failed dial counts against the peer whatever the state of our relay:
+/// with LAN discovery on, an unreachable relay is the normal condition, and
+/// a peer that fails to connect in that condition would otherwise cost every
+/// module a fresh connect timeout on every attempt.
 #[tokio::test]
-async fn connect_failure_does_not_blame_peer_while_relay_is_disconnected() {
+async fn connect_failure_blames_peer_with_lan_discovery_on() {
     let endpoint = Arc::new(FakeEndpoint {
         connect: connect_fails("timed out"),
-        relay_connected: false,
-        ..Default::default()
-    });
-
-    let (err, calls) = attempt(endpoint, lan_config()).await;
-
-    assert!(err.contains("iroh connect error"), "got: {err}");
-    assert!(
-        calls.lock().unwrap().is_empty(),
-        "peer must not be marked unresponsive while our relay is down"
-    );
-}
-
-/// A failed dial while our relay is connected is the peer's problem.
-#[tokio::test]
-async fn connect_failure_blames_peer_while_relay_is_connected() {
-    let endpoint = Arc::new(FakeEndpoint {
-        connect: connect_fails("timed out"),
-        relay_connected: true,
         ..Default::default()
     });
 

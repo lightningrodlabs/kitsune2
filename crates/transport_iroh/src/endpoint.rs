@@ -70,14 +70,6 @@ pub(crate) trait Endpoint:
     /// explicitly failed and iroh is waiting to retry.
     fn is_home_relay_known_down(&self) -> bool;
 
-    /// Returns `true` if a home relay is currently connected.
-    ///
-    /// `false` while no home relay has been selected yet: iroh only selects a
-    /// relay it has managed to reach, so an unreachable relay shows up as no
-    /// home relay at all rather than as a failed one. This transport always
-    /// configures relays, so the empty case never means "none configured".
-    fn is_home_relay_connected(&self) -> bool;
-
     /// Resolves direct (IP) transport addresses for the given peer via the
     /// endpoint's address lookup services (e.g. mDNS LAN discovery).
     ///
@@ -191,14 +183,6 @@ impl Endpoint for IrohEndpoint {
             .get()
             .iter()
             .any(|s| !s.is_connected() && s.last_error().is_some())
-    }
-
-    fn is_home_relay_connected(&self) -> bool {
-        self.inner
-            .home_relay_status()
-            .get()
-            .iter()
-            .any(|s| s.is_connected())
     }
 
     fn discover_direct_addrs(
