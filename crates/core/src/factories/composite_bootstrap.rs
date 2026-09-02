@@ -4,6 +4,12 @@
 //! one peer store, and `put` is fanned out to every one of them. This is the
 //! primary way to run WAN (`CoreBootstrap`) and LAN (`MdnsBootstrap`)
 //! simultaneously.
+//!
+//! The composite degrades rather than fails: an inner bootstrap that cannot
+//! start on this host — a LAN discovery with no usable interface, say — is
+//! logged and left out, and the space carries on with the rest. Only when
+//! no inner bootstrap at all could be created is that an error, because a
+//! space with no way to find peers is not what anyone configured.
 
 use kitsune2_api::*;
 use std::sync::Arc;
@@ -48,16 +54,38 @@ impl BootstrapFactory for CompositeBootstrapFactory {
         let inner = self.inner.clone();
         Box::pin(async move {
             let mut instances = Vec::with_capacity(inner.len());
+            let mut last_err = None;
             for f in inner {
-                instances.push(
-                    f.create(
+                match f
+                    .create(
                         builder.clone(),
                         peer_store.clone(),
                         space_id.clone(),
                         tx.clone(),
                     )
-                    .await?,
-                );
+                    .await
+                {
+                    Ok(instance) => instances.push(instance),
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            factory = ?f,
+                            "inner bootstrap failed to start, continuing without it"
+                        );
+                        last_err = Some(err);
+                    }
+                }
+            }
+            if instances.is_empty() {
+                return Err(match last_err {
+                    Some(err) => K2Error::other_src(
+                        "no inner bootstrap could be created",
+                        err,
+                    ),
+                    None => K2Error::other(
+                        "composite bootstrap has no inner factories",
+                    ),
+                });
             }
             let out: DynBootstrap =
                 Arc::new(CompositeBootstrap { inner: instances });

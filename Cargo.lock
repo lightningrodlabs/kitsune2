@@ -2534,6 +2534,7 @@ dependencies = [
  "bytes",
  "flume",
  "hex",
+ "if-addrs",
  "kitsune2_api",
  "mdns-sd",
  "rand 0.10.2",
