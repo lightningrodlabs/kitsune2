@@ -1,7 +1,9 @@
 //! [`BootstrapFactory`] backed by mDNS LAN discovery.
 
 use crate::browse::{LocalIdentity, browse_loop};
-use crate::config::{MdnsBootstrapConfig, MdnsBootstrapModConfig};
+use crate::config::{
+    MdnsBootstrapConfig, MdnsBootstrapModConfig, validate_service_type,
+};
 use crate::dial_policy::DialPolicy;
 use crate::discovery::{self, MdnsService};
 use crate::fingerprint;
@@ -35,14 +37,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 "mdnsBootstrap.maxConcurrentDials must be at least 1",
             ));
         }
-        if !cfg.service_type.ends_with("._udp.local.")
-            && !cfg.service_type.ends_with("._tcp.local.")
-        {
-            return Err(K2Error::other(
-                "mdnsBootstrap.serviceType must be of the form _name._udp.local.",
-            ));
-        }
-        Ok(())
+        validate_service_type(&cfg.service_type).map_err(K2Error::other)
     }
 
     fn create(
