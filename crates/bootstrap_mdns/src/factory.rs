@@ -36,6 +36,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
         builder: Arc<Builder>,
         peer_store: DynPeerStore,
         space_id: SpaceId,
+        _tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         Box::pin(async move {
             let cfg: MdnsBootstrapModConfig =

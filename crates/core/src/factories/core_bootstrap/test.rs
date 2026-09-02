@@ -144,7 +144,12 @@ impl Test {
 
         let boot = builder
             .bootstrap
-            .create(builder.clone(), peer_store.clone(), S1.clone())
+            .create(
+                builder.clone(),
+                peer_store.clone(),
+                S1.clone(),
+                Arc::new(MockTransport::new()),
+            )
             .await
             .unwrap();
 

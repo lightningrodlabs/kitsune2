@@ -269,6 +269,7 @@ async fn space_local_agent_periodic_re_sign_and_bootstrap() {
             _builder: Arc<Builder>,
             _peer_store: DynPeerStore,
             _space_id: SpaceId,
+            _tx: DynTransport,
         ) -> BoxFut<'static, K2Result<DynBootstrap>> {
             let out: DynBootstrap = self.0.clone();
             Box::pin(async move { Ok(out) })

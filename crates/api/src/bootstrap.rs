@@ -32,11 +32,15 @@ pub trait BootstrapFactory: 'static + Send + Sync + std::fmt::Debug {
     fn validate_config(&self, config: &Config) -> K2Result<()>;
 
     /// Construct a bootstrap instance.
+    ///
+    /// `tx` is the space's transport, so that a bootstrap which learns peer
+    /// URLs by some out-of-band means can have them dialled directly.
     fn create(
         &self,
         builder: Arc<Builder>,
         peer_store: DynPeerStore,
         space_id: SpaceId,
+        tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>>;
 }
 

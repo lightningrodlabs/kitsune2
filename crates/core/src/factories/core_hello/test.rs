@@ -74,6 +74,10 @@ impl Transport for StubTransport {
         Box::pin(async { Ok(()) })
     }
 
+    fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn send_module(
         &self,
         peer: Url,
@@ -855,6 +859,9 @@ async fn the_join_trigger_tolerates_a_transport_without_connection_listing() {
             data: Bytes,
         ) -> BoxFut<'_, K2Result<()>> {
             self.0.send_space_notify(peer, space_id, data)
+        }
+        fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
+            self.0.dial(peer)
         }
         fn send_module(
             &self,

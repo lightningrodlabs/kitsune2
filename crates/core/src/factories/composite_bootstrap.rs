@@ -43,6 +43,7 @@ impl BootstrapFactory for CompositeBootstrapFactory {
         builder: Arc<Builder>,
         peer_store: DynPeerStore,
         space_id: SpaceId,
+        tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         let inner = self.inner.clone();
         Box::pin(async move {
@@ -53,6 +54,7 @@ impl BootstrapFactory for CompositeBootstrapFactory {
                         builder.clone(),
                         peer_store.clone(),
                         space_id.clone(),
+                        tx.clone(),
                     )
                     .await?,
                 );

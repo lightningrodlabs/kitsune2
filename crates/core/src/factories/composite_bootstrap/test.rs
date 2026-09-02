@@ -31,6 +31,7 @@ impl BootstrapFactory for RecordingBootstrapFactory {
         _: Arc<Builder>,
         _: DynPeerStore,
         _: SpaceId,
+        _: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         let inst = self.instance.clone();
         Box::pin(async move { Ok(inst as DynBootstrap) })
@@ -70,8 +71,9 @@ async fn fans_put_to_all_inner() {
         .create(builder.clone(), space_id.clone(), blocks, known_peers)
         .await
         .unwrap();
+    let tx: DynTransport = Arc::new(MockTransport::new());
     let bootstrap = composite
-        .create(builder, peer_store, space_id.clone())
+        .create(builder, peer_store, space_id.clone(), tx)
         .await
         .unwrap();
 
