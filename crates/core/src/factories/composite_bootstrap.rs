@@ -6,10 +6,11 @@
 //! simultaneously.
 //!
 //! The composite is strict: an inner factory that fails to create its
-//! bootstrap fails the space, exactly as it would on its own. Whether a
-//! particular bootstrap is optional is that bootstrap's own call — the mDNS
-//! factory, for one, answers a daemon that cannot start with a no-op —
-//! and the composite does not second-guess it.
+//! bootstrap fails the space, exactly as it would on its own, and a
+//! composite over no factories at all is an error rather than a space
+//! silently left without bootstrap. Whether a particular bootstrap may be
+//! dropped is decided where the stack is assembled, by wrapping it in
+//! [`OptionalBootstrapFactory`](super::OptionalBootstrapFactory).
 
 use kitsune2_api::*;
 use std::sync::Arc;
@@ -53,6 +54,11 @@ impl BootstrapFactory for CompositeBootstrapFactory {
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         let inner = self.inner.clone();
         Box::pin(async move {
+            if inner.is_empty() {
+                return Err(K2Error::other(
+                    "composite bootstrap has no inner factories",
+                ));
+            }
             let mut instances = Vec::with_capacity(inner.len());
             for f in inner {
                 instances.push(

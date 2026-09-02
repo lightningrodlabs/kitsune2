@@ -79,7 +79,7 @@ mod tests {
     use super::*;
     use crate::discovery::Daemon as _;
     use crate::discovery::test_support::*;
-    use kitsune2_api::{DynTransport, MockTransport, SpaceId};
+    use kitsune2_api::{DialOutcome, DynTransport, MockTransport, SpaceId};
     use std::time::Duration;
 
     const PEER_A: &str = "ws://a.test:80/peera";
@@ -97,7 +97,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect_dial().returning(move |_space, url| {
             record.lock().unwrap().push(url);
-            Box::pin(async { Ok(()) })
+            Box::pin(async { Ok(DialOutcome::Connected) })
         });
         mock.expect_get_connected_peers()
             .returning(|| Box::pin(async { Ok(Vec::new()) }));

@@ -152,7 +152,7 @@ impl SpaceEntry {
 mod tests {
     use super::*;
     use crate::discovery::test_support::{FakeDaemon, test_fp};
-    use kitsune2_api::MockTransport;
+    use kitsune2_api::{DialOutcome, MockTransport};
     use std::time::Duration;
 
     const PEER_A: &str = "ws://a.test:80/peera";
@@ -174,7 +174,7 @@ mod tests {
         let mut mock = MockTransport::new();
         mock.expect_dial().returning(move |_space, url| {
             record.lock().unwrap().push(url);
-            Box::pin(async { Ok(()) })
+            Box::pin(async { Ok(DialOutcome::Connected) })
         });
         mock.expect_get_connected_peers().returning(move || {
             let connected = connected.clone();
@@ -243,7 +243,7 @@ mod tests {
                 let release = release.clone();
                 Box::pin(async move {
                     release.notified().await;
-                    Ok(())
+                    Ok(DialOutcome::Connected)
                 })
             });
         }

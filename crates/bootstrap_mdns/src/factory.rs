@@ -129,23 +129,13 @@ impl BootstrapFactory for MdnsBootstrapFactory {
             if !cfg.enabled {
                 // Disabled: produce a no-op bootstrap so the builder stack
                 // stays uniform.
-                let out: DynBootstrap = Arc::new(NoopMdnsBootstrap);
+                let out: DynBootstrap = Arc::new(DisabledMdnsBootstrap);
                 return Ok(out);
             }
-            // The LAN path is the optional one: a host without multicast
-            // must not lose its other bootstraps over it.
-            let shared = match inner.shared(&cfg.service_type).await {
-                Ok(shared) => shared,
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        ?space_id,
-                        "mdns bootstrap could not start, LAN discovery is off for this space"
-                    );
-                    let out: DynBootstrap = Arc::new(NoopMdnsBootstrap);
-                    return Ok(out);
-                }
-            };
+            // A daemon that cannot start is this factory's failure to
+            // report; whether the space may run without LAN discovery is
+            // decided by whoever assembles the bootstrap stack.
+            let shared = inner.shared(&cfg.service_type).await?;
             let fp = SpaceFingerprint::derive(&builder, &space_id).await?;
             let boot = MdnsBootstrap::join(shared, &cfg, space_id, fp, tx);
             let out: DynBootstrap = Arc::new(boot);
@@ -154,10 +144,11 @@ impl BootstrapFactory for MdnsBootstrapFactory {
     }
 }
 
+/// What a space gets while mDNS discovery is switched off in config.
 #[derive(Debug)]
-struct NoopMdnsBootstrap;
+struct DisabledMdnsBootstrap;
 
-impl Bootstrap for NoopMdnsBootstrap {
+impl Bootstrap for DisabledMdnsBootstrap {
     fn put(&self, _info: Arc<AgentInfoSigned>) {}
 }
 

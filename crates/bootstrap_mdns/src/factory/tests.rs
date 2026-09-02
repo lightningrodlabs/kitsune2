@@ -23,7 +23,7 @@ fn transport(connected: Vec<Url>) -> (DynTransport, Arc<Mutex<Vec<Url>>>) {
     let mut mock = MockTransport::new();
     mock.expect_dial().returning(move |_space, url| {
         record.lock().unwrap().push(url);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(DialOutcome::Connected) })
     });
     mock.expect_get_connected_peers().returning(move || {
         let connected = connected.clone();
@@ -240,10 +240,10 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
     assert!(dials.lock().unwrap().iter().all(|u| u == &url(PEER_A)));
 }
 
-/// The LAN path is the optional one: a daemon that cannot start on this
-/// host must not cost the space its other bootstraps.
+/// A daemon that cannot start is reported as the error it is; making the
+/// LAN path optional is the wrapping factory's job.
 #[tokio::test]
-async fn a_failing_daemon_start_yields_a_noop_bootstrap() {
+async fn a_failing_daemon_start_fails_create() {
     let starts = Arc::new(AtomicUsize::new(0));
     let factory = {
         let starts = starts.clone();
@@ -273,18 +273,15 @@ async fn a_failing_daemon_start_yields_a_noop_bootstrap() {
         builder: Arc::new(builder),
     };
 
-    let (boot, space_id, dials) = create_space(&h, b"space-a", vec![]).await;
+    let space_id = SpaceId::from(bytes::Bytes::from_static(b"space-a"));
+    let (tx, _) = transport(vec![]);
+    let peer_store = peer_store(&h, &space_id).await;
+    let err = h
+        .factory
+        .create(h.builder.clone(), peer_store, space_id, tx)
+        .await
+        .expect_err("a daemon that cannot start fails the create");
+    assert!(err.to_string().contains("no multicast"), "{err}");
     assert_eq!(h.starts.load(Ordering::SeqCst), 1);
     assert!(h.factory.shared_if_started().is_none());
-
-    // The no-op accepts puts and never dials.
-    boot.put(
-        AgentBuilder::default()
-            .with_space(space_id)
-            .with_url(Some(url(PEER_A)))
-            .build(TestLocalAgent::default()),
-    );
-    settle().await;
-    assert!(dials.lock().unwrap().is_empty());
-    assert!(h.daemon.registered.lock().unwrap().is_empty());
 }
