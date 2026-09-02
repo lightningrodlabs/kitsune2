@@ -8,6 +8,7 @@
 use super::fakes::*;
 use crate::connection::DynConnection;
 use crate::endpoint::{DynIrohEndpoint, Endpoint, EndpointAddrWatcher};
+use super::support::{build_recording_handler, remote_url};
 use crate::url::endpoint_from_url;
 use crate::{IrohTransport, IrohTransportConfig};
 use bytes::Bytes;
@@ -67,7 +68,7 @@ fn build_context_with_stream(
         ConnectionContext, ConnectionContextParams,
     };
 
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let remote_id = endpoint_from_url(&remote_url).unwrap().id;
     let mut connection = MockConnection::new();
     let stream = send_stream.clone();
@@ -117,10 +118,9 @@ impl crate::stream::SendStream for FailingWriteStream {
 async fn waits_for_the_winner_to_learn_its_peer_url() {
     use crate::tests::support::build_parked_context;
 
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls);
+    let handler = build_recording_handler().handler;
     let connections = crate::Connections::new();
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let loser = build_parked_context(
         handler.clone(),
         connections.clone(),
@@ -174,10 +174,9 @@ async fn waits_for_the_winner_to_learn_its_peer_url() {
 
 #[tokio::test]
 async fn transfers_a_send_superseded_during_the_frame_write() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls);
+    let handler = build_recording_handler().handler;
     let connections = crate::Connections::new();
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let incumbent = build_context_with_stream(
@@ -239,10 +238,9 @@ async fn transfers_a_send_superseded_during_the_frame_write() {
 
 #[tokio::test(start_paused = true)]
 async fn repeated_supersessions_share_one_send_deadline() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls);
+    let handler = build_recording_handler().handler;
     let connections = crate::Connections::new();
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let first_started = Arc::new(tokio::sync::Notify::new());
     let first_release = Arc::new(tokio::sync::Notify::new());
     let first = build_context_with_stream(
@@ -321,10 +319,9 @@ async fn repeated_supersessions_share_one_send_deadline() {
 async fn drops_a_superseded_connection_when_no_winner_appears() {
     use crate::tests::support::build_parked_context;
 
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls);
+    let handler = build_recording_handler().handler;
     let connections = crate::Connections::new();
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let loser =
         build_parked_context(handler, connections.clone(), true, [0xff; 32]);
     assert!(connections.register_candidate(&remote_url, &loser));
@@ -351,10 +348,9 @@ async fn drops_a_superseded_connection_when_no_winner_appears() {
 async fn expired_send_deadline_rejects_an_available_replacement() {
     use crate::tests::support::build_parked_context;
 
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls);
+    let handler = build_recording_handler().handler;
     let connections = crate::Connections::new();
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let loser = build_parked_context(
         handler.clone(),
         connections.clone(),
@@ -396,15 +392,16 @@ async fn expired_send_deadline_rejects_an_available_replacement() {
 /// and surface a clear error.
 #[tokio::test]
 async fn marks_unresponsive_when_iroh_connect_returns_error() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls.clone());
+    let recorder = build_recording_handler();
+    let calls = recorder.unresponsive_calls.clone();
+    let handler = recorder.handler;
 
     let endpoint = Arc::new(FakeEndpoint {
         connect: connect_fails("timed out"),
         ..Default::default()
     });
 
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let target = endpoint_from_url(&remote_url).unwrap();
 
     let connections = crate::Connections::new();
@@ -449,15 +446,16 @@ async fn marks_unresponsive_when_iroh_connect_returns_error() {
 /// guarantee must hold.
 #[tokio::test]
 async fn marks_unresponsive_when_outer_connect_timeout_fires() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls.clone());
+    let recorder = build_recording_handler();
+    let calls = recorder.unresponsive_calls.clone();
+    let handler = recorder.handler;
 
     let endpoint = Arc::new(FakeEndpoint {
         connect: connect_hangs(),
         ..Default::default()
     });
 
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let target = endpoint_from_url(&remote_url).unwrap();
 
     let connections = crate::Connections::new();
@@ -575,10 +573,9 @@ async fn genuine_preflight_write_failure_closes_with_real_reason_not_superseded(
     use super::support::FakeConnection;
     use crate::close_code::CloseCode;
 
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = build_handler_with_space(calls.clone());
+    let handler = build_recording_handler().handler;
 
-    let remote_url = fake_remote_url();
+    let remote_url = remote_url();
     let target = endpoint_from_url(&remote_url).unwrap();
 
     let close_calls = Arc::new(Mutex::new(Vec::new()));
@@ -635,7 +632,6 @@ mod preflight_timeout {
     use crate::tests::support::{
         CloseCalls, Recorder, build_recording_handler,
     };
-    use std::sync::atomic::Ordering;
 
     /// Supplies a prefix and then stalls without closing the QUIC stream.
     struct StalledStream(tokio::sync::Mutex<Bytes>);
@@ -667,7 +663,7 @@ mod preflight_timeout {
     impl Test {
         fn new(streams: Vec<(Duration, DynIrohRecvStream)>) -> Self {
             let mut streams = streams.into_iter();
-            let url = fake_remote_url();
+            let url = remote_url();
             let remote_id = endpoint_from_url(&url).unwrap().id;
             let recorder = build_recording_handler();
             let writes = Arc::new(MockSendStream::new());
@@ -720,7 +716,7 @@ mod preflight_timeout {
         async fn assert_expires(&self) {
             let send = || {
                 self.transport
-                    .send(fake_remote_url(), Bytes::from_static(b"hello"))
+                    .send(remote_url(), Bytes::from_static(b"hello"))
             };
             tokio::time::timeout(Duration::from_secs(11), async {
                 let (first, second) = tokio::join!(send(), send());
@@ -735,10 +731,10 @@ mod preflight_timeout {
             );
 
             assert!(
-                self.transport.connections.get(&fake_remote_url()).is_none()
+                self.transport.connections.get(&remote_url()).is_none()
             );
             assert_eq!(
-                self.recorder.unresponsive_calls.load(Ordering::SeqCst),
+                self.recorder.unresponsive_calls.lock().unwrap().len(),
                 1
             );
             let closes = self.closes.lock().expect("poison");
@@ -785,7 +781,7 @@ mod preflight_timeout {
         .encode()
         .unwrap();
         let frame = encode_frame(
-            Frame::Preflight((fake_remote_url(), preflight)),
+            Frame::Preflight((remote_url(), preflight)),
             64 * 1024,
         )
         .unwrap();
@@ -808,10 +804,10 @@ mod preflight_timeout {
             ),
         ]);
         test.transport
-            .send(fake_remote_url(), Bytes::from_static(b"first"))
+            .send(remote_url(), Bytes::from_static(b"first"))
             .await
             .unwrap();
-        let ctx = test.transport.connections.get(&fake_remote_url()).unwrap();
+        let ctx = test.transport.connections.get(&remote_url()).unwrap();
         kitsune2_test_utils::retry_fn_until_timeout(
             || async { ctx.get_recv_message_count() == 1 },
             Some(12_000),
@@ -820,16 +816,16 @@ mod preflight_timeout {
         .await
         .expect("an established connection must accept data after the preflight deadline");
         test.transport
-            .send(fake_remote_url(), Bytes::from_static(b"second"))
+            .send(remote_url(), Bytes::from_static(b"second"))
             .await
             .unwrap();
 
         assert_eq!(
             test.transport.get_connected_peers().await.unwrap(),
-            vec![fake_remote_url()]
+            vec![remote_url()]
         );
         assert!(test.closes.lock().expect("poison").is_empty());
-        assert_eq!(test.recorder.unresponsive_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(test.recorder.unresponsive_calls.lock().unwrap().len(), 0);
         assert_eq!(test.writes.get_written_data().len(), 3);
     }
 }

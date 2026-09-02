@@ -110,16 +110,6 @@ pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Stub used when the `mdns` cargo feature is disabled.
-#[cfg(not(feature = "mdns"))]
-pub(crate) async fn resolve_direct_addrs(
-    _endpoint: &iroh::Endpoint,
-    _endpoint_id: iroh::EndpointId,
-    _timeout: Duration,
-) -> Vec<iroh::TransportAddr> {
-    Vec::new()
-}
-
 /// Attach an mDNS-based LAN discovery service to the given iroh endpoint
 /// builder. Returns the builder unchanged if the `mdns` feature is off or if
 /// `enabled` is false.

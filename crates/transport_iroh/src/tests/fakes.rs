@@ -11,15 +11,10 @@ use crate::connection::{Connection, DynConnection};
 use crate::endpoint::{DynIrohEndpoint, Endpoint, EndpointAddrWatcher};
 use crate::stream::mock::MockSendStream;
 use crate::stream::{DynIrohRecvStream, DynIrohSendStream};
-use crate::test_utils::MockTxHandler;
-use crate::tests::support::StubTxImp;
 use crate::{IrohTransport, IrohTransportConfig};
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayUrl, TransportAddr};
-use kitsune2_api::{
-    BoxFut, DefaultTransport, K2Error, K2Result, Timestamp, TxImpHnd, Url,
-};
-use kitsune2_test_utils::space::TEST_SPACE_ID;
+use kitsune2_api::{BoxFut, K2Error, K2Result, TxImpHnd, Url};
 use n0_watcher::Disconnected;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -185,37 +180,8 @@ impl Connection for DialableConnection {
     }
 }
 
-/// Recorded `set_unresponsive` calls as `(peer, when)` pairs.
-pub(super) type UnresponsiveCalls = Arc<Mutex<Vec<(Url, Timestamp)>>>;
-
-/// Build a `TxImpHnd` with a space handler registered, so that
-/// `set_unresponsive` reaches the recording mock.
-pub(super) fn build_handler_with_space(
-    set_unresponsive_calls: UnresponsiveCalls,
-) -> Arc<TxImpHnd> {
-    let calls = set_unresponsive_calls.clone();
-    let mock = Arc::new(MockTxHandler {
-        set_unresponsive: Arc::new(move |peer, ts| {
-            calls.lock().unwrap().push((peer, ts));
-            Ok(())
-        }),
-        ..Default::default()
-    });
-    let handler = TxImpHnd::new(mock.clone());
-    let transport = DefaultTransport::create(&handler, Arc::new(StubTxImp));
-    transport.register_space_handler(TEST_SPACE_ID, mock);
-    handler
-}
-
-pub(super) fn fake_remote_url() -> Url {
-    // 64 hex characters → valid iroh EndpointId encoding.
-    Url::from_str(
-        "https://relay.example.com:443/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    )
-    .unwrap()
-}
-
-/// A URL of our own that is distinct from [`fake_remote_url`].
+/// A URL of our own that is distinct from
+/// [`remote_url`](crate::tests::support::remote_url).
 pub(super) fn fake_local_url() -> Url {
     Url::from_str(
         "https://relay.example.com:443/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

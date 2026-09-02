@@ -501,6 +501,10 @@ mod configure_for_space_only_when_overridden {
             Box::pin(async { Ok(()) })
         }
 
+        fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
         fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
             Box::pin(async { Ok(Vec::new()) })
         }

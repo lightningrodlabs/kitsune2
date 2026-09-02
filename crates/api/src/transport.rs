@@ -961,7 +961,7 @@ impl Transport for DefaultTransport {
             let access_module = self
                 .space_map
                 .lock()
-                .expect("poisoned")
+                .expect("poison")
                 .get(&space_id)
                 .map(|handler| handler.access_module_id());
             match check_peer_access(

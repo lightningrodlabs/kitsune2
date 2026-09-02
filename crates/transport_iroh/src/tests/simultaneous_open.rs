@@ -22,7 +22,6 @@ use crate::connection_registry::RegistryEntry;
 use bytes::Bytes;
 use kitsune2_test_utils::retry_fn_until_timeout;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 /// When the active connection is closed by the remote with the superseded
 /// close code — i.e. the remote preferred a different connection during
@@ -51,7 +50,7 @@ async fn superseded_remote_close_does_not_mark_unresponsive() {
     .expect("condition not met within timeout");
 
     assert_eq!(
-        recorder.unresponsive_calls.load(Ordering::SeqCst),
+        recorder.unresponsive_calls.lock().unwrap().len(),
         0,
         "a connection superseded by the remote must not mark the peer unresponsive"
     );
@@ -81,7 +80,7 @@ async fn genuine_remote_close_marks_unresponsive() {
     .expect("condition not met within timeout");
 
     assert_eq!(
-        recorder.unresponsive_calls.load(Ordering::SeqCst),
+        recorder.unresponsive_calls.lock().unwrap().len(),
         1,
         "a genuine peer disconnect must mark the peer unresponsive"
     );

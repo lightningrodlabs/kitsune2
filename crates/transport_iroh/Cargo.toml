@@ -74,6 +74,7 @@ metrics = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 # Enable mDNS-based local network discovery. When set and the
 # `enable_lan_discovery` config flag is on, two nodes on the same LAN can
 # dial each other by iroh EndpointId without a relay. This only provides
-# dialability — it does not distribute Kitsune2 AgentInfoSigned; that is the
-# job of the `kitsune2_bootstrap_mdns` crate.
+# dialability: which peers to dial for a space comes from the
+# `kitsune2_bootstrap_mdns` crate, and agent infos are exchanged by the
+# space's hello access module once a connection is up.
 mdns = ["dep:iroh-mdns-address-lookup", "dep:futures"]

@@ -185,6 +185,7 @@ impl Endpoint for IrohEndpoint {
             .any(|s| !s.is_connected() && s.last_error().is_some())
     }
 
+    #[cfg(feature = "mdns")]
     fn discover_direct_addrs(
         &self,
         endpoint_id: EndpointId,
