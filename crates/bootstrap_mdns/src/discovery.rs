@@ -60,9 +60,10 @@ fn random_hostname() -> String {
     format!("{:032x}.local.", rand::rng().random::<u128>())
 }
 
-/// Fully qualified name of the record announced under `instance`.
-pub fn fullname(daemon: &dyn Daemon, instance: &str) -> String {
-    format!("{instance}.{}", daemon.service_type())
+/// Fully qualified name of the record announced under `instance` within
+/// `service_type`.
+pub fn fullname(service_type: &str, instance: &str) -> String {
+    format!("{instance}.{service_type}")
 }
 
 /// This process's presence on the LAN: an `mdns-sd` daemon, the service
@@ -138,7 +139,7 @@ impl Daemon for MdnsService {
 
     fn unregister(&self, instance: &str) -> K2Result<()> {
         self.daemon
-            .unregister(&fullname(self, instance))
+            .unregister(&fullname(&self.service_type, instance))
             .map(|_| ())
             .map_err(|e| K2Error::other_src("mdns unregister", e))
     }
@@ -168,123 +169,9 @@ pub fn parse_record(svc: &ResolvedService) -> Option<(SpaceFingerprint, Url)> {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    //! A [`Daemon`] that needs no multicast: the test feeds it the browse
-    //! events it wants seen and reads back what was announced.
-
-    use super::*;
-    use std::sync::Mutex;
-
-    pub const SERVICE_TYPE: &str = "_k2test._udp.local.";
-
-    /// A resolved-service event as `mdns-sd` would deliver it for an
-    /// announcement with the given instance name and TXT fields.
-    pub fn resolved(instance: &str, txt: &[(&str, &str)]) -> ServiceEvent {
-        let info = ServiceInfo::new(
-            SERVICE_TYPE,
-            instance,
-            &format!("{instance}.local."),
-            "192.0.2.10",
-            0,
-            txt,
-        )
-        .unwrap();
-        ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service()))
-    }
-
-    /// A resolved-service event for a record of space `fp` naming `url`.
-    pub fn resolved_peer(
-        instance: &str,
-        fp: &SpaceFingerprint,
-        url: &str,
-    ) -> ServiceEvent {
-        let fp = fp.encode();
-        resolved(instance, &[("spacefp", &fp), ("url", url)])
-    }
-
-    /// A fingerprint for tests that have no space secret to derive from.
-    pub fn test_fp(seed: &[u8]) -> SpaceFingerprint {
-        SpaceFingerprint::from(bytes::Bytes::copy_from_slice(seed))
-    }
-
-    /// The event `mdns-sd` delivers when a record goes away.
-    pub fn removed(instance: &str) -> ServiceEvent {
-        ServiceEvent::ServiceRemoved(
-            SERVICE_TYPE.to_string(),
-            fullname_for(instance),
-        )
-    }
-
-    pub fn fullname_for(instance: &str) -> String {
-        format!("{instance}.{SERVICE_TYPE}")
-    }
-
-    /// A `register` call as `(instance, txt)`.
-    pub type Registered = (String, Vec<(String, String)>);
-
-    #[derive(Debug)]
-    pub struct FakeDaemon {
-        events: flume::Sender<ServiceEvent>,
-        browse_rx: flume::Receiver<ServiceEvent>,
-        /// Every `register` call.
-        pub registered: Mutex<Vec<Registered>>,
-        /// Every `unregister` call.
-        pub unregistered: Mutex<Vec<String>>,
-    }
-
-    impl FakeDaemon {
-        pub fn new() -> Arc<Self> {
-            let (events, browse_rx) = flume::unbounded();
-            Arc::new(Self {
-                events,
-                browse_rx,
-                registered: Mutex::new(Vec::new()),
-                unregistered: Mutex::new(Vec::new()),
-            })
-        }
-
-        /// Deliver a browse event as if the LAN had produced it.
-        pub fn deliver(&self, event: ServiceEvent) {
-            self.events.send(event).unwrap();
-        }
-    }
-
-    impl Daemon for FakeDaemon {
-        fn service_type(&self) -> &str {
-            SERVICE_TYPE
-        }
-
-        fn browse(&self) -> K2Result<flume::Receiver<ServiceEvent>> {
-            Ok(self.browse_rx.clone())
-        }
-
-        fn register(
-            &self,
-            instance: &str,
-            txt: &[(&str, &str)],
-        ) -> K2Result<()> {
-            let txt = txt
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            self.registered
-                .lock()
-                .unwrap()
-                .push((instance.to_string(), txt));
-            Ok(())
-        }
-
-        fn unregister(&self, instance: &str) -> K2Result<()> {
-            self.unregistered.lock().unwrap().push(instance.to_string());
-            Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_support::*;
     use super::*;
+    use crate::test_support::*;
 
     const OTHER: &str = "other-instance";
     const OTHER_URL: &str = "ws://other.test:80/otherpeer";

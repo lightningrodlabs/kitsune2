@@ -34,7 +34,7 @@ impl SpaceEntry {
         max_concurrent_dials: usize,
     ) -> Arc<Self> {
         let instance = discovery::random_name();
-        let fullname = discovery::fullname(daemon.as_ref(), &instance);
+        let fullname = discovery::fullname(daemon.service_type(), &instance);
         Arc::new(Self {
             space_id,
             fp,
@@ -151,49 +151,22 @@ impl SpaceEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::test_support::{FakeDaemon, test_fp};
-    use kitsune2_api::{DialOutcome, MockTransport};
-    use std::time::Duration;
+    use crate::test_support::*;
 
     const PEER_A: &str = "ws://a.test:80/peera";
     const PEER_B: &str = "ws://b.test:80/peerb";
 
-    fn url(s: &str) -> Url {
-        Url::from_str(s).unwrap()
-    }
-
     fn space() -> SpaceId {
-        SpaceId::from(bytes::Bytes::from_static(b"space"))
-    }
-
-    /// A transport recording its dials and reporting `connected` as its
-    /// open connections.
-    fn transport(connected: Vec<Url>) -> (DynTransport, Arc<Mutex<Vec<Url>>>) {
-        let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
-        let record = dials.clone();
-        let mut mock = MockTransport::new();
-        mock.expect_dial().returning(move |_space, url| {
-            record.lock().unwrap().push(url);
-            Box::pin(async { Ok(DialOutcome::Connected) })
-        });
-        mock.expect_get_connected_peers().returning(move || {
-            let connected = connected.clone();
-            Box::pin(async move { Ok(connected) })
-        });
-        (Arc::new(mock), dials)
+        space_id(b"space")
     }
 
     fn entry(tx: DynTransport, cap: usize) -> Arc<SpaceEntry> {
         SpaceEntry::new(space(), test_fp(b"space"), FakeDaemon::new(), tx, cap)
     }
 
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
     #[tokio::test]
     async fn a_new_url_is_dialled_once_until_reconciled() {
-        let (tx, dials) = transport(vec![]);
+        let (tx, dials) = recording_transport(vec![]);
         let entry = entry(tx, 4);
 
         entry.record_resolved(url(PEER_A));
@@ -209,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconciliation_skips_connected_and_withdrawn_peers() {
-        let (tx, dials) = transport(vec![url(PEER_A)]);
+        let (tx, dials) = recording_transport(vec![url(PEER_A)]);
         let entry = entry(tx, 4);
 
         entry.record_resolved(url(PEER_A));
@@ -233,25 +206,11 @@ mod tests {
     #[tokio::test]
     async fn a_url_skipped_at_the_cap_is_picked_up_by_the_next_round() {
         let release = Arc::new(tokio::sync::Notify::new());
-        let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
-        let mut mock = MockTransport::new();
-        {
-            let record = dials.clone();
-            let release = release.clone();
-            mock.expect_dial().returning(move |_space, url| {
-                record.lock().unwrap().push(url);
-                let release = release.clone();
-                Box::pin(async move {
-                    release.notified().await;
-                    Ok(DialOutcome::Connected)
-                })
-            });
-        }
         // A counts as connected once dialled, so every round has only B
         // left to dial.
-        mock.expect_get_connected_peers()
-            .returning(|| Box::pin(async { Ok(vec![url(PEER_A)]) }));
-        let entry = entry(Arc::new(mock), 1);
+        let (tx, dials) =
+            blocking_transport(release.clone(), vec![url(PEER_A)]);
+        let entry = entry(tx, 1);
 
         entry.record_resolved(url(PEER_A));
         entry.record_resolved(url(PEER_B));
@@ -274,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn advertise_registers_and_replaces_the_record() {
         let daemon = FakeDaemon::new();
-        let (tx, _) = transport(vec![]);
+        let (tx, _) = recording_transport(vec![]);
         let entry =
             SpaceEntry::new(space(), test_fp(b"space"), daemon.clone(), tx, 1);
         assert!(entry.advertised().is_none());

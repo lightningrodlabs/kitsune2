@@ -232,7 +232,7 @@ mod endpoint;
 mod lan_discovery;
 mod stream;
 use connection_context::*;
-use connection_registry::{ConnectionRegistry, ConnectionResolution};
+use connection_registry::{ConnectionRegistry, ConnectionResolution, RegistryEntry};
 #[cfg(feature = "metrics")]
 mod metrics;
 
@@ -1047,20 +1047,11 @@ impl IrohTransport {
         .await
         {
             Err(e) => {
-                // A peer that cannot be reached is marked unresponsive so the
-                // modules stop paying the connect timeout for it. The mark is
-                // lifted the moment a connection with the peer completes.
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
+                self.mark_unresponsive(&remote_url).await;
                 Err(K2Error::other_src("iroh connect timed out", e))
             }
             Ok(Err(e)) => {
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
+                self.mark_unresponsive(&remote_url).await;
                 Err(K2Error::other_src("iroh connect error", e))
             }
             Ok(Ok(conn)) => Ok(conn),
@@ -1139,14 +1130,12 @@ impl IrohTransport {
                     return Ok(ctx);
                 }
 
-                // On send preflight error, mark the peer unresponsive
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
-
+                // On send preflight error, mark the peer unresponsive. The
+                // failed dial leaves the registry first, so it cannot count as
+                // the live connection that would spare the peer.
                 ctx.close_failed(e.to_string().as_bytes());
                 self.connections.remove_if_current(&remote_url, &ctx);
+                self.mark_unresponsive(&remote_url).await;
 
                 return Err(e);
             }
@@ -1242,10 +1231,7 @@ impl IrohTransport {
         match endpoint_from_url(remote_url) {
             Ok(target) => Ok(target),
             Err(e) => {
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
+                self.mark_unresponsive(remote_url).await;
                 Err(K2Error::other_src(
                     format!(
                         "iroh send error converting Url to EndpointAddr {remote_url}"
@@ -1254,6 +1240,30 @@ impl IrohTransport {
                 ))
             }
         }
+    }
+
+    /// Record that `remote_url` could not be reached, so the modules stop
+    /// paying the connect timeout for it until it connects again.
+    ///
+    /// A peer with a live connection is spared: it may have connected to us
+    /// while our own dial to it was stalled on the relay, and a peer we are
+    /// talking to is not unresponsive whatever our dial says.
+    async fn mark_unresponsive(&self, remote_url: &Url) {
+        let connected = self
+            .connections
+            .get(remote_url)
+            .is_some_and(|ctx| ctx.lifecycle().is_live());
+        if connected {
+            debug!(
+                ?remote_url,
+                "not marking peer unresponsive: a connection with it is live"
+            );
+            return;
+        }
+        let _ = self
+            .handler
+            .set_unresponsive(remote_url.clone(), Timestamp::now())
+            .await;
     }
 
     /// The lock that serializes connection creation towards one peer.

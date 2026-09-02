@@ -78,31 +78,11 @@ fn lookup(
 mod tests {
     use super::*;
     use crate::discovery::Daemon as _;
-    use crate::discovery::test_support::*;
-    use kitsune2_api::{DialOutcome, DynTransport, MockTransport, SpaceId};
-    use std::time::Duration;
+    use crate::test_support::*;
 
     const PEER_A: &str = "ws://a.test:80/peera";
     const PEER_B: &str = "ws://b.test:80/peerb";
     const SELF_URL: &str = "ws://self.test:80/selfpeer";
-
-    fn url(s: &str) -> Url {
-        Url::from_str(s).unwrap()
-    }
-
-    /// A transport that records its dials and never reports a connection.
-    fn recording_transport() -> (DynTransport, Arc<Mutex<Vec<Url>>>) {
-        let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
-        let record = dials.clone();
-        let mut mock = MockTransport::new();
-        mock.expect_dial().returning(move |_space, url| {
-            record.lock().unwrap().push(url);
-            Box::pin(async { Ok(DialOutcome::Connected) })
-        });
-        mock.expect_get_connected_peers()
-            .returning(|| Box::pin(async { Ok(Vec::new()) }));
-        (Arc::new(mock), dials)
-    }
 
     struct Harness {
         daemon: Arc<FakeDaemon>,
@@ -122,14 +102,10 @@ mod tests {
         }
     }
 
-    fn join(
-        h: &Harness,
-        space: &[u8],
-    ) -> (Arc<SpaceEntry>, Arc<Mutex<Vec<Url>>>) {
-        let space_id = SpaceId::from(bytes::Bytes::copy_from_slice(space));
-        let (tx, dials) = recording_transport();
+    fn join(h: &Harness, space: &[u8]) -> (Arc<SpaceEntry>, Dials) {
+        let (tx, dials) = recording_transport(vec![]);
         let entry = SpaceEntry::new(
-            space_id.clone(),
+            space_id(space),
             test_fp(space),
             h.daemon.clone(),
             tx,
@@ -140,10 +116,6 @@ mod tests {
             .unwrap()
             .insert(entry.fingerprint().clone(), entry.clone());
         (entry, dials)
-    }
-
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

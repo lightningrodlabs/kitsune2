@@ -52,3 +52,6 @@ pub mod space;
 
 mod factory;
 pub use factory::*;
+
+#[cfg(test)]
+mod test_support;

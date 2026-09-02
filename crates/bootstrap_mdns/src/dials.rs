@@ -116,33 +116,12 @@ impl DialState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
     use kitsune2_api::MockTransport;
     use std::time::Duration;
 
-    fn url(s: &str) -> Url {
-        Url::from_str(s).unwrap()
-    }
-
     fn space() -> SpaceId {
-        SpaceId::from(bytes::Bytes::from_static(b"space"))
-    }
-
-    /// A transport whose dials block until `release` is notified.
-    fn blocking_transport(
-        release: Arc<tokio::sync::Notify>,
-    ) -> (DynTransport, Arc<Mutex<Vec<Url>>>) {
-        let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
-        let record = dials.clone();
-        let mut mock = MockTransport::new();
-        mock.expect_dial().returning(move |_space, url| {
-            record.lock().unwrap().push(url);
-            let release = release.clone();
-            Box::pin(async move {
-                release.notified().await;
-                Ok(DialOutcome::Connected)
-            })
-        });
-        (Arc::new(mock), dials)
+        space_id(b"space")
     }
 
     #[test]
@@ -159,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn dials_beyond_the_cap_are_skipped_not_queued() {
         let release = Arc::new(tokio::sync::Notify::new());
-        let (tx, dials) = blocking_transport(release.clone());
+        let (tx, dials) = blocking_transport(release.clone(), vec![]);
         let state = DialState::new(1);
 
         assert!(state.try_dial(&tx, &space(), url("ws://a.test:80/peerA")));
@@ -208,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_state_aborts_dials_in_flight() {
         let release = Arc::new(tokio::sync::Notify::new());
-        let (tx, _dials) = blocking_transport(release);
+        let (tx, _dials) = blocking_transport(release, vec![]);
         let state = DialState::new(1);
         assert!(state.try_dial(&tx, &space(), url("ws://a.test:80/peerA")));
         let slots = state.in_flight.clone();
