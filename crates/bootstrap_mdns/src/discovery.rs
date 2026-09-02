@@ -185,49 +185,43 @@ fn instance_name() -> String {
     hex::encode(bytes)
 }
 
-/// Collect the local addresses to name in our announcement, skipping
-/// loopback and unspecified ones. An empty result is an error: a node
-/// nobody on the LAN can address has nothing to announce.
+/// Collect the local addresses to name in our announcement: every
+/// interface address a LAN peer could plausibly reach, which excludes
+/// loopback, unspecified and IPv6 link-local addresses. An empty result is
+/// an error: a node nobody on the LAN can address has nothing to announce.
 pub fn local_addrs() -> K2Result<Vec<IpAddr>> {
-    // One "best" address per family, found by asking the kernel which
-    // source address it would route a packet through.
-    let mut out = Vec::new();
-    if let Ok(v4) = primary_v4() {
-        out.push(IpAddr::V4(v4));
-    }
-    if let Ok(v6) = primary_v6() {
-        out.push(IpAddr::V6(v6));
-    }
+    let ifaces = if_addrs::get_if_addrs()
+        .map_err(|e| K2Error::other_src("mdns: enumerating interfaces", e))?;
+    let out = announceable(ifaces.iter().map(|i| i.ip()));
     if out.is_empty() {
         return Err(K2Error::other("mdns: no usable local IP addresses found"));
     }
     Ok(out)
 }
 
-fn primary_v4() -> std::io::Result<std::net::Ipv4Addr> {
-    use std::net::{SocketAddrV4, UdpSocket};
-    let s =
-        UdpSocket::bind(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))?;
-    s.connect("8.8.8.8:80")?;
-    match s.local_addr()? {
-        std::net::SocketAddr::V4(a) => Ok(*a.ip()),
-        _ => Err(std::io::Error::other("expected v4 local addr")),
+/// Keep the addresses worth announcing, in the order given, without
+/// duplicates.
+///
+/// IPv6 link-local addresses are dropped because they are only meaningful
+/// together with a scope id, which a TXT/A record cannot carry; IPv4
+/// link-local addresses are kept, since on a LAN without DHCP they are the
+/// only addresses there are.
+fn announceable(addrs: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = Vec::new();
+    for ip in addrs {
+        let skip = match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_unicast_link_local()
+            }
+        };
+        if !skip && !out.contains(&ip) {
+            out.push(ip);
+        }
     }
-}
-
-fn primary_v6() -> std::io::Result<std::net::Ipv6Addr> {
-    use std::net::{SocketAddrV6, UdpSocket};
-    let s = UdpSocket::bind(SocketAddrV6::new(
-        std::net::Ipv6Addr::UNSPECIFIED,
-        0,
-        0,
-        0,
-    ))?;
-    s.connect("[2001:4860:4860::8888]:80")?;
-    match s.local_addr()? {
-        std::net::SocketAddr::V6(a) => Ok(*a.ip()),
-        _ => Err(std::io::Error::other("expected v6 local addr")),
-    }
+    out
 }
 
 #[cfg(test)]
@@ -336,6 +330,32 @@ mod tests {
         let ev =
             resolved(OTHER, &[("spacefp", &fp), ("url", "ws://other.test:80")]);
         assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn announceable_drops_loopback_unspecified_and_v6_link_local() {
+        let addrs: Vec<IpAddr> = [
+            "127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "::1",
+            "fe80::1",
+            "169.254.7.7",
+            "192.168.1.20",
+            "192.168.1.20",
+            "fd00::20",
+            "2001:db8::20",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let kept = announceable(addrs.into_iter());
+        let expected: Vec<IpAddr> =
+            ["169.254.7.7", "192.168.1.20", "fd00::20", "2001:db8::20"]
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+        assert_eq!(kept, expected);
     }
 
     #[test]
