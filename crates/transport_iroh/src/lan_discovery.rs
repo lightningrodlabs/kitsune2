@@ -12,6 +12,14 @@
 //! [`resolve_direct_addrs`] exists for the one case where the transport
 //! wants to know *before* dialling whether a LAN path exists: when the home
 //! relay is known to be down and the dial would otherwise be skipped.
+//!
+//! mDNS answers are unauthenticated, so the pre-resolve keeps only
+//! addresses a LAN peer could actually have ([`is_lan_scoped`]); an answer
+//! must not be able to steer a dial at an arbitrary public address. iroh's
+//! own in-connect lookup applies no such filter. In both cases the QUIC
+//! handshake pins the peer's `EndpointId`, so a spoofed address can only
+//! waste a connect attempt or bounce traffic off a third party — a
+//! DoS/reflection concern, not an impersonation one.
 
 use std::time::Duration;
 
@@ -51,8 +59,11 @@ pub(crate) async fn resolve_direct_addrs(
                         .into_endpoint_addr()
                         .addrs
                         .into_iter()
-                        .filter(|addr| {
-                            matches!(addr, iroh::TransportAddr::Ip(_))
+                        .filter(|addr| match addr {
+                            iroh::TransportAddr::Ip(sock) => {
+                                is_lan_scoped(sock.ip())
+                            }
+                            _ => false,
                         })
                         .collect();
                     if !addrs.is_empty() {
@@ -82,6 +93,21 @@ pub(crate) async fn resolve_direct_addrs(
     tokio::time::timeout(timeout, first_ip_addrs)
         .await
         .unwrap_or_default()
+}
+
+/// Whether `ip` is one a peer on the same LAN could hold: RFC 1918 private
+/// or link-local for IPv4, unique-local (`fc00::/7`) or link-local for
+/// IPv6. IPv4-mapped IPv6 addresses are judged by the IPv4 they carry.
+#[cfg(any(test, feature = "mdns"))]
+pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_private() || v4.is_link_local(),
+            None => v6.is_unique_local() || v6.is_unicast_link_local(),
+        },
+    }
 }
 
 /// Stub used when the `mdns` cargo feature is disabled.
@@ -133,6 +159,38 @@ pub(crate) fn validate_lan_discovery_config(
     }
     let _ = enable_lan_discovery;
     Ok(())
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::is_lan_scoped;
+
+    #[test]
+    fn lan_scoped_admits_only_private_and_link_local_addresses() {
+        let cases: &[(&str, bool)] = &[
+            ("10.0.0.1", true),
+            ("172.16.0.1", true),
+            ("172.31.255.254", true),
+            ("192.168.1.20", true),
+            ("169.254.7.7", true),
+            ("fd00::20", true),
+            ("fc00::1", true),
+            ("fe80::1", true),
+            ("::ffff:192.168.1.20", true),
+            ("172.32.0.1", false),
+            ("8.8.8.8", false),
+            ("203.0.113.9", false),
+            ("127.0.0.1", false),
+            ("0.0.0.0", false),
+            ("2001:db8::20", false),
+            ("::1", false),
+            ("::ffff:8.8.8.8", false),
+        ];
+        for (ip, expected) in cases {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert_eq!(is_lan_scoped(ip), *expected, "{ip}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "mdns"))]
