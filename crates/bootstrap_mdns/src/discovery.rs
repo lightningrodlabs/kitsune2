@@ -1,152 +1,182 @@
-//! mDNS service announce and browse glue around `mdns-sd`.
+//! mDNS announce and browse glue around `mdns-sd`.
 //!
-//! Announcement publishes a single TXT record field — `spacefp` — carrying
-//! the hex-encoded space fingerprint. The raw `SpaceId` is never sent over
-//! mDNS. The instance name is a random 16-byte token, so it does not
-//! correlate across sessions or spaces.
+//! An announcement carries two TXT fields: `spacefp`, the hex-encoded
+//! [space fingerprint](crate::fingerprint), and `url`, this node's kitsune2
+//! peer URL. The raw space id is never sent. The instance name is a random
+//! token so that announcements do not correlate across sessions or spaces,
+//! and the port is zero because nothing listens for this crate: the URL is
+//! all a peer needs to dial us through the transport.
 //!
-//! Browsing emits [`DiscoveredPeer`]s that match our local fingerprint; the
-//! rest is the job of the session layer.
+//! Browsing yields [`DiscoveredPeer`]s: announcements that match our
+//! fingerprint and are not our own. What to do with them is the browse
+//! loop's business.
 
-use crate::proto::{self, FP_LEN};
-use kitsune2_api::{K2Error, K2Result, SpaceId};
+use crate::fingerprint::{self, SpaceFingerprint};
+use kitsune2_api::{K2Error, K2Result, SpaceId, Url};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::Rng;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+use std::sync::Mutex;
 
-/// TXT record key under which we store the hex-encoded space fingerprint.
+/// TXT record key carrying the hex-encoded space fingerprint.
 pub const TXT_KEY_SPACE_FP: &str = "spacefp";
 
-/// A peer resolved via mDNS that claims to match our space fingerprint.
-/// The session layer connects to `addr` to complete the handshake.
-#[derive(Debug, Clone)]
+/// TXT record key carrying the announcing node's kitsune2 peer URL.
+pub const TXT_KEY_URL: &str = "url";
+
+/// A peer announced on the LAN that claims to be in our space.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredPeer {
-    /// The socket address to connect to.
-    pub addr: SocketAddr,
-    /// Full mDNS instance name, useful for de-duplication and logging.
+    /// The peer URL to dial.
+    pub url: Url,
+    /// Full mDNS instance name, for de-duplication and logging.
     pub fullname: String,
 }
 
-/// An mDNS service handle. While this value is alive, the service is
-/// published; dropping it unregisters and shuts down the daemon.
+/// One node's presence on the LAN for one space: an mDNS daemon, a fixed
+/// instance name, and whichever peer URL is currently advertised under it.
+///
+/// Dropping the service withdraws the announcement and shuts the daemon
+/// down.
 pub struct MdnsService {
     daemon: ServiceDaemon,
+    service_type: String,
+    instance: String,
     fullname: String,
+    fp_hex: String,
+    addrs: Vec<IpAddr>,
+    advertised: Mutex<Option<Url>>,
 }
 
 impl std::fmt::Debug for MdnsService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MdnsService")
             .field("fullname", &self.fullname)
+            .field("advertised", &self.advertised.lock().ok().as_deref())
             .finish()
     }
 }
 
 impl Drop for MdnsService {
     fn drop(&mut self) {
-        // Best-effort unregister; daemon will also shut down when dropped.
+        // Best effort: the daemon shutdown withdraws the record too.
         let _ = self.daemon.unregister(&self.fullname);
         let _ = self.daemon.shutdown();
     }
 }
 
 impl MdnsService {
-    /// Register an mDNS service advertising the given space fingerprint.
+    /// Start an mDNS daemon for `service_type`, announcing nothing yet.
     ///
-    /// `port` is the TCP port of the local info-exchange listener. `addrs`
-    /// is the list of local IP addresses to advertise.
-    pub fn register(
+    /// `addrs` are the local addresses the record will name once a URL is
+    /// advertised; they are fixed for the life of the service.
+    pub fn start(
         service_type: &str,
         space_id: &SpaceId,
-        port: u16,
         addrs: Vec<IpAddr>,
     ) -> K2Result<Self> {
+        if addrs.is_empty() {
+            return Err(K2Error::other("mdns: no local addresses to announce"));
+        }
         let daemon = ServiceDaemon::new()
             .map_err(|e| K2Error::other_src("mdns daemon start", e))?;
-
-        let fp = proto::space_fingerprint(space_id);
-        let fp_hex = hex::encode(fp);
-
         let instance = instance_name();
-        let host = format!("{instance}.local.");
-
-        let props = [(TXT_KEY_SPACE_FP, fp_hex.as_str())];
-
-        let info = ServiceInfo::new(
-            service_type,
-            &instance,
-            &host,
-            &addrs[..],
-            port,
-            &props[..],
-        )
-        .map_err(|e| K2Error::other_src("mdns ServiceInfo::new", e))?;
-
-        let fullname = info.get_fullname().to_string();
-        daemon
-            .register(info)
-            .map_err(|e| K2Error::other_src("mdns register", e))?;
-
-        Ok(Self { daemon, fullname })
+        let fullname = format!("{instance}.{service_type}");
+        Ok(Self {
+            daemon,
+            service_type: service_type.to_string(),
+            instance,
+            fullname,
+            fp_hex: hex::encode(fingerprint::space_fingerprint(space_id)),
+            addrs,
+            advertised: Mutex::new(None),
+        })
     }
 
-    /// Get a browse receiver for this service type.
-    pub fn browse(
-        &self,
-        service_type: &str,
-    ) -> K2Result<flume::Receiver<ServiceEvent>> {
+    /// Subscribe to announcements of our service type.
+    pub fn browse(&self) -> K2Result<flume::Receiver<ServiceEvent>> {
         self.daemon
-            .browse(service_type)
+            .browse(&self.service_type)
             .map_err(|e| K2Error::other_src("mdns browse", e))
     }
 
-    /// The full mDNS instance name of our registered service. Useful to
-    /// filter out our own announcements from the browse stream.
+    /// Announce `url` as this node's peer URL, replacing any earlier
+    /// announcement. Announcing the URL already advertised is a no-op.
+    pub fn advertise(&self, url: &Url) -> K2Result<()> {
+        let mut advertised =
+            self.advertised.lock().expect("mdns advertised poisoned");
+        if advertised.as_ref() == Some(url) {
+            return Ok(());
+        }
+        if advertised.is_some() {
+            // Commands are handled by the daemon in order, so the fresh
+            // record is registered only after the stale one is gone.
+            self.daemon
+                .unregister(&self.fullname)
+                .map_err(|e| K2Error::other_src("mdns unregister", e))?;
+            *advertised = None;
+        }
+
+        let host = format!("{}.local.", self.instance);
+        let props = [
+            (TXT_KEY_SPACE_FP, self.fp_hex.as_str()),
+            (TXT_KEY_URL, url.as_str()),
+        ];
+        let info = ServiceInfo::new(
+            &self.service_type,
+            &self.instance,
+            &host,
+            &self.addrs[..],
+            0,
+            &props[..],
+        )
+        .map_err(|e| K2Error::other_src("mdns ServiceInfo::new", e))?;
+        debug_assert_eq!(info.get_fullname(), self.fullname);
+
+        self.daemon
+            .register(info)
+            .map_err(|e| K2Error::other_src("mdns register", e))?;
+        *advertised = Some(url.clone());
+        Ok(())
+    }
+
+    /// The full mDNS instance name of our own announcement.
     pub fn fullname(&self) -> &str {
         &self.fullname
     }
 }
 
-/// Extract a [`DiscoveredPeer`] from a resolved mDNS service event, but
-/// only if:
+/// Extract a [`DiscoveredPeer`] from a browse event.
 ///
-/// - The TXT `spacefp` field is present and parses to 32 bytes,
-/// - It matches `expected_fp`,
-/// - The event is not our own announcement (filtered by `self_fullname`).
-///
-/// Returns `None` when any of those conditions fail. Logs at `trace` to
-/// aid debugging.
+/// Only a resolved service that carries `expected_fp` under `spacefp` and a
+/// parseable peer URL under `url` qualifies, and never our own announcement,
+/// whether recognised by instance name or by the URL it names.
 pub fn resolved_to_peer(
     event: &ServiceEvent,
-    expected_fp: &[u8; FP_LEN],
+    expected_fp: &SpaceFingerprint,
     self_fullname: &str,
+    self_url: Option<&Url>,
 ) -> Option<DiscoveredPeer> {
-    let svc = match event {
-        ServiceEvent::ServiceResolved(svc) => svc,
-        _ => return None,
+    let ServiceEvent::ServiceResolved(svc) = event else {
+        return None;
     };
     if svc.fullname == self_fullname {
         return None;
     }
     let fp_hex = svc.txt_properties.get_property_val_str(TXT_KEY_SPACE_FP)?;
     let fp = hex::decode(fp_hex).ok()?;
-    if fp.len() != FP_LEN || fp != expected_fp {
+    if fp != expected_fp {
         return None;
     }
-    let ip = svc.addresses.iter().next()?;
-    let addr = SocketAddr::new(scoped_ip_to_std(ip)?, svc.port);
+    let url = svc.txt_properties.get_property_val_str(TXT_KEY_URL)?;
+    let url = Url::from_str(url).ok()?;
+    if !url.is_peer() || Some(&url) == self_url {
+        return None;
+    }
     Some(DiscoveredPeer {
-        addr,
+        url,
         fullname: svc.fullname.clone(),
     })
-}
-
-fn scoped_ip_to_std(ip: &mdns_sd::ScopedIp) -> Option<IpAddr> {
-    match ip {
-        mdns_sd::ScopedIp::V4(v) => Some(IpAddr::V4(*v.addr())),
-        mdns_sd::ScopedIp::V6(v) => Some(IpAddr::V6(*v.addr())),
-        _ => None,
-    }
 }
 
 fn instance_name() -> String {
@@ -155,17 +185,12 @@ fn instance_name() -> String {
     hex::encode(bytes)
 }
 
-/// Collect local IPv4/IPv6 addresses suitable for advertising over mDNS.
-/// Skips loopback and unspecified. Returns an error if none are found —
-/// in that case we can't be reached on the LAN so there's no point
-/// registering.
+/// Collect the local addresses to name in our announcement, skipping
+/// loopback and unspecified ones. An empty result is an error: a node
+/// nobody on the LAN can address has nothing to announce.
 pub fn local_addrs() -> K2Result<Vec<IpAddr>> {
-    // `if_addrs` is a small focused crate, but we avoid adding a dep and
-    // instead query via `local-ip-address`. To keep dep count low here we
-    // fall back to the standard approach: enumerate via a UDP socket
-    // connect-to-sentinel trick to find the primary interface IP.
-    //
-    // This yields one "best" address per family and is adequate for v1.
+    // One "best" address per family, found by asking the kernel which
+    // source address it would route a packet through.
     let mut out = Vec::new();
     if let Ok(v4) = primary_v4() {
         out.push(IpAddr::V4(v4));
@@ -202,5 +227,123 @@ fn primary_v6() -> std::io::Result<std::net::Ipv6Addr> {
     match s.local_addr()? {
         std::net::SocketAddr::V6(a) => Ok(*a.ip()),
         _ => Err(std::io::Error::other("expected v6 local addr")),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Builders for the browse events the unit tests feed in, so that no
+    //! test needs a multicast-capable interface.
+
+    use super::*;
+
+    pub const SERVICE_TYPE: &str = "_k2test._udp.local.";
+
+    /// A resolved-service event as `mdns-sd` would deliver it for an
+    /// announcement with the given instance name and TXT fields.
+    pub fn resolved(instance: &str, txt: &[(&str, &str)]) -> ServiceEvent {
+        let info = ServiceInfo::new(
+            SERVICE_TYPE,
+            instance,
+            &format!("{instance}.local."),
+            "192.0.2.10",
+            0,
+            txt,
+        )
+        .unwrap();
+        ServiceEvent::ServiceResolved(Box::new(info.as_resolved_service()))
+    }
+
+    pub fn fullname(instance: &str) -> String {
+        format!("{instance}.{SERVICE_TYPE}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+
+    const SELF: &str = "self-instance";
+    const OTHER: &str = "other-instance";
+    const SELF_URL: &str = "ws://self.test:80/selfpeer";
+    const OTHER_URL: &str = "ws://other.test:80/otherpeer";
+
+    fn space() -> SpaceId {
+        SpaceId::from(bytes::Bytes::from_static(b"space"))
+    }
+
+    fn fp_hex() -> String {
+        hex::encode(fingerprint::space_fingerprint(&space()))
+    }
+
+    fn classify(event: &ServiceEvent) -> Option<DiscoveredPeer> {
+        let self_url = Url::from_str(SELF_URL).unwrap();
+        resolved_to_peer(
+            event,
+            &fingerprint::space_fingerprint(&space()),
+            &fullname(SELF),
+            Some(&self_url),
+        )
+    }
+
+    #[test]
+    fn matching_announcement_yields_a_peer() {
+        let fp = fp_hex();
+        let ev = resolved(OTHER, &[("spacefp", &fp), ("url", OTHER_URL)]);
+        let peer = classify(&ev).expect("peer");
+        assert_eq!(peer.url, Url::from_str(OTHER_URL).unwrap());
+        assert_eq!(peer.fullname, fullname(OTHER));
+    }
+
+    #[test]
+    fn fingerprint_mismatch_is_ignored() {
+        let other_fp = hex::encode([7u8; 32]);
+        let ev = resolved(OTHER, &[("spacefp", &other_fp), ("url", OTHER_URL)]);
+        assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn malformed_fingerprint_is_ignored() {
+        let ev = resolved(OTHER, &[("spacefp", "zz"), ("url", OTHER_URL)]);
+        assert!(classify(&ev).is_none());
+        let ev = resolved(OTHER, &[("url", OTHER_URL)]);
+        assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn our_own_instance_is_ignored() {
+        let fp = fp_hex();
+        let ev = resolved(SELF, &[("spacefp", &fp), ("url", OTHER_URL)]);
+        assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn our_own_url_is_ignored() {
+        let fp = fp_hex();
+        let ev = resolved(OTHER, &[("spacefp", &fp), ("url", SELF_URL)]);
+        assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn missing_or_bad_url_is_ignored() {
+        let fp = fp_hex();
+        let ev = resolved(OTHER, &[("spacefp", &fp)]);
+        assert!(classify(&ev).is_none());
+        let ev = resolved(OTHER, &[("spacefp", &fp), ("url", "not a url")]);
+        assert!(classify(&ev).is_none());
+        // A URL without a peer id names nobody to dial.
+        let ev =
+            resolved(OTHER, &[("spacefp", &fp), ("url", "ws://other.test:80")]);
+        assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn non_resolved_events_are_ignored() {
+        let ev = ServiceEvent::ServiceFound(
+            SERVICE_TYPE.to_string(),
+            fullname(OTHER),
+        );
+        assert!(classify(&ev).is_none());
     }
 }
