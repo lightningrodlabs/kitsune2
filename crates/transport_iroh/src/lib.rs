@@ -93,8 +93,9 @@
 //!
 //! # Connection establishment
 //!
-//! The transport handlers [`TxImp::send`] implementation contains the logic
-//! for connection establishment.
+//! Both [`TxImp::send`] and [`TxImp::dial`] go through the same
+//! get-or-create step for the peer's connection; `send` then writes a data
+//! frame on it, while `dial` stops once the preflight has been sent.
 //!
 //! ```text
 //!                  ┌────────────────┐
@@ -1132,6 +1133,67 @@ impl IrohTransport {
 
         Ok((relay_url_parsed, local_url, auth_params))
     }
+    /// Convert a peer URL into the iroh address to dial.
+    ///
+    /// A URL that cannot name an endpoint can never be reached, so the peer
+    /// is marked unresponsive right away rather than after a failed dial.
+    async fn dial_target(&self, remote_url: &Url) -> K2Result<EndpointAddr> {
+        match endpoint_from_url(remote_url) {
+            Ok(target) => Ok(target),
+            Err(e) => {
+                let _ = self
+                    .handler
+                    .set_unresponsive(remote_url.clone(), Timestamp::now())
+                    .await;
+                Err(K2Error::other_src(
+                    format!(
+                        "iroh send error converting Url to EndpointAddr {remote_url}"
+                    ),
+                    e,
+                ))
+            }
+        }
+    }
+
+    /// The lock that serializes connection creation towards one peer.
+    ///
+    /// Folding this into the connections map would move the complexity into
+    /// every reader of that map; a separate lock table keeps it local to the
+    /// one place that creates connections.
+    fn peer_connection_lock(
+        &self,
+        remote_url: &Url,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.connection_locks
+            .lock()
+            .expect("poisoned")
+            .entry(remote_url.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Return the active connection to `remote_url`, establishing one and
+    /// completing the preflight on it first if there is none.
+    ///
+    /// Concurrent callers for the same peer wait on the per-peer lock; the
+    /// first one to hold it creates the connection and the rest find it in
+    /// the map once the lock is released.
+    async fn ensure_connection(
+        &self,
+        remote_url: Url,
+    ) -> K2Result<Arc<ConnectionContext>> {
+        let target = self.dial_target(&remote_url).await?;
+
+        let peer_lock = self.peer_connection_lock(&remote_url);
+        let _lock_guard = peer_lock.lock().await;
+
+        if let Some(ctx) = self.connections.get(&remote_url) {
+            return Ok(ctx);
+        }
+
+        info!(remote = ?remote_url.peer_id(), "Establishing connection to remote");
+        self.create_connection_and_context(target, remote_url).await
+    }
 }
 
 async fn wait_for_send_replacement(
@@ -1190,51 +1252,9 @@ impl TxImp for IrohTransport {
     }
 
     fn send(&self, remote_url: Url, data: Bytes) -> BoxFut<'_, K2Result<()>> {
-        let connections = self.connections.clone();
-        let connection_locks = self.connection_locks.clone();
-
         Box::pin(async move {
-            let remote = match endpoint_from_url(&remote_url) {
-                Err(e) => {
-                    // If we cannot convert the url to an endpoint address, mark the peer unresponsive
-                    let _ = self
-                        .handler
-                        .set_unresponsive(remote_url.clone(), Timestamp::now())
-                        .await;
-
-                    Err(K2Error::other_src(
-                        format!(
-                            "iroh send error converting Url to EndpointAddr {remote_url}"
-                        ),
-                        e,
-                    ))
-                }
-                ok => ok,
-            }?;
-
-            // Get or create the connection lock for this peer to serialize connection creation.
-            let peer_lock = {
-                let mut locks = connection_locks.lock().expect("poisoned");
-                locks
-                    .entry(remote_url.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                    .clone()
-            };
-
-            let mut ctx = {
-                let _lock_guard = peer_lock.lock().await;
-                let existing = connections.get(&remote_url);
-                if let Some(ctx) = existing {
-                    ctx
-                } else {
-                    info!(remote = ?remote_url.peer_id(), "Establishing connection to remote");
-                    self.create_connection_and_context(
-                        remote,
-                        remote_url.clone(),
-                    )
-                    .await?
-                }
-            };
+            let connections = self.connections.clone();
+            let mut ctx = self.ensure_connection(remote_url.clone()).await?;
             let send_deadline = tokio::time::Instant::now() + PREFLIGHT_TIMEOUT;
 
             loop {
@@ -1307,6 +1327,10 @@ impl TxImp for IrohTransport {
                 }
             }
         })
+    }
+
+    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async move { self.ensure_connection(peer).await.map(|_| ()) })
     }
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {

@@ -78,7 +78,7 @@ impl Connection for FakeConnection {
 /// register a space handler against the shared `TxImpHnd` (which is what
 /// makes `set_unresponsive` reach our recording handler).
 #[derive(Debug)]
-struct StubTxImp;
+pub(super) struct StubTxImp;
 
 impl TxImp for StubTxImp {
     fn url(&self) -> Option<Url> {

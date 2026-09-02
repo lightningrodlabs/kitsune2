@@ -5,6 +5,8 @@ use super::*;
 mod close;
 mod connect_failure;
 mod connection_registry;
+mod dial;
+mod fakes;
 mod frame;
 mod relay_lifecycle;
 mod relay_qad;
