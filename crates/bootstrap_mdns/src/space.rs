@@ -107,6 +107,11 @@ impl SpaceEntry {
         fullname == self.fullname() || self.advertised().as_ref() == Some(url)
     }
 
+    /// Whether the LAN has announced anything for this space.
+    pub fn has_announcements(&self) -> bool {
+        !self.announced.is_empty()
+    }
+
     /// Whether this node can be dialled back yet. Until a local agent has
     /// a URL the space has no handler registered and no agents to
     /// preflight with, so a dial would fail on our own side.
@@ -140,13 +145,14 @@ impl SpaceEntry {
         self.announced.record_removed(fullname);
     }
 
-    /// Dial every announced peer that `connected` does not list.
+    /// Dial every announced peer that `connected` does not list and whose
+    /// schedule allows a dial this round.
     pub fn reconcile(&self, connected: &HashSet<Url>) {
-        if !self.is_dialable() {
+        if !self.is_dialable() || self.announced.is_empty() {
             return;
         }
         let own = self.advertised();
-        for url in self.announced.urls() {
+        for url in self.announced.due_urls() {
             if connected.contains(&url) || own.as_ref() == Some(&url) {
                 continue;
             }

@@ -35,16 +35,46 @@ use tracing::{debug, trace};
 /// forged ones — costs a fixed amount of memory per space.
 pub const MAX_URLS: usize = 256;
 
+/// The most reconciliation rounds a URL waits between dials. A peer that
+/// keeps failing is still tried, just rarely; a fresh announcement puts it
+/// back on the short schedule.
+pub const MAX_BACKOFF_ROUNDS: u64 = 16;
+
 /// The records announced for a space, by name, and the URLs they name.
 #[derive(Debug, Default)]
 struct Records {
     by_name: HashMap<String, Url>,
     urls: HashMap<Url, UrlState>,
+    /// The reconciliation rounds run so far; schedules count in rounds
+    /// rather than time so that they need no clock of their own.
+    round: u64,
 }
 
+/// One URL's standing: when it was last heard, and when it may be dialled
+/// again after failing.
 #[derive(Debug)]
 struct UrlState {
     last_heard: Instant,
+    /// The first round the URL may be dialled in again.
+    next_round: u64,
+    /// How many rounds the next failure will push `next_round` out by.
+    backoff_rounds: u64,
+}
+
+impl UrlState {
+    fn fresh() -> Self {
+        Self {
+            last_heard: Instant::now(),
+            next_round: 0,
+            backoff_rounds: 1,
+        }
+    }
+
+    /// Heard again, or connected: back on the short schedule.
+    fn reset(&mut self) {
+        self.next_round = 0;
+        self.backoff_rounds = 1;
+    }
 }
 
 impl Records {
@@ -60,12 +90,11 @@ impl Records {
         let new = match self.urls.entry(url) {
             Entry::Occupied(mut state) => {
                 state.get_mut().last_heard = Instant::now();
+                state.get_mut().reset();
                 false
             }
             Entry::Vacant(slot) => {
-                slot.insert(UrlState {
-                    last_heard: Instant::now(),
-                });
+                slot.insert(UrlState::fresh());
                 true
             }
         };
@@ -73,10 +102,43 @@ impl Records {
         new
     }
 
-    /// The record `fullname` is gone.
+    /// The record `fullname` is gone. A URL other records still name is
+    /// put back on the short schedule: something about the peer changed.
     fn removed(&mut self, fullname: &str) {
         if let Some(url) = self.by_name.remove(fullname) {
             self.release(&url);
+            if let Some(state) = self.urls.get_mut(&url) {
+                state.reset();
+            }
+        }
+    }
+
+    /// Start a reconciliation round and return the URLs due for a dial in
+    /// it.
+    fn due(&mut self) -> Vec<Url> {
+        self.round += 1;
+        let round = self.round;
+        self.urls
+            .iter()
+            .filter(|(_, state)| state.next_round <= round)
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
+
+    /// A dial toward `url` failed: wait longer before the next one, up to
+    /// [`MAX_BACKOFF_ROUNDS`].
+    fn failed(&mut self, url: &Url) {
+        if let Some(state) = self.urls.get_mut(url) {
+            state.next_round = self.round + state.backoff_rounds;
+            state.backoff_rounds =
+                (state.backoff_rounds * 2).min(MAX_BACKOFF_ROUNDS);
+        }
+    }
+
+    /// A dial toward `url` connected.
+    fn connected(&mut self, url: &Url) {
+        if let Some(state) = self.urls.get_mut(url) {
+            state.reset();
         }
     }
 
@@ -159,6 +221,17 @@ impl Announcements {
             .collect()
     }
 
+    /// Whether any record is known at all.
+    pub fn is_empty(&self) -> bool {
+        self.records.lock().expect("poison").urls.is_empty()
+    }
+
+    /// Start a reconciliation round: the URLs whose schedule allows a
+    /// dial now. Each call is one round.
+    pub fn due_urls(&self) -> Vec<Url> {
+        self.records.lock().expect("poison").due()
+    }
+
     /// Start a dial toward `url` in its own task if a slot is free.
     /// Returns `false` when every slot is taken; the peer is not queued.
     pub fn try_dial(
@@ -181,7 +254,8 @@ impl Announcements {
             let _permit = permit;
             match tx.dial(space_id, url.clone()).await {
                 Ok(DialOutcome::Connected) => {
-                    debug!(%url, "mdns: dial succeeded")
+                    debug!(%url, "mdns: dial succeeded");
+                    records.lock().expect("poison").connected(&url);
                 }
                 Ok(DialOutcome::Blocked) => {
                     // The space refuses this peer, so no round should
@@ -193,7 +267,10 @@ impl Announcements {
                 Ok(outcome) => {
                     debug!(?outcome, %url, "mdns: dial ended with an outcome this crate does not know")
                 }
-                Err(err) => debug!(?err, %url, "mdns: dial failed"),
+                Err(err) => {
+                    debug!(?err, %url, "mdns: dial failed");
+                    records.lock().expect("poison").failed(&url);
+                }
             }
         });
         true
@@ -294,6 +371,80 @@ mod tests {
             !urls.contains(&url("ws://p1.test:80/peer1")),
             "the oldest made room"
         );
+    }
+
+    /// A transport whose every dial fails.
+    fn failing_transport() -> (DynTransport, Dials) {
+        let dials: Dials = Arc::new(Mutex::new(Vec::new()));
+        let record = dials.clone();
+        let mut mock = MockTransport::new();
+        mock.expect_dial().returning(move |_space, url| {
+            record.lock().unwrap().push(url);
+            Box::pin(async { Err(kitsune2_api::K2Error::other("no route")) })
+        });
+        (Arc::new(mock), dials)
+    }
+
+    /// Run one reconciliation round: dial everything due, and let the
+    /// dials finish so their outcome is recorded before the next round.
+    async fn round(state: &Announcements, tx: &DynTransport) {
+        for url in state.due_urls() {
+            state.try_dial(tx, &space(), url);
+        }
+        settle().await;
+    }
+
+    /// A failing URL is dialled at rounds 1, 2, 4, 8, 16, then every 16.
+    #[tokio::test]
+    async fn a_failing_url_backs_off_exponentially_up_to_the_cap() {
+        let (tx, dials) = failing_transport();
+        let state = Announcements::new(4);
+        state.record_resolved("r1", url(A));
+
+        let mut dialled_in = Vec::new();
+        for r in 1..=(MAX_BACKOFF_ROUNDS * 3 + 1) {
+            let before = dials.lock().unwrap().len();
+            round(&state, &tx).await;
+            if dials.lock().unwrap().len() > before {
+                dialled_in.push(r);
+            }
+        }
+        assert_eq!(dialled_in, vec![1, 2, 4, 8, 16, 32, 48]);
+    }
+
+    /// A re-announcement says something changed on the peer's side, so
+    /// the wait is over: it is dialled in the very next round.
+    #[tokio::test]
+    async fn a_re_announcement_resets_the_backoff() {
+        let (tx, dials) = failing_transport();
+        let state = Announcements::new(4);
+        state.record_resolved("r1", url(A));
+        for _ in 0..3 {
+            round(&state, &tx).await;
+        }
+        // Rounds 1 and 2 dialled; the URL now waits until round 4.
+        assert_eq!(dials.lock().unwrap().len(), 2);
+
+        state.record_resolved("r2", url(A));
+        round(&state, &tx).await;
+        assert_eq!(dials.lock().unwrap().len(), 3, "dialled at round 4");
+        // No wait: the reset put the backoff back to one round.
+        round(&state, &tx).await;
+        assert_eq!(dials.lock().unwrap().len(), 4, "and at round 5");
+    }
+
+    /// A URL heard once and never again — mDNS repeats nothing that has
+    /// not changed — is still dialled for as long as it is announced.
+    #[tokio::test]
+    async fn a_stable_record_is_never_expired_by_time() {
+        let (tx, dials) = failing_transport();
+        let state = Announcements::new(4);
+        state.record_resolved("r1", url(A));
+        for _ in 0..(MAX_BACKOFF_ROUNDS * 4) {
+            round(&state, &tx).await;
+        }
+        assert_eq!(state.urls(), vec![url(A)]);
+        assert!(dials.lock().unwrap().len() >= 6);
     }
 
     #[tokio::test]
