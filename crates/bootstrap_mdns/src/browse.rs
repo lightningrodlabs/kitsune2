@@ -79,7 +79,6 @@ mod tests {
     use super::*;
     use crate::discovery::Daemon as _;
     use crate::discovery::test_support::*;
-    use crate::fingerprint::space_fingerprint;
     use kitsune2_api::{DynTransport, MockTransport, SpaceId};
     use std::time::Duration;
 
@@ -131,7 +130,7 @@ mod tests {
         let (tx, dials) = recording_transport();
         let entry = SpaceEntry::new(
             space_id.clone(),
-            space_fingerprint(&space_id),
+            test_fp(space),
             h.daemon.clone(),
             tx,
             4,
@@ -139,7 +138,7 @@ mod tests {
         h.registry
             .lock()
             .unwrap()
-            .insert(*entry.fingerprint(), entry.clone());
+            .insert(entry.fingerprint().clone(), entry.clone());
         (entry, dials)
     }
 
@@ -158,7 +157,7 @@ mod tests {
         h.daemon
             .deliver(resolved_peer("peer-2", b.fingerprint(), PEER_B));
         h.daemon
-            .deliver(resolved_peer("peer-3", &[9u8; 32], PEER_A));
+            .deliver(resolved_peer("peer-3", &test_fp(&[9u8; 32]), PEER_A));
         h.daemon.deliver(resolved("peer-4", &[("url", PEER_A)]));
         settle().await;
 

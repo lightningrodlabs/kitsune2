@@ -3,8 +3,8 @@
 use crate::config::{
     MdnsBootstrapConfig, MdnsBootstrapModConfig, validate_service_type,
 };
-use crate::discovery::{self, DynDaemon, MdnsService};
-use crate::fingerprint;
+use crate::discovery::{DynDaemon, MdnsService};
+use crate::fingerprint::SpaceFingerprint;
 use crate::shared::SharedMdns;
 use crate::space::SpaceEntry;
 use kitsune2_api::*;
@@ -88,12 +88,9 @@ impl FactoryInner {
     }
 }
 
-/// Start a real `mdns-sd` daemon announcing this host's interface
-/// addresses.
+/// Start a real `mdns-sd` daemon.
 fn start_mdns_sd_daemon(service_type: &str) -> K2Result<DynDaemon> {
-    let addrs = discovery::local_addrs()?;
-    let service = MdnsService::start(service_type, addrs)?;
-    Ok(Arc::new(service))
+    Ok(Arc::new(MdnsService::start(service_type)?))
 }
 
 impl BootstrapFactory for MdnsBootstrapFactory {
@@ -136,7 +133,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 return Ok(out);
             }
             let shared = inner.shared(&cfg.service_type).await?;
-            let fp = fingerprint::space_fingerprint(&space_id);
+            let fp = SpaceFingerprint::derive(&builder, &space_id).await?;
             let boot = MdnsBootstrap::join(shared, &cfg, space_id, fp, tx);
             let out: DynBootstrap = Arc::new(boot);
             Ok(out)
@@ -200,7 +197,7 @@ impl MdnsBootstrap {
         shared: Arc<SharedMdns>,
         cfg: &MdnsBootstrapConfig,
         space_id: SpaceId,
-        fp: fingerprint::SpaceFingerprint,
+        fp: SpaceFingerprint,
         tx: DynTransport,
     ) -> Self {
         let entry = shared.join(

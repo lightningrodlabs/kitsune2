@@ -151,8 +151,7 @@ impl SpaceEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::test_support::FakeDaemon;
-    use crate::fingerprint::space_fingerprint;
+    use crate::discovery::test_support::{FakeDaemon, test_fp};
     use kitsune2_api::MockTransport;
     use std::time::Duration;
 
@@ -185,13 +184,7 @@ mod tests {
     }
 
     fn entry(tx: DynTransport, cap: usize) -> Arc<SpaceEntry> {
-        SpaceEntry::new(
-            space(),
-            space_fingerprint(&space()),
-            FakeDaemon::new(),
-            tx,
-            cap,
-        )
+        SpaceEntry::new(space(), test_fp(b"space"), FakeDaemon::new(), tx, cap)
     }
 
     async fn settle() {
@@ -282,13 +275,8 @@ mod tests {
     async fn advertise_registers_and_replaces_the_record() {
         let daemon = FakeDaemon::new();
         let (tx, _) = transport(vec![]);
-        let entry = SpaceEntry::new(
-            space(),
-            space_fingerprint(&space()),
-            daemon.clone(),
-            tx,
-            1,
-        );
+        let entry =
+            SpaceEntry::new(space(), test_fp(b"space"), daemon.clone(), tx, 1);
         assert!(entry.advertised().is_none());
 
         entry.advertise(&url(PEER_A)).unwrap();

@@ -1,26 +1,27 @@
 //! The mDNS daemon behind LAN discovery, and the records it carries.
 //!
-//! An announcement carries two TXT fields: `spacefp`, the hex-encoded
+//! An announcement carries two TXT fields: `spacefp`, the base64-encoded
 //! [space fingerprint](crate::fingerprint), and `url`, this node's kitsune2
 //! peer URL. The raw space id is never sent. Each space announces its own
 //! record under a random instance name, so that announcements do not
 //! correlate across sessions or spaces; all of a node's records share one
-//! hostname, because they all name the same machine. The port is zero:
-//! nothing listens for this crate, the URL is all a peer needs to dial us
-//! through the transport.
+//! hostname, because they all name the same machine, and the daemon fills
+//! in and maintains that host's addresses itself. The port is zero: nothing
+//! listens for this crate, the URL is all a peer needs to dial us through
+//! the transport.
 //!
 //! [`Daemon`] is the narrow surface this crate needs from an mDNS
 //! implementation, so that the browse and announce logic can be exercised
 //! without multicast. [`MdnsService`] is the real thing, over `mdns-sd`.
 
 use crate::fingerprint::SpaceFingerprint;
+use base64::prelude::*;
 use kitsune2_api::{K2Error, K2Result, Url};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
-use rand::Rng;
-use std::net::IpAddr;
+use rand::{Rng, RngExt};
 use std::sync::Arc;
 
-/// TXT record key carrying the hex-encoded space fingerprint.
+/// TXT record key carrying the base64-encoded space fingerprint.
 pub const TXT_KEY_SPACE_FP: &str = "spacefp";
 
 /// TXT record key carrying the announcing node's kitsune2 peer URL.
@@ -46,11 +47,17 @@ pub trait Daemon: 'static + Send + Sync + std::fmt::Debug {
 /// Trait-object [`Daemon`].
 pub type DynDaemon = Arc<dyn Daemon>;
 
-/// A random token for an instance or host name.
+/// A random token for an instance name.
 pub fn random_name() -> String {
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    BASE64_URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// A random hostname. Hostnames are DNS labels, so this stays within
+/// lowercase hex.
+fn random_hostname() -> String {
+    format!("{:032x}.local.", rand::rng().random::<u128>())
 }
 
 /// Fully qualified name of the record announced under `instance`.
@@ -67,7 +74,6 @@ pub struct MdnsService {
     daemon: ServiceDaemon,
     service_type: String,
     hostname: String,
-    addrs: Vec<IpAddr>,
 }
 
 impl std::fmt::Debug for MdnsService {
@@ -88,21 +94,15 @@ impl Drop for MdnsService {
 impl MdnsService {
     /// Start an mDNS daemon for `service_type`, announcing nothing yet.
     ///
-    /// `addrs` are the local addresses every record will name; they are
-    /// fixed for the life of the service. Starting the daemon binds
-    /// multicast sockets and spawns a thread, so call this off the async
-    /// runtime.
-    pub fn start(service_type: &str, addrs: Vec<IpAddr>) -> K2Result<Self> {
-        if addrs.is_empty() {
-            return Err(K2Error::other("mdns: no local addresses to announce"));
-        }
+    /// Starting the daemon binds multicast sockets and spawns a thread, so
+    /// call this off the async runtime.
+    pub fn start(service_type: &str) -> K2Result<Self> {
         let daemon = ServiceDaemon::new()
             .map_err(|e| K2Error::other_src("mdns daemon start", e))?;
         Ok(Self {
             daemon,
             service_type: service_type.to_string(),
-            hostname: format!("{}.local.", random_name()),
-            addrs,
+            hostname: random_hostname(),
         })
     }
 }
@@ -119,15 +119,18 @@ impl Daemon for MdnsService {
     }
 
     fn register(&self, instance: &str, txt: &[(&str, &str)]) -> K2Result<()> {
+        // The daemon enumerates the host's interface addresses itself and
+        // re-announces when they change.
         let info = ServiceInfo::new(
             &self.service_type,
             instance,
             &self.hostname,
-            &self.addrs[..],
+            (),
             0,
             txt,
         )
-        .map_err(|e| K2Error::other_src("mdns ServiceInfo::new", e))?;
+        .map_err(|e| K2Error::other_src("mdns ServiceInfo::new", e))?
+        .enable_addr_auto();
         self.daemon
             .register(info)
             .map_err(|e| K2Error::other_src("mdns register", e))
@@ -144,7 +147,7 @@ impl Daemon for MdnsService {
 /// The TXT fields a record for `fp` and `url` carries.
 pub fn record_txt(fp: &SpaceFingerprint, url: &Url) -> [(String, String); 2] {
     [
-        (TXT_KEY_SPACE_FP.to_string(), hex::encode(fp)),
+        (TXT_KEY_SPACE_FP.to_string(), fp.encode()),
         (TXT_KEY_URL.to_string(), url.to_string()),
     ]
 }
@@ -154,53 +157,14 @@ pub fn record_txt(fp: &SpaceFingerprint, url: &Url) -> [(String, String); 2] {
 /// dial. Whose space it is, and whether it is our own record, is for the
 /// caller to decide.
 pub fn parse_record(svc: &ResolvedService) -> Option<(SpaceFingerprint, Url)> {
-    let fp_hex = svc.txt_properties.get_property_val_str(TXT_KEY_SPACE_FP)?;
-    let fp: SpaceFingerprint = hex::decode(fp_hex).ok()?.try_into().ok()?;
+    let fp = svc.txt_properties.get_property_val_str(TXT_KEY_SPACE_FP)?;
+    let fp = SpaceFingerprint::decode(fp)?;
     let url = svc.txt_properties.get_property_val_str(TXT_KEY_URL)?;
     let url = Url::from_str(url).ok()?;
     if !url.is_peer() {
         return None;
     }
     Some((fp, url))
-}
-
-/// Collect the local addresses to name in our announcement: every
-/// interface address a LAN peer could plausibly reach, which excludes
-/// loopback, unspecified and IPv6 link-local addresses. An empty result is
-/// an error: a node nobody on the LAN can address has nothing to announce.
-pub fn local_addrs() -> K2Result<Vec<IpAddr>> {
-    let ifaces = if_addrs::get_if_addrs()
-        .map_err(|e| K2Error::other_src("mdns: enumerating interfaces", e))?;
-    let out = announceable(ifaces.iter().map(|i| i.ip()));
-    if out.is_empty() {
-        return Err(K2Error::other("mdns: no usable local IP addresses found"));
-    }
-    Ok(out)
-}
-
-/// Keep the addresses worth announcing, in the order given, without
-/// duplicates.
-///
-/// IPv6 link-local addresses are dropped because they are only meaningful
-/// together with a scope id, which a TXT/A record cannot carry; IPv4
-/// link-local addresses are kept, since on a LAN without DHCP they are the
-/// only addresses there are.
-fn announceable(addrs: impl Iterator<Item = IpAddr>) -> Vec<IpAddr> {
-    let mut out: Vec<IpAddr> = Vec::new();
-    for ip in addrs {
-        let skip = match ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unicast_link_local()
-            }
-        };
-        if !skip && !out.contains(&ip) {
-            out.push(ip);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -234,8 +198,13 @@ pub(crate) mod test_support {
         fp: &SpaceFingerprint,
         url: &str,
     ) -> ServiceEvent {
-        let fp_hex = hex::encode(fp);
-        resolved(instance, &[("spacefp", &fp_hex), ("url", url)])
+        let fp = fp.encode();
+        resolved(instance, &[("spacefp", &fp), ("url", url)])
+    }
+
+    /// A fingerprint for tests that have no space secret to derive from.
+    pub fn test_fp(seed: &[u8]) -> SpaceFingerprint {
+        SpaceFingerprint::from(bytes::Bytes::copy_from_slice(seed))
     }
 
     /// The event `mdns-sd` delivers when a record goes away.
@@ -316,16 +285,12 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::fingerprint;
-    use kitsune2_api::SpaceId;
 
     const OTHER: &str = "other-instance";
     const OTHER_URL: &str = "ws://other.test:80/otherpeer";
 
     fn fp() -> SpaceFingerprint {
-        fingerprint::space_fingerprint(&SpaceId::from(
-            bytes::Bytes::from_static(b"space"),
-        ))
+        test_fp(&[7u8; 32])
     }
 
     fn parse(event: &ServiceEvent) -> Option<(SpaceFingerprint, Url)> {
@@ -345,10 +310,7 @@ mod tests {
 
     #[test]
     fn a_malformed_or_missing_fingerprint_is_ignored() {
-        let ev = resolved(OTHER, &[("spacefp", "zz"), ("url", OTHER_URL)]);
-        assert!(parse(&ev).is_none());
-        let short = hex::encode([7u8; 8]);
-        let ev = resolved(OTHER, &[("spacefp", &short), ("url", OTHER_URL)]);
+        let ev = resolved(OTHER, &[("spacefp", "z!z"), ("url", OTHER_URL)]);
         assert!(parse(&ev).is_none());
         let ev = resolved(OTHER, &[("url", OTHER_URL)]);
         assert!(parse(&ev).is_none());
@@ -356,15 +318,15 @@ mod tests {
 
     #[test]
     fn a_missing_or_bad_url_is_ignored() {
-        let fp_hex = hex::encode(fp());
-        let ev = resolved(OTHER, &[("spacefp", &fp_hex)]);
+        let fp_txt = fp().encode();
+        let ev = resolved(OTHER, &[("spacefp", &fp_txt)]);
         assert!(parse(&ev).is_none());
-        let ev = resolved(OTHER, &[("spacefp", &fp_hex), ("url", "not a url")]);
+        let ev = resolved(OTHER, &[("spacefp", &fp_txt), ("url", "not a url")]);
         assert!(parse(&ev).is_none());
         // A URL without a peer id names nobody to dial.
         let ev = resolved(
             OTHER,
-            &[("spacefp", &fp_hex), ("url", "ws://other.test:80")],
+            &[("spacefp", &fp_txt), ("url", "ws://other.test:80")],
         );
         assert!(parse(&ev).is_none());
     }
@@ -377,31 +339,5 @@ mod tests {
             txt.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let ev = resolved(OTHER, &txt);
         assert_eq!(parse(&ev), Some((fp(), url)));
-    }
-
-    #[test]
-    fn announceable_drops_loopback_unspecified_and_v6_link_local() {
-        let addrs: Vec<IpAddr> = [
-            "127.0.0.1",
-            "0.0.0.0",
-            "::",
-            "::1",
-            "fe80::1",
-            "169.254.7.7",
-            "192.168.1.20",
-            "192.168.1.20",
-            "fd00::20",
-            "2001:db8::20",
-        ]
-        .iter()
-        .map(|s| s.parse().unwrap())
-        .collect();
-        let kept = announceable(addrs.into_iter());
-        let expected: Vec<IpAddr> =
-            ["169.254.7.7", "192.168.1.20", "fd00::20", "2001:db8::20"]
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect();
-        assert_eq!(kept, expected);
     }
 }

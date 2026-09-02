@@ -75,21 +75,32 @@ preflight exchanges agent infos (Holochain's does) gets the faster
 - **Active LAN attacker** can spoof mDNS records. Can cause a dial — one
   per URL per cooldown, at most `maxConcurrentDials` in flight — to a peer
   that then fails the hello exchange. Cannot put anything in a peer store.
-- **Adversary with a candidate space_id list** can precompute fingerprints
-  and confirm presence. Accepted limitation; time-bucketed rotation could
-  raise the cost in a future iteration.
+- **Adversary with a candidate space_id list** can derive fingerprints
+  and confirm presence for spaces that configure no secret (the open-space
+  default, where the space id is the secret). Spaces with a real secret
+  are not affected.
 - **WAN bootstrap server compromise** is a separate problem (see below).
 
 ## Announcement
 
-Service type `_kitsune2._udp.local.`, instance name a random 16-byte hex
-token, port 0, every non-loopback non-link-local-v6 interface address, and
-two TXT fields:
+Service type `_kitsune2._udp.local.`, one record per space under a random
+16-byte instance name, port 0, the host's interface addresses as
+enumerated and maintained by `mdns-sd` (`enable_addr_auto`), and two TXT
+fields:
 
 ```
-spacefp = hex(SHA-256(space_id || "k2-mdns-v1"))   // 64 chars
+spacefp = base64url(space_secret.derive_key(space_id, "k2-mdns-v1"))
 url     = <kitsune2 peer URL>
 ```
+
+The fingerprint is purpose-scoped key material from the same space secret
+the hello proof uses, so a non-member cannot compute it. With no secret
+configured kitsune2 falls back to the space id, and the candidate-list
+attack in the threat model applies to that default.
+
+One `mdns-sd` daemon serves every space of a process: one browse, one
+hostname, and a registry that routes each resolved record to the space
+whose fingerprint it carries.
 
 The URL is taken from the local agent infos delivered through
 `Bootstrap::put`; browsing starts immediately, announcing waits for the

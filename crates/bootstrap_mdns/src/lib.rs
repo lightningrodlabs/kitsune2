@@ -20,13 +20,15 @@
 //!
 //! ## Privacy
 //!
-//! - The raw `SpaceId` is never sent over mDNS. Only the 32-byte
-//!   [`fingerprint`] is, alongside the peer URL, which is public
-//!   by nature.
-//! - An adversary with a pre-existing list of candidate space ids can
-//!   precompute fingerprints and confirm presence. This is an inherent
-//!   limit of any discovery protocol that must match on a shared
-//!   identifier.
+//! - The raw `SpaceId` is never sent over mDNS. Only the
+//!   [`fingerprint`] is, alongside the peer URL, which is public by
+//!   nature. The fingerprint is key material derived from the space secret
+//!   for this one purpose — the same property the hello proof rests on — so
+//!   a non-member cannot compute it.
+//! - When the host configures no space secret, kitsune2 uses the space id
+//!   as the secret, and an adversary with a list of candidate space ids can
+//!   then compute fingerprints and confirm presence. That is a limit of the
+//!   open-space default, not of the announcement.
 //! - mDNS is unauthenticated, which is why discovery decides nothing on
 //!   its own: membership is established by the access module over the
 //!   authenticated transport connection.
