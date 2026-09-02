@@ -8,6 +8,8 @@
 use super::fakes::*;
 use super::support::{build_recording_handler, remote_url};
 use crate::IrohTransportConfig;
+use crate::connection::DynConnection;
+use crate::connection_context::{ConnectionContext, ConnectionContextParams};
 use crate::url::endpoint_from_url;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -136,4 +138,63 @@ async fn marks_unresponsive_when_outer_connect_timeout_fires() {
         "set_unresponsive should be called exactly once"
     );
     assert_eq!(recorded[0].0, remote_url);
+}
+
+/// A peer whose inbound connection completed while our dial to it was
+/// failing is not unresponsive: the mark must be skipped when the
+/// connections map already holds a live connection for the URL.
+#[tokio::test]
+async fn a_live_connection_spares_the_peer_the_unresponsive_mark() {
+    let recorder = build_recording_handler();
+    let calls = recorder.unresponsive_calls.clone();
+    let handler = recorder.handler;
+
+    let endpoint = Arc::new(FakeEndpoint {
+        connect: connect_fails("timed out"),
+        ..Default::default()
+    });
+
+    let remote_url = remote_url();
+    let target = endpoint_from_url(&remote_url).unwrap();
+    let connections = Arc::new(RwLock::new(HashMap::new()));
+    let local_url = Arc::new(RwLock::new(Some(fake_local_url())));
+
+    // The peer's inbound connection, registered as the live one.
+    let inbound: DynConnection = DialableConnection::new(target.id);
+    let inbound = ConnectionContext::new(ConnectionContextParams {
+        handler: handler.clone(),
+        connection: inbound,
+        local_id: [0u8; 32],
+        dialed_by_us: false,
+        remote_url: Some(remote_url.clone()),
+        preflight_sent: true,
+        opened_at_s: 0,
+        connections: connections.clone(),
+        local_url: local_url.clone(),
+        space_relays: Arc::new(RwLock::new(HashMap::new())),
+        max_frame_bytes: 64 * 1024,
+    });
+    connections
+        .write()
+        .unwrap()
+        .insert(remote_url.clone(), inbound);
+
+    let transport = build_transport(
+        endpoint,
+        handler,
+        connections.clone(),
+        local_url,
+        config(),
+    );
+
+    transport
+        .create_connection_and_context(target, remote_url.clone())
+        .await
+        .expect_err("the dial itself still fails");
+
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a peer with a live connection must not be marked unresponsive"
+    );
+    assert!(connections.read().unwrap().contains_key(&remote_url));
 }

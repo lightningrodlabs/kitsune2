@@ -2,35 +2,12 @@
 //! driven through a fake daemon so no multicast is involved.
 
 use super::*;
-use crate::discovery::test_support::{FakeDaemon, resolved_peer};
-use kitsune2_api::MockTransport;
+use crate::test_support::*;
 use kitsune2_test_utils::agent::{AgentBuilder, TestLocalAgent};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PEER_A: &str = "ws://a.test:80/peera";
 const PEER_B: &str = "ws://b.test:80/peerb";
-
-fn url(s: &str) -> Url {
-    Url::from_str(s).unwrap()
-}
-
-/// A transport recording its dials, reporting `connected` as its open
-/// connections.
-fn transport(connected: Vec<Url>) -> (DynTransport, Arc<Mutex<Vec<Url>>>) {
-    let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
-    let record = dials.clone();
-    let mut mock = MockTransport::new();
-    mock.expect_dial().returning(move |_space, url| {
-        record.lock().unwrap().push(url);
-        Box::pin(async { Ok(DialOutcome::Connected) })
-    });
-    mock.expect_get_connected_peers().returning(move || {
-        let connected = connected.clone();
-        Box::pin(async move { Ok(connected) })
-    });
-    (Arc::new(mock), dials)
-}
 
 struct Harness {
     factory: Arc<MdnsBootstrapFactory>,
@@ -76,7 +53,7 @@ fn harness(cfg: MdnsBootstrapConfig) -> Harness {
 fn enabled() -> MdnsBootstrapConfig {
     MdnsBootstrapConfig {
         enabled: true,
-        service_type: crate::discovery::test_support::SERVICE_TYPE.into(),
+        service_type: SERVICE_TYPE.into(),
         ..Default::default()
     }
 }
@@ -101,9 +78,9 @@ async fn create_space(
     h: &Harness,
     space: &[u8],
     connected: Vec<Url>,
-) -> (DynBootstrap, SpaceId, Arc<Mutex<Vec<Url>>>) {
-    let space_id = SpaceId::from(bytes::Bytes::copy_from_slice(space));
-    let (tx, dials) = transport(connected);
+) -> (DynBootstrap, SpaceId, Dials) {
+    let space_id = space_id(space);
+    let (tx, dials) = recording_transport(connected);
     let peer_store = peer_store(h, &space_id).await;
     let boot = h
         .factory
@@ -111,10 +88,6 @@ async fn create_space(
         .await
         .unwrap();
     (boot, space_id, dials)
-}
-
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 #[tokio::test]
@@ -273,8 +246,8 @@ async fn a_failing_daemon_start_fails_create() {
         builder: Arc::new(builder),
     };
 
-    let space_id = SpaceId::from(bytes::Bytes::from_static(b"space-a"));
-    let (tx, _) = transport(vec![]);
+    let space_id = space_id(b"space-a");
+    let (tx, _) = recording_transport(vec![]);
     let peer_store = peer_store(&h, &space_id).await;
     let err = h
         .factory

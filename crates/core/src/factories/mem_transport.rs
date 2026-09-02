@@ -120,6 +120,23 @@ impl MemTransport {
     }
 }
 
+impl MemTransport {
+    /// Hand the command built by `cmd` to the command runner task and wait
+    /// for the result it reports back.
+    async fn request(
+        &self,
+        cmd: impl FnOnce(ResultSender) -> Cmd,
+    ) -> K2Result<()> {
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        self.cmd_send
+            .send(cmd(result_sender))
+            .map_err(|_| K2Error::other("Connection Closed"))?;
+        result_receiver
+            .await
+            .unwrap_or_else(|_| Err(K2Error::other("Connection Closed")))
+    }
+}
+
 impl TxImp for MemTransport {
     fn url(&self) -> Option<Url> {
         Some(self.this_url.clone())
@@ -143,31 +160,11 @@ impl TxImp for MemTransport {
     }
 
     fn send(&self, peer: Url, data: bytes::Bytes) -> BoxFut<'_, K2Result<()>> {
-        Box::pin(async move {
-            let (result_sender, result_receiver) =
-                tokio::sync::oneshot::channel();
-            match self.cmd_send.send(Cmd::Send(peer, data, result_sender)) {
-                Err(_) => Err(K2Error::other("Connection Closed")),
-                Ok(_) => match result_receiver.await {
-                    Ok(result) => result,
-                    Err(_) => Err(K2Error::other("Connection Closed")),
-                },
-            }
-        })
+        Box::pin(self.request(|result| Cmd::Send(peer, data, result)))
     }
 
     fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
-        Box::pin(async move {
-            let (result_sender, result_receiver) =
-                tokio::sync::oneshot::channel();
-            match self.cmd_send.send(Cmd::Dial(peer, result_sender)) {
-                Err(_) => Err(K2Error::other("Connection Closed")),
-                Ok(_) => match result_receiver.await {
-                    Ok(result) => result,
-                    Err(_) => Err(K2Error::other("Connection Closed")),
-                },
-            }
-        })
+        Box::pin(self.request(|result| Cmd::Dial(peer, result)))
     }
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
@@ -503,49 +500,67 @@ async fn cmd_task(
                 let _ = result_sender.send(con_pool.keys().cloned().collect());
             }
             Cmd::Dial(url, result_sender) => {
-                match get_transport_instances().connect(
+                connect_and_wait(
                     &cmd_send,
                     &mut con_pool,
                     &url,
                     &this_url,
-                ) {
-                    Some(ready_data_send) => {
-                        tokio::task::spawn(async move {
-                            let result =
-                                ready_data_send.wait_ready().await.map(|_| ());
-                            let _ = result_sender.send(result);
-                        });
-                    }
-                    None => {
-                        let _ = result_sender.send(Err(K2Error::other(
-                            format!("no mem transport listening at {url}"),
-                        )));
-                    }
-                }
+                    result_sender,
+                    |_, result_sender| {
+                        let _ = result_sender.send(Ok(()));
+                    },
+                );
             }
             Cmd::Send(url, data, result_sender) => {
-                if let Some(ready_data_send) = get_transport_instances()
-                    .connect(&cmd_send, &mut con_pool, &url, &this_url)
-                {
-                    net_stat_ref(&net_stats, &url, |r| {
-                        r.send_message_count += 1;
-                        r.send_bytes += data.len() as u64;
-                    });
-
-                    tokio::task::spawn(async move {
-                        match ready_data_send.wait_ready().await {
-                            Ok(ds) => {
-                                let _ = ds.send((data, result_sender));
-                            }
-                            Err(e) => {
-                                let _ = result_sender.send(Err(e));
-                            }
-                        };
-                    });
-                }
+                let net_stats = net_stats.clone();
+                let stat_url = url.clone();
+                connect_and_wait(
+                    &cmd_send,
+                    &mut con_pool,
+                    &url,
+                    &this_url,
+                    result_sender,
+                    move |data_send, result_sender| {
+                        net_stat_ref(&net_stats, &stat_url, |r| {
+                            r.send_message_count += 1;
+                            r.send_bytes += data.len() as u64;
+                        });
+                        let _ = data_send.send((data, result_sender));
+                    },
+                );
             }
         }
     }
+}
+
+/// Open the pseudo-connection to `url`, or reuse the open one, and run
+/// `on_ready` with its data channel once the preflight exchange has
+/// completed. A peer that is not listening, or a preflight that does not
+/// complete, is reported through `result_sender` instead.
+fn connect_and_wait(
+    cmd_send: &CmdSend,
+    con_pool: &mut HashMap<Url, DropConnection>,
+    url: &Url,
+    this_url: &Url,
+    result_sender: ResultSender,
+    on_ready: impl FnOnce(DataSend, ResultSender) + Send + 'static,
+) {
+    let Some(ready_data_send) =
+        get_transport_instances().connect(cmd_send, con_pool, url, this_url)
+    else {
+        let _ = result_sender.send(Err(K2Error::other(format!(
+            "no mem transport listening at {url}"
+        ))));
+        return;
+    };
+    tokio::task::spawn(async move {
+        match ready_data_send.wait_ready().await {
+            Ok(data_send) => on_ready(data_send, result_sender),
+            Err(err) => {
+                let _ = result_sender.send(Err(err));
+            }
+        }
+    });
 }
 
 /// A Listener instance is the receiver side of a pseudo connection.
