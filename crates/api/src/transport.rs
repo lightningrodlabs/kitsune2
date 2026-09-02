@@ -574,11 +574,9 @@ pub trait TxImp: 'static + Send + Sync + std::fmt::Debug {
     /// usual post-connect handling (peer store insertion, access grants) can
     /// run, without any module having a message to deliver yet.
     ///
-    /// Transports without a connection phase have nothing to establish, so the
-    /// default implementation succeeds without doing anything.
-    fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
+    /// Whatever `send` does to get a connection with a completed preflight
+    /// before its first frame is what this must do, and then stop.
+    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>>;
 
     /// Get the list of connected peers.
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>>;
@@ -683,7 +681,13 @@ pub trait Transport: 'static + Send + Sync + std::fmt::Debug {
     /// application data. Used by discovery mechanisms that learn a peer URL
     /// and want the peer introduced to this node before any module has a
     /// reason to message it.
-    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>>;
+    ///
+    /// The dial is scoped to a space so that the space's access decisions
+    /// apply: a peer blocked in that space is not dialled, and the attempt
+    /// is counted like any other dropped outgoing message. A peer that has
+    /// no grant yet is dialled, since the connection is what the access
+    /// module needs to negotiate one.
+    fn dial(&self, space_id: SpaceId, peer: Url) -> BoxFut<'_, K2Result<()>>;
 
     /// Get the list of connected peers.
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>>;
@@ -943,8 +947,43 @@ impl Transport for DefaultTransport {
         })
     }
 
-    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
-        self.imp.dial(peer)
+    fn dial(
+        &self,
+        space_id: SpaceId,
+        peer_url: Url,
+    ) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async move {
+            self.error_if_no_local_agents(space_id.clone()).await?;
+            // A dial is checked as if it were addressed to the space's access
+            // module: that exemption exists precisely for the traffic that
+            // lets an ungranted peer become granted, and a dial opens the
+            // connection that traffic needs. A block still wins.
+            let access_module = self
+                .space_map
+                .lock()
+                .expect("poisoned")
+                .get(&space_id)
+                .map(|handler| handler.access_module_id());
+            match check_peer_access(
+                self.space_map.clone(),
+                self.blocked_message_counts.clone(),
+                &peer_url,
+                &space_id,
+                &access_module,
+                true,
+            )? {
+                AccessOutcome::Allow | AccessOutcome::Ungranted => (),
+                AccessOutcome::Blocked => {
+                    tracing::debug!(
+                        ?peer_url,
+                        ?space_id,
+                        "Not dialling a peer that is blocked in that space."
+                    );
+                    return Ok(());
+                }
+            }
+            self.imp.dial(peer_url).await
+        })
     }
 
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {

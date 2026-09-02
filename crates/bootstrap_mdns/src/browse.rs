@@ -9,7 +9,7 @@
 use crate::dial_policy::DialPolicy;
 use crate::discovery;
 use crate::fingerprint::SpaceFingerprint;
-use kitsune2_api::{DynTransport, Url};
+use kitsune2_api::{DynTransport, SpaceId, Url};
 use mdns_sd::ServiceEvent;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, trace};
@@ -49,6 +49,7 @@ impl LocalIdentity {
 /// event stream; the policy's in-flight cap bounds how many run at once.
 pub async fn browse_loop(
     rx: flume::Receiver<ServiceEvent>,
+    space_id: SpaceId,
     fp: SpaceFingerprint,
     identity: Arc<LocalIdentity>,
     tx: DynTransport,
@@ -72,9 +73,10 @@ pub async fn browse_loop(
 
         let tx = tx.clone();
         let policy = policy.clone();
+        let space_id = space_id.clone();
         tokio::spawn(async move {
             let _slot = policy.acquire_slot().await;
-            match tx.dial(peer.url.clone()).await {
+            match tx.dial(space_id, peer.url.clone()).await {
                 Ok(()) => debug!(url = %peer.url, "mdns: dial succeeded"),
                 Err(err) => debug!(?err, url = %peer.url, "mdns: dial failed"),
             }
@@ -105,7 +107,7 @@ mod tests {
         let dials: Arc<Mutex<Vec<Url>>> = Arc::new(Mutex::new(Vec::new()));
         let mut mock = MockTransport::new();
         let record = dials.clone();
-        mock.expect_dial().returning(move |url| {
+        mock.expect_dial().returning(move |_space_id, url| {
             record.lock().unwrap().push(url);
             Box::pin(async { Ok(()) })
         });
@@ -126,8 +128,14 @@ mod tests {
         let fp = space_fingerprint(&space());
         let fp_hex = hex::encode(fp);
 
-        let loop_task =
-            tokio::spawn(browse_loop(event_rx, fp, identity, tx, policy));
+        let loop_task = tokio::spawn(browse_loop(
+            event_rx,
+            space(),
+            fp,
+            identity,
+            tx,
+            policy,
+        ));
 
         // The same peer resolved three times, a second peer once, our own
         // record, a record for another space and a resolve without a URL.
@@ -184,6 +192,7 @@ mod tests {
         let fp_hex = hex::encode(fp);
         let _loop_task = tokio::spawn(browse_loop(
             event_rx,
+            space(),
             fp,
             identity.clone(),
             tx,

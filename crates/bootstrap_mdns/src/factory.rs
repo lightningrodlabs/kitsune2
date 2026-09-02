@@ -136,6 +136,7 @@ impl MdnsBootstrap {
         let browse_rx = service.browse()?;
         let browse_task = tokio::spawn(browse_loop(
             browse_rx,
+            space_id.clone(),
             fingerprint::space_fingerprint(&space_id),
             identity.clone(),
             tx,

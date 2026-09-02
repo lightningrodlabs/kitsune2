@@ -206,6 +206,26 @@ impl TrackHnd {
         panic!("no url found");
     }
 
+    /// How many times `peer` connected to this handler.
+    pub fn connect_count(&self, peer: &Url) -> usize {
+        self.track
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| matches!(t, Track::Connect(url) if url == peer))
+            .count()
+    }
+
+    /// How many preflights this handler has validated.
+    pub fn preflight_recv_count(&self) -> usize {
+        self.track
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| matches!(t, Track::PreflightRecv))
+            .count()
+    }
+
     pub fn check_connect(&self, peer: &Url) -> K2Result<()> {
         for t in self.track.lock().unwrap().iter() {
             if let Track::Connect(u) = t
@@ -808,5 +828,107 @@ async fn sending_to_a_blocked_peer_does_not_trigger_a_challenge() {
     h2.check_no_mod(HELLO_MOD_NAME);
     h2.check_no_mod("test");
     h2.check_no_notify();
+    h1.check_no_ungranted_dropped();
+}
+
+/// A dial runs the preflight on the remote and leaves a connection behind
+/// that the next send reuses instead of opening a second one.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_runs_the_preflight_and_a_following_send_reuses_the_connection() {
+    let h1 = TrackHnd::new();
+    let t1 = gen_tx(h1.clone()).await;
+    t1.register_space_handler(TEST_SPACE_ID, h1.clone());
+    let u1 = h1.url();
+
+    let h2 = TrackHnd::new();
+    let t2 = gen_tx(h2.clone()).await;
+    t2.register_space_handler(TEST_SPACE_ID, h2.clone());
+    let u2 = h2.url();
+
+    t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+
+    // The remote saw us connect and validated our preflight, and both ends
+    // now report the connection.
+    iter_check!({
+        if h2.check_connect(&u1).is_ok() && h2.preflight_recv_count() == 1 {
+            break;
+        }
+    });
+    assert_eq!(vec![u2.clone()], t1.get_connected_peers().await.unwrap());
+    // One connection fans out to every handler registered on the remote,
+    // so the count is compared before and after rather than to a constant.
+    let connects_after_dial = h2.connect_count(&u1);
+
+    t1.send_space_notify(
+        u2.clone(),
+        TEST_SPACE_ID,
+        bytes::Bytes::from_static(b"hello"),
+    )
+    .await
+    .unwrap();
+    iter_check!({
+        if h2.check_notify(&u1, &TEST_SPACE_ID, b"hello").is_ok() {
+            break;
+        }
+    });
+    assert_eq!(
+        h2.connect_count(&u1),
+        connects_after_dial,
+        "the send must reuse the dialled connection"
+    );
+    assert_eq!(h2.preflight_recv_count(), 1);
+}
+
+/// A dial toward a peer blocked in the space opens nothing and is counted
+/// as a dropped outgoing message.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_to_a_blocked_peer_opens_no_connection() {
+    let h1 = TrackHnd::new();
+    h1.block();
+    let t1 = gen_tx(h1.clone()).await;
+    t1.register_space_handler(TEST_SPACE_ID, h1.clone());
+
+    let h2 = TrackHnd::new();
+    let t2 = gen_tx(h2.clone()).await;
+    t2.register_space_handler(TEST_SPACE_ID, h2.clone());
+    let u2 = h2.url();
+
+    t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+
+    assert!(t1.get_connected_peers().await.unwrap().is_empty());
+    let counts = t1
+        .dump_network_stats()
+        .await
+        .unwrap()
+        .blocked_message_counts;
+    assert_eq!(counts[&u2][&TEST_SPACE_ID].outgoing, 1);
+    h1.check_no_ungranted_dropped();
+}
+
+/// A peer with no grant yet is dialled: the connection is what the access
+/// module needs to negotiate one. The dial is not reported as a dropped
+/// message, so it triggers no challenge of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_to_an_ungranted_peer_connects() {
+    let h1 = TrackHnd::new();
+    h1.ungrant();
+    let t1 = gen_tx(h1.clone()).await;
+    t1.register_space_handler(TEST_SPACE_ID, h1.clone());
+
+    let h2 = TrackHnd::new();
+    let t2 = gen_tx(h2.clone()).await;
+    t2.register_space_handler(TEST_SPACE_ID, h2.clone());
+    let u2 = h2.url();
+
+    t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+
+    assert_eq!(vec![u2.clone()], t1.get_connected_peers().await.unwrap());
+    assert!(
+        t1.dump_network_stats()
+            .await
+            .unwrap()
+            .blocked_message_counts
+            .is_empty()
+    );
     h1.check_no_ungranted_dropped();
 }
