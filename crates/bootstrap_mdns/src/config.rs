@@ -22,14 +22,15 @@ pub struct MdnsBootstrapConfig {
     #[cfg_attr(feature = "schema", schemars(default))]
     pub service_type: String,
 
-    /// Minimum time, in milliseconds, between two dial attempts toward the
-    /// same peer URL. mDNS resolves the same record repeatedly (on every
-    /// re-announce and on every interface it is heard on) and a peer that
-    /// could not be reached a moment ago is unlikely to be reachable now.
+    /// How often, in milliseconds, announced peers the transport is not
+    /// connected to are dialled again. A peer is dialled once when its
+    /// announcement is first heard; if that dial fails — commonly because
+    /// the peer's transport record has not reached this node yet — this is
+    /// what retries it, for as long as the LAN keeps announcing the peer.
     ///
-    /// Default: 60 seconds.
+    /// Default: 30 seconds.
     #[cfg_attr(feature = "schema", schemars(default))]
-    pub dial_cooldown_ms: u32,
+    pub redial_interval_ms: u32,
 
     /// Maximum number of dials this module has in flight at once. Bounds
     /// the work a burst of announcements — or a hostile flood of them — can
@@ -45,7 +46,7 @@ impl Default for MdnsBootstrapConfig {
         Self {
             enabled: false,
             service_type: "_kitsune2._udp.local.".to_string(),
-            dial_cooldown_ms: 60_000,
+            redial_interval_ms: 30_000,
             max_concurrent_dials: 4,
         }
     }

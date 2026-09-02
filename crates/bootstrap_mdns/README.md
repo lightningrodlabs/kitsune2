@@ -20,9 +20,11 @@ someone else's job.
 2. **Browse.** Every resolved record that carries our fingerprint and a
    parseable peer URL — and is not our own instance or our own URL — is a
    candidate.
-3. **Dial.** Candidates are handed to `Transport::dial(url)`, at most once
-   per URL per `dialCooldownMs` and with at most `maxConcurrentDials` in
-   flight. That opens a transport connection and runs its preflight.
+3. **Dial.** A candidate is handed to `Transport::dial(space, url)` when
+   it is first heard, and again every `redialIntervalMs` for as long as the
+   LAN announces it and the transport reports no connection to it, with at
+   most `maxConcurrentDials` in flight. That opens a transport connection
+   and runs its preflight.
 4. **Hand over.** The space's access module (the *hello* module in
    `kitsune2_core`) sees the new connection, challenges the peer to prove
    knowledge of the space secret, proves the same in return, and only then
@@ -73,7 +75,7 @@ Then enable discovery in config (disabled by default):
   "mdnsBootstrap": {
     "enabled": true,
     "serviceType": "_kitsune2._udp.local.",
-    "dialCooldownMs": 60000,
+    "redialIntervalMs": 30000,
     "maxConcurrentDials": 4
   }
 }
