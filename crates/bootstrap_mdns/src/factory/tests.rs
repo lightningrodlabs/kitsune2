@@ -90,6 +90,19 @@ async fn create_space(
     (boot, space_id, dials)
 }
 
+/// Hand the bootstrap a local agent info carrying `url`, which is what
+/// gives the space something to announce and makes it dial.
+fn put(boot: &DynBootstrap, space: &SpaceId, url: &Url) {
+    boot.put(
+        AgentBuilder::default()
+            .with_space(space.clone())
+            .with_url(Some(url.clone()))
+            .build(TestLocalAgent::default()),
+    );
+}
+
+const SELF_URL: &str = "ws://self.test:80/selfpeer";
+
 #[tokio::test]
 async fn spaces_share_one_daemon_and_announce_their_own_records() {
     let h = harness(enabled());
@@ -98,16 +111,8 @@ async fn spaces_share_one_daemon_and_announce_their_own_records() {
     assert_eq!(h.starts.load(Ordering::SeqCst), 1);
     assert_eq!(h.factory.shared_if_started().unwrap().space_count(), 2);
 
-    let put = |boot: &DynBootstrap, space: &SpaceId| {
-        boot.put(
-            AgentBuilder::default()
-                .with_space(space.clone())
-                .with_url(Some(url(PEER_A)))
-                .build(TestLocalAgent::default()),
-        );
-    };
-    put(&boot_a, &space_a);
-    put(&boot_b, &space_b);
+    put(&boot_a, &space_a, &url(PEER_A));
+    put(&boot_b, &space_b, &url(PEER_A));
 
     let registered = h.daemon.registered.lock().unwrap();
     assert_eq!(registered.len(), 2, "one record per space");
@@ -130,10 +135,13 @@ async fn a_disabled_factory_starts_no_daemon() {
 #[tokio::test]
 async fn a_record_for_one_space_never_dials_for_another() {
     let h = harness(enabled());
-    let (_boot_a, space_a, dials_a) =
-        create_space(&h, b"space-a", vec![]).await;
-    let (_boot_b, _space_b, dials_b) =
-        create_space(&h, b"space-b", vec![]).await;
+    let (boot_a, space_a, dials_a) = create_space(&h, b"space-a", vec![]).await;
+    let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
+    put(&boot_a, &space_a, &url(SELF_URL));
+    put(&boot_b, &space_b, &url(SELF_URL));
+    // The first put reconciles what was heard so far (nothing yet); let
+    // that run before the LAN speaks, so each record is dialled once.
+    settle().await;
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
@@ -152,14 +160,10 @@ async fn a_record_for_one_space_never_dials_for_another() {
 async fn dropping_one_space_leaves_the_other_browsing() {
     let h = harness(enabled());
     let (boot_a, space_a, dials_a) = create_space(&h, b"space-a", vec![]).await;
-    let (_boot_b, space_b, dials_b) =
-        create_space(&h, b"space-b", vec![]).await;
-    boot_a.put(
-        AgentBuilder::default()
-            .with_space(space_a.clone())
-            .with_url(Some(url(PEER_A)))
-            .build(TestLocalAgent::default()),
-    );
+    let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
+    put(&boot_a, &space_a, &url(SELF_URL));
+    put(&boot_b, &space_b, &url(SELF_URL));
+    settle().await;
 
     drop(boot_a);
     assert_eq!(h.factory.shared_if_started().unwrap().space_count(), 1);
@@ -195,7 +199,9 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
         redial_interval_ms: 100,
         ..enabled()
     });
-    let (_boot, space_a, dials) = create_space(&h, b"space-a", vec![]).await;
+    let (boot, space_a, dials) = create_space(&h, b"space-a", vec![]).await;
+    put(&boot, &space_a, &url(SELF_URL));
+    settle().await;
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
@@ -205,11 +211,12 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
         PEER_A,
     ));
     settle().await;
-    assert_eq!(dials.lock().unwrap().len(), 1);
+    let first = dials.lock().unwrap().len();
+    assert!(first >= 1, "the announcement is dialled on arrival");
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     let count = dials.lock().unwrap().len();
-    assert!(count >= 2, "expected redials, saw {count} dials");
+    assert!(count > first, "expected redials, saw {count} dials");
     assert!(dials.lock().unwrap().iter().all(|u| u == &url(PEER_A)));
 }
 
@@ -257,4 +264,49 @@ async fn a_failing_daemon_start_fails_create() {
     assert!(err.to_string().contains("no multicast"), "{err}");
     assert_eq!(h.starts.load(Ordering::SeqCst), 1);
     assert!(h.factory.shared_if_started().is_none());
+}
+
+/// A record heard before the space's first put is dialled by that put:
+/// the URL is what makes the space dialable, and the LAN does not repeat
+/// itself.
+#[tokio::test]
+async fn the_first_put_dials_what_was_heard_before_it() {
+    let h = harness(enabled());
+    let (boot, space_a, dials) = create_space(&h, b"space-a", vec![]).await;
+
+    h.daemon.deliver(resolved_peer(
+        "peer-1",
+        &SpaceFingerprint::derive(&h.builder, &space_a)
+            .await
+            .unwrap(),
+        PEER_A,
+    ));
+    settle().await;
+    assert!(dials.lock().unwrap().is_empty(), "not dialable yet");
+
+    put(&boot, &space_a, &url(SELF_URL));
+    settle().await;
+    assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+}
+
+/// A space created after the LAN peer's record was resolved still hears
+/// it: the shared browse replays it on join.
+#[tokio::test]
+async fn a_space_created_later_hears_records_resolved_before_it() {
+    let h = harness(enabled());
+    let (_boot_a, _, _) = create_space(&h, b"space-a", vec![]).await;
+    let space_b = space_id(b"space-b");
+    h.daemon.deliver(resolved_peer(
+        "peer-1",
+        &SpaceFingerprint::derive(&h.builder, &space_b)
+            .await
+            .unwrap(),
+        PEER_B,
+    ));
+    settle().await;
+
+    let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
+    put(&boot_b, &space_b, &url(SELF_URL));
+    settle().await;
+    assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
 }

@@ -132,11 +132,14 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 let out: DynBootstrap = Arc::new(DisabledMdnsBootstrap);
                 return Ok(out);
             }
-            // A daemon that cannot start is this factory's failure to
-            // report; whether the space may run without LAN discovery is
-            // decided by whoever assembles the bootstrap stack.
-            let shared = inner.shared(&cfg.service_type).await?;
+            // The fingerprint comes first so that the space is ready to
+            // join the moment the daemon is up and replays what the LAN
+            // already knows. A daemon that cannot start is this factory's
+            // failure to report; whether the space may run without LAN
+            // discovery is decided by whoever assembles the bootstrap
+            // stack.
             let fp = SpaceFingerprint::derive(&builder, &space_id).await?;
+            let shared = inner.shared(&cfg.service_type).await?;
             let boot = MdnsBootstrap::join(shared, &cfg, space_id, fp, tx);
             let out: DynBootstrap = Arc::new(boot);
             Ok(out)
@@ -190,7 +193,11 @@ impl Bootstrap for MdnsBootstrap {
             return;
         };
         match self.entry.advertise(&url) {
-            Ok(()) => trace!(%url, "mdns: advertising peer url"),
+            Ok(true) => {
+                trace!(%url, "mdns: advertising peer url, dialling what the LAN announced so far");
+                self.entry.reconcile_soon();
+            }
+            Ok(false) => trace!(%url, "mdns: advertising peer url"),
             Err(err) => warn!(?err, %url, "mdns: failed to advertise peer url"),
         }
     }
@@ -216,7 +223,7 @@ impl MdnsBootstrap {
         ));
         debug!(
             ?space_id,
-            fullname = entry.fullname(),
+            fullname = %entry.fullname(),
             "mdns bootstrap joined the shared daemon"
         );
         Self {
@@ -237,7 +244,7 @@ async fn redial_loop(entry: Arc<SpaceEntry>, interval: Duration) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        entry.redial_unconnected().await;
+        entry.reconcile_from_transport().await;
     }
 }
 

@@ -153,19 +153,20 @@ pub fn record_txt(fp: &SpaceFingerprint, url: &Url) -> [(String, String); 2] {
     ]
 }
 
-/// The space commitment and peer URL a resolved record carries, if it is
-/// one of ours: a decodable `spacefp` and a peer URL that names someone to
-/// dial. Whose space it is, and whether it is our own record, is for the
-/// caller to decide.
-pub fn parse_record(svc: &ResolvedService) -> Option<(SpaceFingerprint, Url)> {
+/// The `spacefp` and `url` TXT values of a resolved record, as announced.
+/// Neither is decoded here: a record for a space this node is not in
+/// should cost one string lookup and nothing more.
+pub fn record_fields(svc: &ResolvedService) -> Option<(&str, &str)> {
     let fp = svc.txt_properties.get_property_val_str(TXT_KEY_SPACE_FP)?;
-    let fp = SpaceFingerprint::decode(fp)?;
     let url = svc.txt_properties.get_property_val_str(TXT_KEY_URL)?;
-    let url = Url::from_str(url).ok()?;
-    if !url.is_peer() {
-        return None;
-    }
     Some((fp, url))
+}
+
+/// The peer URL an announced `url` value names, if it names someone to
+/// dial.
+pub fn parse_peer_url(url: &str) -> Option<Url> {
+    let url = Url::from_str(url).ok()?;
+    url.is_peer().then_some(url)
 }
 
 #[cfg(test)]
@@ -180,11 +181,13 @@ mod tests {
         test_fp(&[7u8; 32])
     }
 
+    /// The fingerprint and peer URL a record carries, decoded.
     fn parse(event: &ServiceEvent) -> Option<(SpaceFingerprint, Url)> {
-        match event {
-            ServiceEvent::ServiceResolved(svc) => parse_record(svc),
-            _ => None,
-        }
+        let ServiceEvent::ServiceResolved(svc) = event else {
+            return None;
+        };
+        let (fp, url) = record_fields(svc)?;
+        Some((SpaceFingerprint::decode(fp)?, parse_peer_url(url)?))
     }
 
     #[test]
