@@ -82,6 +82,16 @@ pub trait PeerMetaStore: 'static + Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Forget that a peer URL was marked unresponsive.
+    ///
+    /// A peer that has just completed a connection with us is responsive by
+    /// definition, so whatever earlier failure put it on the unresponsive
+    /// list no longer describes it. Clearing a URL that is not marked is not
+    /// an error.
+    fn clear_unresponsive(&self, peer: Url) -> BoxFuture<'_, K2Result<()>> {
+        self.delete(peer, format!("{KEY_PREFIX_ROOT}:{META_KEY_UNRESPONSIVE}"))
+    }
+
     /// Delete a key-value pair for a given space and peer.
     fn delete(&self, peer: Url, key: String) -> BoxFuture<'_, K2Result<()>>;
 }
