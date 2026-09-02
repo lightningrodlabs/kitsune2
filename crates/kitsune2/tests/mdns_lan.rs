@@ -23,7 +23,9 @@ use kitsune2_bootstrap_mdns::config::{
     MdnsBootstrapConfig, MdnsBootstrapModConfig,
 };
 use kitsune2_core::Ed25519LocalAgent;
-use kitsune2_core::factories::CompositeBootstrapFactory;
+use kitsune2_core::factories::{
+    CompositeBootstrapFactory, OptionalBootstrapFactory,
+};
 use kitsune2_gossip::{K2GossipConfig, K2GossipModConfig};
 use kitsune2_test_utils::noop_bootstrap::NoopBootstrapFactory;
 use kitsune2_test_utils::{enable_tracing, iter_check, space::TEST_SPACE_ID};
@@ -71,9 +73,12 @@ fn per_run_service_type() -> String {
 
 async fn make_node(service_type: &str) -> Node {
     let builder = Builder {
+        // The intended production wiring: the WAN bootstrap stays
+        // mandatory, the LAN one may fail to start without costing the
+        // space anything.
         bootstrap: CompositeBootstrapFactory::create(vec![
             Arc::new(NoopBootstrapFactory),
-            MdnsBootstrapFactory::create(),
+            OptionalBootstrapFactory::create(MdnsBootstrapFactory::create()),
         ]),
         ..default_builder()
     }

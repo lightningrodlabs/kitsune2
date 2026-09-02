@@ -845,7 +845,8 @@ async fn dial_runs_the_preflight_and_a_following_send_reuses_the_connection() {
     t2.register_space_handler(TEST_SPACE_ID, h2.clone());
     let u2 = h2.url();
 
-    t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+    let outcome = t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+    assert_eq!(outcome, DialOutcome::Connected);
 
     // The remote saw us connect and validated our preflight, and both ends
     // now report the connection.
@@ -893,7 +894,8 @@ async fn dial_to_a_blocked_peer_opens_no_connection() {
     t2.register_space_handler(TEST_SPACE_ID, h2.clone());
     let u2 = h2.url();
 
-    t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+    let outcome = t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+    assert_eq!(outcome, DialOutcome::Blocked);
 
     assert!(t1.get_connected_peers().await.unwrap().is_empty());
     let counts = t1
@@ -920,7 +922,8 @@ async fn dial_to_an_ungranted_peer_connects() {
     t2.register_space_handler(TEST_SPACE_ID, h2.clone());
     let u2 = h2.url();
 
-    t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+    let outcome = t1.dial(TEST_SPACE_ID, u2.clone()).await.unwrap();
+    assert_eq!(outcome, DialOutcome::Connected);
 
     assert_eq!(vec![u2.clone()], t1.get_connected_peers().await.unwrap());
     assert!(

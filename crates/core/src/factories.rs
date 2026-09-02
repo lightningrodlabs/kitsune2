@@ -23,6 +23,12 @@ pub use core_bootstrap::*;
 mod composite_bootstrap;
 pub use composite_bootstrap::*;
 
+mod optional_bootstrap;
+pub use optional_bootstrap::*;
+
+#[cfg(test)]
+mod bootstrap_test_support;
+
 mod mem_peer_meta_store;
 pub use mem_peer_meta_store::*;
 

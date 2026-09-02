@@ -859,7 +859,11 @@ impl Transport for HandlerCapturingTransport {
         self.inner.send_module(peer, space_id, module, data)
     }
 
-    fn dial(&self, space_id: SpaceId, peer: Url) -> BoxFut<'_, K2Result<()>> {
+    fn dial(
+        &self,
+        space_id: SpaceId,
+        peer: Url,
+    ) -> BoxFut<'_, K2Result<DialOutcome>> {
         self.inner.dial(space_id, peer)
     }
 

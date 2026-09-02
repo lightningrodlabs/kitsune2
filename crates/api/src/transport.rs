@@ -620,6 +620,22 @@ pub trait TxImp: 'static + Send + Sync + std::fmt::Debug {
 /// Trait-object [TxImp].
 pub type DynTxImp = Arc<dyn TxImp>;
 
+/// What a [`Transport::dial`] achieved.
+///
+/// A dial that the space's access rules refuse is not a failure of the
+/// transport, so it is reported as an outcome rather than an error: the
+/// caller learns that the peer is off limits in that space and can stop
+/// asking, while a real transport error stays an `Err`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialOutcome {
+    /// A connection with a completed preflight is open to the peer.
+    Connected,
+
+    /// The peer is blocked in the space, so nothing was dialled.
+    Blocked,
+}
+
 /// A high-level wrapper around a low-level [DynTxImp] transport implementation.
 #[cfg_attr(any(test, feature = "mockall"), mockall::automock)]
 pub trait Transport: 'static + Send + Sync + std::fmt::Debug {
@@ -683,11 +699,16 @@ pub trait Transport: 'static + Send + Sync + std::fmt::Debug {
     /// reason to message it.
     ///
     /// The dial is scoped to a space so that the space's access decisions
-    /// apply: a peer blocked in that space is not dialled, and the attempt
-    /// is counted like any other dropped outgoing message. A peer that has
-    /// no grant yet is dialled, since the connection is what the access
-    /// module needs to negotiate one.
-    fn dial(&self, space_id: SpaceId, peer: Url) -> BoxFut<'_, K2Result<()>>;
+    /// apply: a peer blocked in that space is not dialled, the attempt is
+    /// counted like any other dropped outgoing message, and the outcome is
+    /// [`DialOutcome::Blocked`]. A peer that has no grant yet is dialled,
+    /// since the connection is what the access module needs to negotiate
+    /// one.
+    fn dial(
+        &self,
+        space_id: SpaceId,
+        peer: Url,
+    ) -> BoxFut<'_, K2Result<DialOutcome>>;
 
     /// Get the list of connected peers.
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>>;
@@ -951,7 +972,7 @@ impl Transport for DefaultTransport {
         &self,
         space_id: SpaceId,
         peer_url: Url,
-    ) -> BoxFut<'_, K2Result<()>> {
+    ) -> BoxFut<'_, K2Result<DialOutcome>> {
         Box::pin(async move {
             self.error_if_no_local_agents(space_id.clone()).await?;
             // A dial is checked as if it were addressed to the space's access
@@ -979,10 +1000,11 @@ impl Transport for DefaultTransport {
                         ?space_id,
                         "Not dialling a peer that is blocked in that space."
                     );
-                    return Ok(());
+                    return Ok(DialOutcome::Blocked);
                 }
             }
-            self.imp.dial(peer_url).await
+            self.imp.dial(peer_url).await?;
+            Ok(DialOutcome::Connected)
         })
     }
 
