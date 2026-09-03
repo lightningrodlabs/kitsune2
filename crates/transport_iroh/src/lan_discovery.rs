@@ -33,7 +33,23 @@
 //! it is not recognised either. None of these are served by the
 //! relay-down bypass; the relay-up path, where iroh's in-connect lookup
 //! is unfiltered, is unaffected. All three are known limitations.
+//!
+//! The mDNS service joins the multicast group once, on the interfaces
+//! that exist when it is built, and never follows interface changes. A
+//! node that starts without a usable interface and gains one later would
+//! therefore never announce or hear iroh records on it. To cover that,
+//! [`maybe_spawn_lan_rebind_task`] watches the endpoint's local IP set and,
+//! when it changes, rebuilds the lookup service after a short debounce
+//! (`LAN_REBIND_DEBOUNCE`); the fresh service joins the group on the
+//! interfaces present now and iroh republishes the current addresses to
+//! it. The rebuild replaces the endpoint's whole service list, which is
+//! sound because the transport builds its endpoint from the `Minimal`
+//! preset and the mDNS lookup is the only service it ever attaches.
 
+#[cfg(any(test, feature = "mdns"))]
+use std::collections::BTreeSet;
+#[cfg(any(test, feature = "mdns"))]
+use std::net::IpAddr;
 use std::time::Duration;
 
 /// How long a dial that would otherwise be skipped waits for the LAN
@@ -123,6 +139,152 @@ pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// How long the local IP set has to stay unchanged before the LAN
+/// discovery service is rebuilt. An interface coming up typically fires
+/// several address updates in quick succession (v4, v6, temporary
+/// addresses); the window folds them into one rebuild.
+#[cfg(feature = "mdns")]
+pub(crate) const LAN_REBIND_DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// The set of local IP addresses in an endpoint address, ignoring ports
+/// and relay entries. Ports change with every socket rebind while the
+/// interfaces stay the same, and relays say nothing about the LAN, so
+/// neither is part of what decides a rebind.
+#[cfg(any(test, feature = "mdns"))]
+pub(crate) fn local_ip_set(addr: &iroh::EndpointAddr) -> BTreeSet<IpAddr> {
+    addr.ip_addrs().map(|sock| sock.ip()).collect()
+}
+
+/// Whether the local IP set changed in a way that calls for rebuilding
+/// the LAN discovery service: any difference counts, because a lost
+/// address may mean an interface went down and lost its multicast
+/// membership, and a new one is an interface the service never joined.
+#[cfg(any(test, feature = "mdns"))]
+pub(crate) fn rebind_needed(
+    prev: &BTreeSet<IpAddr>,
+    next: &BTreeSet<IpAddr>,
+) -> bool {
+    prev != next
+}
+
+/// Replace the endpoint's mDNS lookup service with a freshly built one.
+///
+/// The new service is built before the old one is removed, so a build
+/// failure leaves the endpoint as it was. iroh publishes the last known
+/// endpoint data to the new service as soon as it is added, so the
+/// current addresses are announced on the interfaces present now.
+#[cfg(feature = "mdns")]
+pub(crate) fn rebind_lan_discovery(
+    endpoint: &iroh::Endpoint,
+) -> kitsune2_api::K2Result<()> {
+    use kitsune2_api::K2Error;
+
+    let services = endpoint.address_lookup().map_err(|err| {
+        K2Error::other_src("endpoint closed, cannot rebind LAN discovery", err)
+    })?;
+    let fresh = iroh_mdns_address_lookup::MdnsAddressLookup::builder()
+        .build(endpoint.id())
+        .map_err(|err| {
+            K2Error::other_src("failed to build the LAN discovery service", err)
+        })?;
+    debug_assert_eq!(
+        services.len(),
+        1,
+        "the mDNS lookup must be the endpoint's only address lookup service"
+    );
+    services.clear();
+    services.add(fresh);
+    Ok(())
+}
+
+/// Watch the endpoint's local IP set and call `rebind` once per debounced
+/// change. The first observed value never triggers a rebind: the service
+/// built at bind time already covers the interfaces present then.
+///
+/// `rebind` is injectable so that tests can count rebuilds; production
+/// passes [`rebind_lan_discovery`]. A failed rebind is logged and the next
+/// change retries it. The task runs until it is aborted; the watcher only
+/// disconnects when the last endpoint clone is dropped, and this task
+/// holds one.
+#[cfg(feature = "mdns")]
+pub(crate) fn spawn_lan_rebind_task(
+    endpoint: iroh::Endpoint,
+    debounce: Duration,
+    rebind: impl Fn(&iroh::Endpoint) -> kitsune2_api::K2Result<()> + Send + 'static,
+) -> tokio::task::AbortHandle {
+    use n0_watcher::Watcher;
+    use tokio::time::{Instant, sleep_until};
+
+    let mut watcher = endpoint.watch_addr();
+    tokio::spawn(async move {
+        let mut prev = local_ip_set(&watcher.get());
+        loop {
+            let mut next = match watcher.updated().await {
+                Ok(addr) => local_ip_set(&addr),
+                Err(_) => return,
+            };
+            if !rebind_needed(&prev, &next) {
+                continue;
+            }
+            // Absorb the burst: every further change restarts the window.
+            let mut deadline = Instant::now() + debounce;
+            loop {
+                tokio::select! {
+                    _ = sleep_until(deadline) => break,
+                    updated = watcher.updated() => match updated {
+                        Ok(addr) => {
+                            let seen = local_ip_set(&addr);
+                            if seen != next {
+                                next = seen;
+                                deadline = Instant::now() + debounce;
+                            }
+                        }
+                        Err(_) => return,
+                    },
+                }
+            }
+            match rebind(&endpoint) {
+                Ok(()) => tracing::info!(
+                    local_ips = ?next,
+                    "LAN discovery rebound after a local address change"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    local_ips = ?next,
+                    "LAN discovery rebind failed, will retry on the next address change"
+                ),
+            }
+            prev = next;
+        }
+    })
+    .abort_handle()
+}
+
+/// Start the address-change rebind task for an endpoint that has LAN
+/// discovery enabled. Returns `None` when LAN discovery is off.
+#[cfg(feature = "mdns")]
+pub(crate) fn maybe_spawn_lan_rebind_task(
+    endpoint: &iroh::Endpoint,
+    enabled: bool,
+) -> Option<tokio::task::AbortHandle> {
+    enabled.then(|| {
+        spawn_lan_rebind_task(
+            endpoint.clone(),
+            LAN_REBIND_DEBOUNCE,
+            rebind_lan_discovery,
+        )
+    })
+}
+
+/// Stub used when the `mdns` cargo feature is disabled.
+#[cfg(not(feature = "mdns"))]
+pub(crate) fn maybe_spawn_lan_rebind_task(
+    _endpoint: &iroh::Endpoint,
+    _enabled: bool,
+) -> Option<tokio::task::AbortHandle> {
+    None
+}
+
 /// Attach an mDNS-based LAN discovery service to the given iroh endpoint
 /// builder. Returns the builder unchanged if the `mdns` feature is off or if
 /// `enabled` is false.
@@ -199,11 +361,56 @@ mod scope_tests {
     }
 }
 
+#[cfg(test)]
+mod rebind_tests {
+    use super::{local_ip_set, rebind_needed};
+    use iroh::{EndpointAddr, RelayUrl, TransportAddr};
+    use std::collections::BTreeSet;
+    use std::net::IpAddr;
+
+    fn ips(list: &[&str]) -> BTreeSet<IpAddr> {
+        list.iter().map(|ip| ip.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn local_ip_set_keeps_ips_only() {
+        let id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let relay: RelayUrl = "https://relay.example/".parse().unwrap();
+        let addr = EndpointAddr::from_parts(
+            id,
+            [
+                TransportAddr::Relay(relay),
+                TransportAddr::Ip("192.168.1.20:4433".parse().unwrap()),
+                TransportAddr::Ip("192.168.1.20:5000".parse().unwrap()),
+                TransportAddr::Ip("[fd00::20]:4433".parse().unwrap()),
+            ],
+        );
+        assert_eq!(local_ip_set(&addr), ips(&["192.168.1.20", "fd00::20"]));
+        assert!(local_ip_set(&EndpointAddr::new(id)).is_empty());
+    }
+
+    #[test]
+    fn rebind_needed_on_any_set_difference() {
+        let a = ips(&["192.168.1.20"]);
+        let b = ips(&["192.168.1.20", "10.0.0.5"]);
+        let c = ips(&[]);
+        assert!(!rebind_needed(&a, &a));
+        assert!(!rebind_needed(&c, &c));
+        assert!(rebind_needed(&a, &b));
+        assert!(rebind_needed(&b, &a));
+        assert!(rebind_needed(&c, &a));
+        assert!(rebind_needed(&a, &c));
+    }
+}
+
 #[cfg(all(test, feature = "mdns"))]
 mod tests {
     use super::*;
     use iroh::endpoint::presets::Minimal;
     use iroh::{Endpoint, RelayMode};
+    use n0_watcher::Watcher;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Sanity: with the `mdns` feature on, an endpoint binds with the lookup
     // service registered. Cross-node discovery is not asserted here — that
@@ -241,6 +448,79 @@ mod tests {
             start.elapsed() < Duration::from_secs(3),
             "resolve must be bounded by the timeout"
         );
+        ep.close().await;
+    }
+
+    async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // The rebind task must ignore the initial address, rebuild the lookup
+    // once per debounced change, and leave exactly one service behind. The
+    // address change is driven with `add_external_addr`, which feeds the
+    // same `ip_addrs` watcher that an interface change does.
+    #[tokio::test]
+    async fn rebinds_once_per_debounced_address_change() {
+        let builder =
+            Endpoint::builder(Minimal).relay_mode(RelayMode::Disabled);
+        let builder = maybe_enable_lan_discovery(builder, true);
+        let ep = builder.bind().await.expect("bind");
+
+        let debounce = Duration::from_millis(200);
+        let rebinds = Arc::new(AtomicUsize::new(0));
+        let counter = rebinds.clone();
+        let task = spawn_lan_rebind_task(ep.clone(), debounce, move |ep| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            rebind_lan_discovery(ep)
+        });
+
+        tokio::time::sleep(debounce * 3).await;
+        assert_eq!(
+            rebinds.load(Ordering::SeqCst),
+            0,
+            "the initial address must not trigger a rebind"
+        );
+
+        let first: std::net::SocketAddr = "192.0.2.9:4433".parse().unwrap();
+        ep.add_external_addr(first).await;
+        wait_for("the external addr to surface in watch_addr", || {
+            ep.watch_addr().get().ip_addrs().any(|sock| *sock == first)
+        })
+        .await;
+        wait_for("the first rebind", || rebinds.load(Ordering::SeqCst) == 1)
+            .await;
+        tokio::time::sleep(debounce * 2).await;
+        assert_eq!(rebinds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ep.address_lookup().expect("endpoint open").len(),
+            1,
+            "the rebuild must leave exactly one lookup service"
+        );
+
+        // Two changes inside one debounce window fold into one rebind.
+        ep.add_external_addr("192.0.2.10:4433".parse().unwrap())
+            .await;
+        tokio::time::sleep(debounce / 4).await;
+        ep.add_external_addr("192.0.2.11:4433".parse().unwrap())
+            .await;
+        wait_for("the second rebind", || rebinds.load(Ordering::SeqCst) == 2)
+            .await;
+        tokio::time::sleep(debounce * 2).await;
+        assert_eq!(
+            rebinds.load(Ordering::SeqCst),
+            2,
+            "rapid changes must be debounced into one rebind"
+        );
+        assert_eq!(ep.address_lookup().expect("endpoint open").len(), 1);
+
+        task.abort();
         ep.close().await;
     }
 }

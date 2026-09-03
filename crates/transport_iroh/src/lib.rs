@@ -466,6 +466,9 @@ struct IrohTransport {
     watch_addr_task: AbortHandle,
     accept_task: AbortHandle,
     relay_keepalive_task: Option<AbortHandle>,
+    /// Rebuilds LAN discovery when the local IP set changes; only present
+    /// with LAN discovery enabled.
+    lan_rebind_task: Option<AbortHandle>,
     /// Keepalive tasks for per-space relays, keyed by relay URL.
     space_relay_keepalives: Arc<Mutex<HashMap<RelayUrl, AbortHandle>>>,
     config: IrohTransportConfig,
@@ -478,6 +481,9 @@ impl Drop for IrohTransport {
         self.watch_addr_task.abort();
         self.accept_task.abort();
         if let Some(handle) = self.relay_keepalive_task.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.lan_rebind_task.take() {
             handle.abort();
         }
         self.space_relay_keepalives
@@ -564,6 +570,14 @@ impl IrohTransport {
         let endpoint = builder.bind().await.map_err(|err| {
             K2Error::other_src("Failed to bind iroh endpoint", err)
         })?;
+
+        // Interfaces that appear after this point are only joined by a
+        // rebuilt lookup service, so the rebind task starts as soon as
+        // the endpoint exists.
+        let lan_rebind_task = lan_discovery::maybe_spawn_lan_rebind_task(
+            &endpoint,
+            config.enable_lan_discovery,
+        );
 
         // If relay auth is needed, obtain a bearer token from the bootstrap
         // server before inserting the relay into the endpoint. The token is
@@ -694,6 +708,7 @@ impl IrohTransport {
             watch_addr_task,
             accept_task,
             relay_keepalive_task,
+            lan_rebind_task,
             space_relay_keepalives: Arc::new(Mutex::new(HashMap::new())),
             config,
             space_relays,

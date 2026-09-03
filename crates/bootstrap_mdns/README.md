@@ -154,6 +154,12 @@ KITSUNE2_LAN_TEST=1 cargo test -p kitsune2 --features mdns --test mdns_lan
 
 ## Known limitations
 
+- The transport's mDNS lookup joins the multicast group only on the
+  interfaces present when it is built. `transport_iroh` rebuilds it when
+  the endpoint's local IP set changes (debounced by one second), so a node
+  that starts without a network and gains one later becomes dialable on
+  the LAN without a restart; a change iroh's own address watcher does not
+  surface is not covered.
 - The early peer URL that a node announces before its relay handshake
   completes covers only the global `relay_url`; a per-space relay only
   yields its URL once the relay handshake has run, so a space on a
