@@ -362,20 +362,12 @@ impl TxBaseHandler for TxHandlerTranslator {
         let peer_meta_store = core_space.peer_meta_store.clone();
         drop(core_space);
         tokio::task::spawn(async move {
-            let result = async {
-                // Most connections come from peers that carry no mark, and a
-                // read is cheaper than a blind delete.
-                if peer_meta_store
-                    .get_unresponsive(peer.clone())
-                    .await?
-                    .is_some()
-                {
-                    peer_meta_store.clear_unresponsive(peer.clone()).await?;
-                }
-                K2Result::Ok(())
-            }
-            .await;
-            if let Err(err) = result {
+            // The delete is idempotent, and a mark whose stored value no
+            // longer deserialises must still go, so it is not gated on a
+            // read.
+            if let Err(err) =
+                peer_meta_store.clear_unresponsive(peer.clone()).await
+            {
                 tracing::debug!(
                     ?err,
                     ?peer,
