@@ -531,6 +531,10 @@ impl Test {
             ) -> K2Result<bool> {
                 Ok(false)
             }
+
+            fn is_access_granted(&self, _peer_url: &Url) -> K2Result<bool> {
+                Ok(true)
+            }
         }
         impl SpaceHandler for NoopHandler {}
 

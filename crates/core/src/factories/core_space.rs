@@ -1,9 +1,10 @@
 //! The core space implementation provided by Kitsune2.
 
 use crate::factories::core_access::CorePeerAccessState;
+use crate::factories::core_hello::{CoreHello, CoreHelloModConfig};
 use crate::get_all_remote_agents;
 use kitsune2_api::*;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 /// CoreSpace configuration types.
 mod config {
@@ -76,7 +77,10 @@ impl CoreSpaceFactory {
 
 impl SpaceFactory for CoreSpaceFactory {
     fn default_config(&self, config: &mut Config) -> K2Result<()> {
-        config.set_module_config(&CoreSpaceModConfig::default())
+        config.set_module_config(&CoreSpaceModConfig::default())?;
+        // The access module is created by the space rather than by a factory
+        // of its own, so its config is defaulted here.
+        config.set_module_config(&CoreHelloModConfig::default())
     }
 
     fn validate_config(&self, _config: &Config) -> K2Result<()> {
@@ -136,7 +140,12 @@ impl SpaceFactory for CoreSpaceFactory {
 
             let bootstrap = builder
                 .bootstrap
-                .create(builder.clone(), peer_store.clone(), space_id.clone())
+                .create(
+                    builder.clone(),
+                    peer_store.clone(),
+                    space_id.clone(),
+                    tx.clone(),
+                )
                 .await?;
             let local_agent_store =
                 builder.local_agent_store.create(builder.clone()).await?;
@@ -172,6 +181,14 @@ impl SpaceFactory for CoreSpaceFactory {
                     tx.clone(),
                 )
                 .await?;
+            // Gossip is built before the access module but has to be able to
+            // reach it, because "nobody to gossip with" is how the access
+            // module hears that this node and a peer have symmetrically
+            // forgotten each other's grant. The cell is filled in as soon as
+            // the access module exists; a starvation report that somehow
+            // arrives before then simply finds it empty.
+            let hello_cell: Arc<OnceLock<Weak<CoreHello>>> =
+                Arc::new(OnceLock::new());
             let gossip = builder
                 .gossip
                 .create(
@@ -183,8 +200,65 @@ impl SpaceFactory for CoreSpaceFactory {
                     op_store.clone(),
                     tx.clone(),
                     fetch.clone(),
+                    GossipSpaceHooks {
+                        // Gossip may only talk to peers this space has
+                        // granted. Unknown and blocked are both ineligible:
+                        // the transport would refuse to send to either.
+                        peer_eligible: {
+                            let peer_access_state = peer_access_state.clone();
+                            Arc::new(move |peer_url: &Url| {
+                                matches!(
+                                    peer_access_state
+                                        .get_access_decision(peer_url.clone()),
+                                    Ok(Some(PeerAccess {
+                                        decision: AccessDecision::Granted,
+                                        ..
+                                    }))
+                                )
+                            })
+                        },
+                        on_no_target: {
+                            let hello_cell = hello_cell.clone();
+                            Arc::new(move || {
+                                if let Some(hello) =
+                                    hello_cell.get().and_then(Weak::upgrade)
+                                {
+                                    hello.sweep();
+                                }
+                            })
+                        },
+                    },
                 )
                 .await?;
+
+            // The access module. It has to be built after the space handler
+            // knows this node's url, because every proof it computes binds
+            // that url's peer id, so it reads the url through `inner` rather
+            // than being handed a snapshot of it.
+            let space_secret = builder
+                .space_secret
+                .create(builder.clone(), space_id.clone())
+                .await?;
+            let hello_config: CoreHelloModConfig =
+                builder_config.get_module_config()?;
+            let hello = CoreHello::create(
+                hello_config.core_hello,
+                space_id.clone(),
+                builder.verifier.clone(),
+                space_secret,
+                peer_store.clone(),
+                local_agent_store.clone(),
+                peer_access_state.clone(),
+                tx.clone(),
+                {
+                    let inner = inner.clone();
+                    Arc::new(move || {
+                        inner.read().expect("poison").current_url.clone()
+                    })
+                },
+            )
+            .await?;
+            let _ = hello_cell.set(Arc::downgrade(&hello));
 
             let out: DynSpace = Arc::new_cyclic(move |this| {
                 let current_url = tx.register_space_handler(
@@ -208,6 +282,7 @@ impl SpaceFactory for CoreSpaceFactory {
                     blocks,
                     known_peers,
                     peer_access_state,
+                    hello,
                 )
             });
             Ok(out)
@@ -231,6 +306,34 @@ impl TxBaseHandler for TxHandlerTranslator {
                 this.new_url(this_url).await;
             }
         })
+    }
+
+    /// A peer that has just completed a connection with us is responsive by
+    /// definition, so any unresponsive mark it carries from an earlier failed
+    /// dial is stale. The transport calls this synchronously on its connect
+    /// path, so the store update runs in its own task; the task holds only
+    /// the store, so it never keeps the space alive.
+    fn peer_connect(&self, peer: Url) -> K2Result<()> {
+        let Some(core_space) = self.1.upgrade() else {
+            return Ok(());
+        };
+        let peer_meta_store = core_space.peer_meta_store.clone();
+        drop(core_space);
+        tokio::task::spawn(async move {
+            // The delete is idempotent, and a mark whose stored value no
+            // longer deserialises must still go, so it is not gated on a
+            // read.
+            if let Err(err) =
+                peer_meta_store.clear_unresponsive(peer.clone()).await
+            {
+                tracing::debug!(
+                    ?err,
+                    ?peer,
+                    "Failed to clear the unresponsive mark for a peer that connected"
+                );
+            }
+        });
+        Ok(())
     }
 }
 
@@ -292,23 +395,55 @@ impl TxSpaceHandler for TxHandlerTranslator {
             .upgrade()
             .ok_or(K2Error::other("CoreSpace has been dropped."))?;
 
-        let blocked = match core_space
-            .peer_access_state
-            .get_access_decision(peer_url.clone())?
-        {
-            Some(access) => access.decision == AccessDecision::Blocked,
-            None => {
-                // This is normal for blocked peers, but could be a bug for others. Best to log at
-                // debug level which can be accessed if needed but won't create noisy logs if a
-                // blocked peer keeps sending messages.
-                tracing::debug!(
-                    "No access decision found for peer url: {:?}",
-                    peer_url
-                );
-                true
-            }
-        };
+        // Only an explicit `Blocked` decision means blocked. A peer we have
+        // no decision about is not blocked, it is unknown, and being unknown
+        // is answered by [`Self::is_access_granted`] instead — which is what
+        // keeps unknown from being a dead state that only the access module
+        // can talk a peer out of.
+        let blocked = matches!(
+            core_space
+                .peer_access_state
+                .get_access_decision(peer_url.clone())?,
+            Some(PeerAccess {
+                decision: AccessDecision::Blocked,
+                ..
+            })
+        );
         Ok(blocked)
+    }
+
+    fn access_module_id(&self) -> String {
+        HELLO_MOD_NAME.to_string()
+    }
+
+    fn is_access_granted(&self, peer_url: &Url) -> K2Result<bool> {
+        let core_space = self
+            .1
+            .upgrade()
+            .ok_or(K2Error::other("CoreSpace has been dropped."))?;
+
+        let granted = matches!(
+            core_space
+                .peer_access_state
+                .get_access_decision(peer_url.clone())?,
+            Some(PeerAccess {
+                decision: AccessDecision::Granted,
+                ..
+            })
+        );
+        if !granted {
+            // Normal for a peer we have not met yet, and noisy if such a peer
+            // keeps sending, so this stays at debug.
+            tracing::debug!(?peer_url, "No access grant recorded for peer url",);
+        }
+        Ok(granted)
+    }
+
+    fn ungranted_message_dropped(&self, peer: Url) {
+        let Some(core_space) = self.1.upgrade() else {
+            return;
+        };
+        core_space.hello.notify_ungranted_message_dropped(peer);
     }
 
     fn has_local_agents(&self) -> BoxFut<'_, K2Result<bool>> {
@@ -342,6 +477,7 @@ struct CoreSpace {
     blocks: DynBlocks,
     known_peers: DynKnownPeers,
     peer_access_state: DynPeerAccessState,
+    hello: Arc<CoreHello>,
     inner: Arc<RwLock<InnerData>>,
     task_check_agent_infos: tokio::task::JoinHandle<()>,
 }
@@ -380,6 +516,7 @@ impl CoreSpace {
         blocks: DynBlocks,
         known_peers: DynKnownPeers,
         peer_access_state: DynPeerAccessState,
+        hello: Arc<CoreHello>,
     ) -> Self {
         let task_check_agent_infos = tokio::task::spawn(check_agent_infos(
             config,
@@ -394,6 +531,7 @@ impl CoreSpace {
             local_agent_store,
             peer_meta_store,
             peer_access_state,
+            hello,
             inner,
             op_store,
             task_check_agent_infos,
@@ -454,6 +592,10 @@ impl Space for CoreSpace {
 
     fn known_peers(&self) -> &DynKnownPeers {
         &self.known_peers
+    }
+
+    fn peer_access_state(&self) -> &DynPeerAccessState {
+        &self.peer_access_state
     }
 
     fn current_url(&self) -> Option<Url> {
@@ -545,6 +687,13 @@ impl Space for CoreSpace {
 
             // trigger the update
             local_agent.invoke_cb();
+
+            // Introduce ourselves in this space to everyone we can reach.
+            // This is the case a peer store insert never fires for: two nodes
+            // that are already connected because they share another space,
+            // where the connection long predates this join and no preflight
+            // will run again.
+            self.hello.notify_local_agent_join();
 
             Ok(())
         })

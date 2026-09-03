@@ -1,6 +1,8 @@
 use crate::IrohTransport;
 use crate::url::endpoint_from_url;
-use crate::url::{canonicalize_relay_url, get_url_with_first_relay};
+use crate::url::{
+    canonicalize_relay_url, get_url_with_first_relay, relays_match,
+};
 use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kitsune2_api::{Id, SpaceId, Url};
 use std::collections::HashMap;
@@ -322,8 +324,15 @@ fn own_url_for_preflight_matches_global_relay() {
     assert_eq!(result, global_url);
 }
 
+/// A peer on a relay we know nothing about gets our global URL, not a
+/// refusal.
+///
+/// This test used to assert `None`. That was the field-fatal case: two nodes
+/// homed on different relays could never preflight in either direction, and
+/// retried forever. Iroh dials a peer through the relay that peer advertises,
+/// so our global URL is exactly the address we want it to answer on.
 #[test]
-fn own_url_for_preflight_unknown_relay_returns_none() {
+fn own_url_for_preflight_unknown_relay_falls_back_to_global() {
     let eid = test_endpoint_id();
     let global_url = Some(
         Url::from_str(format!("https://global-relay.com:443/{eid}")).unwrap(),
@@ -339,7 +348,122 @@ fn own_url_for_preflight_unknown_relay_returns_none() {
         &space_relays,
         &global_url,
     );
+    assert_eq!(result, global_url);
+}
+
+/// A per-space relay is still preferred over the global one when the peer is
+/// on it, even though an unknown relay no longer refuses.
+#[test]
+fn own_url_for_preflight_prefers_space_relay_over_global_fallback() {
+    let eid = test_endpoint_id();
+    let relay =
+        RelayUrl::from_str("https://space-relay.com:443/relay/").unwrap();
+    let our_space_url =
+        Url::from_str(format!("https://space-relay.com:443/relay/{eid}"))
+            .unwrap();
+    let global_url = Some(
+        Url::from_str(format!("https://global-relay.com:443/{eid}")).unwrap(),
+    );
+    let peer_url = Url::from_str(
+        "https://space-relay.com:443/relay/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let mut space_relays = HashMap::new();
+    space_relays.insert(space(b"s1"), (relay, Some(our_space_url.clone())));
+
+    let result = IrohTransport::own_url_for_preflight(
+        &peer_url,
+        &space_relays,
+        &global_url,
+    );
+    assert_eq!(result, Some(our_space_url));
+}
+
+/// With no URL of our own yet there is nothing truthful to advertise, which
+/// is now the only reason to refuse.
+#[test]
+fn own_url_for_preflight_without_any_url_of_our_own_returns_none() {
+    let peer_url = Url::from_str(
+        "https://unknown-relay.com:443/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let space_relays = HashMap::new();
+
+    let result =
+        IrohTransport::own_url_for_preflight(&peer_url, &space_relays, &None);
     assert_eq!(result, None);
+
+    // A per-space relay we have no URL on yet is no better: it is matched,
+    // but there is still nothing to advertise.
+    let relay = RelayUrl::from_str("https://unknown-relay.com:443/").unwrap();
+    let mut space_relays = HashMap::new();
+    space_relays.insert(space(b"s1"), (relay, None));
+    let result =
+        IrohTransport::own_url_for_preflight(&peer_url, &space_relays, &None);
+    assert_eq!(result, None);
+}
+
+/// The trailing dot of a fully qualified host name must not decide that a
+/// peer sharing our per-space relay is on a foreign one. Both spellings of
+/// the same relay have been seen alternating between sessions.
+#[test]
+fn own_url_for_preflight_matches_relay_across_a_trailing_dot() {
+    let eid = test_endpoint_id();
+    let relay = RelayUrl::from_str("https://space-relay.com:443/").unwrap();
+    let our_space_url =
+        Url::from_str(format!("https://space-relay.com:443/{eid}")).unwrap();
+    let global_url = Some(
+        Url::from_str(format!("https://global-relay.com:443/{eid}")).unwrap(),
+    );
+    // The peer advertises the same relay, fully qualified.
+    let peer_url = Url::from_str(
+        "https://space-relay.com.:443/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let mut space_relays = HashMap::new();
+    space_relays.insert(space(b"s1"), (relay, Some(our_space_url.clone())));
+
+    let result = IrohTransport::own_url_for_preflight(
+        &peer_url,
+        &space_relays,
+        &global_url,
+    );
+    assert_eq!(
+        result,
+        Some(our_space_url),
+        "a trailing dot must not hide a shared relay"
+    );
+}
+
+#[test]
+fn relays_match_ignores_a_trailing_dot() {
+    let dotted = RelayUrl::from_str("https://relay.example.com.:443/").unwrap();
+    let dotless = RelayUrl::from_str("https://relay.example.com:443/").unwrap();
+
+    assert!(relays_match(&dotted, &dotless));
+    assert!(relays_match(&dotless, &dotted));
+    assert!(relays_match(&dotted, &dotted));
+}
+
+#[test]
+fn relays_match_still_separates_different_relays() {
+    let base = RelayUrl::from_str("https://relay.example.com:443/").unwrap();
+
+    for other in [
+        // A different host is a different relay, trailing dot or not.
+        "https://other.example.com:443/",
+        "https://other.example.com.:443/",
+        // As are a different port, path and scheme.
+        "https://relay.example.com:8443/",
+        "https://relay.example.com:443/relay/",
+        "http://relay.example.com:443/",
+    ] {
+        let other = RelayUrl::from_str(other).unwrap();
+        assert!(
+            !relays_match(&base, &other),
+            "{base} and {other} are different relays"
+        );
+    }
 }
 
 #[test]

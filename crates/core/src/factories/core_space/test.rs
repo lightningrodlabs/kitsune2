@@ -191,19 +191,48 @@ async fn space_notify_send_recv() {
     s1.local_agent_join(ned.clone()).await.unwrap();
     s2.local_agent_join(bob.clone()).await.unwrap();
 
+    // Knowing where a peer is does not admit it. Each side challenges the
+    // other's url, and only once both have proven knowledge of the space
+    // secret does anything but the access module's own traffic flow.
+    let granted = |space: &DynSpace, url: &Url| {
+        matches!(
+            space
+                .peer_access_state()
+                .get_access_decision(url.clone())
+                .unwrap()
+                .map(|a| a.decision),
+            Some(AccessDecision::Granted)
+        )
+    };
+    iter_check!(15_000, 10, {
+        if granted(&s1, &u2) && granted(&s2, &u1) {
+            break;
+        }
+    });
+
     s1.send_notify(u2.clone(), bytes::Bytes::from_static(b"hello"))
         .await
         .unwrap();
 
+    iter_check!(5000, 10, {
+        if !recv.lock().unwrap().is_empty() {
+            break;
+        }
+    });
     let (f, s, d) = recv.lock().unwrap().remove(0);
     assert_eq!(u1.clone(), f);
     assert_eq!(TEST_SPACE_ID, s);
     assert_eq!("hello", String::from_utf8_lossy(&d));
 
-    s2.send_notify(u1, bytes::Bytes::from_static(b"world"))
+    s2.send_notify(u1.clone(), bytes::Bytes::from_static(b"world"))
         .await
         .unwrap();
 
+    iter_check!(5000, 10, {
+        if !recv.lock().unwrap().is_empty() {
+            break;
+        }
+    });
     let (f, s, d) = recv.lock().unwrap().remove(0);
     assert_eq!(u2, f);
     assert_eq!(TEST_SPACE_ID, s);
@@ -240,6 +269,7 @@ async fn space_local_agent_periodic_re_sign_and_bootstrap() {
             _builder: Arc<Builder>,
             _peer_store: DynPeerStore,
             _space_id: SpaceId,
+            _tx: DynTransport,
         ) -> BoxFut<'static, K2Result<DynBootstrap>> {
             let out: DynBootstrap = self.0.clone();
             Box::pin(async move { Ok(out) })
@@ -431,4 +461,173 @@ async fn broadcast_new_agent_info_on_resign() {
 
     let broadcast = p.0.lock().unwrap().last().cloned().unwrap();
     assert_eq!(bob.agent(), &broadcast.0.agent);
+}
+
+/// A transport that behaves like the in-memory transport but keeps the
+/// space handler it is handed, so a test can drive the space's transport
+/// callbacks directly.
+#[derive(Debug)]
+struct HandlerCapturingTransport {
+    inner: DynTransport,
+    space_handler: Arc<Mutex<Option<DynTxSpaceHandler>>>,
+}
+
+impl Transport for HandlerCapturingTransport {
+    fn register_space_handler(
+        &self,
+        space_id: SpaceId,
+        handler: DynTxSpaceHandler,
+    ) -> Option<Url> {
+        *self.space_handler.lock().unwrap() = Some(handler.clone());
+        self.inner.register_space_handler(space_id, handler)
+    }
+
+    fn register_module_handler(
+        &self,
+        space_id: SpaceId,
+        module: String,
+        handler: DynTxModuleHandler,
+    ) {
+        self.inner
+            .register_module_handler(space_id, module, handler)
+    }
+
+    fn disconnect(&self, peer: Url, reason: Option<String>) -> BoxFut<'_, ()> {
+        self.inner.disconnect(peer, reason)
+    }
+
+    fn send_space_notify(
+        &self,
+        peer: Url,
+        space_id: SpaceId,
+        data: bytes::Bytes,
+    ) -> BoxFut<'_, K2Result<()>> {
+        self.inner.send_space_notify(peer, space_id, data)
+    }
+
+    fn send_module(
+        &self,
+        peer: Url,
+        space_id: SpaceId,
+        module: String,
+        data: bytes::Bytes,
+    ) -> BoxFut<'_, K2Result<()>> {
+        self.inner.send_module(peer, space_id, module, data)
+    }
+
+    fn dial(
+        &self,
+        space_id: SpaceId,
+        peer: Url,
+    ) -> BoxFut<'_, K2Result<DialOutcome>> {
+        self.inner.dial(space_id, peer)
+    }
+
+    fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
+        self.inner.get_connected_peers()
+    }
+
+    fn unregister_space(&self, space_id: SpaceId) -> BoxFut<'_, ()> {
+        self.inner.unregister_space(space_id)
+    }
+
+    fn dump_network_stats(&self) -> BoxFut<'_, K2Result<ApiTransportStats>> {
+        self.inner.dump_network_stats()
+    }
+}
+
+#[derive(Debug)]
+struct HandlerCapturingTransportFactory {
+    space_handler: Arc<Mutex<Option<DynTxSpaceHandler>>>,
+}
+
+impl TransportFactory for HandlerCapturingTransportFactory {
+    fn default_config(&self, _config: &mut Config) -> K2Result<()> {
+        Ok(())
+    }
+
+    fn validate_config(&self, _config: &Config) -> K2Result<()> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        builder: Arc<Builder>,
+        handler: DynTxHandler,
+    ) -> BoxFut<'static, K2Result<DynTransport>> {
+        let space_handler = self.space_handler.clone();
+        Box::pin(async move {
+            let inner = crate::factories::MemTransportFactory::create()
+                .create(builder, handler)
+                .await?;
+            let out: DynTransport = Arc::new(HandlerCapturingTransport {
+                inner,
+                space_handler,
+            });
+            Ok(out)
+        })
+    }
+}
+
+/// A peer that completes a connection with us is responsive, whatever an
+/// earlier failed dial recorded about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_connect_clears_the_unresponsive_mark() {
+    #[derive(Debug)]
+    struct S;
+    impl SpaceHandler for S {}
+
+    #[derive(Debug)]
+    struct K;
+    impl KitsuneHandler for K {
+        fn create_space(
+            &self,
+            _space_id: SpaceId,
+            _config_override: Option<&Config>,
+        ) -> BoxFut<'_, K2Result<DynSpaceHandler>> {
+            Box::pin(async move {
+                let s: DynSpaceHandler = Arc::new(S);
+                Ok(s)
+            })
+        }
+    }
+
+    let space_handler = Arc::new(Mutex::new(None));
+    let builder = Builder {
+        verifier: Arc::new(TestVerifier),
+        transport: Arc::new(HandlerCapturingTransportFactory {
+            space_handler: space_handler.clone(),
+        }),
+        ..crate::default_test_builder()
+    }
+    .with_default_config()
+    .unwrap();
+
+    let kitsune = builder.build().await.unwrap();
+    kitsune.register_handler(Arc::new(K)).await.unwrap();
+    let space = kitsune.space(TEST_SPACE_ID.clone(), None).await.unwrap();
+    let translator = space_handler
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the space registers its handler with the transport");
+
+    let peer = Url::from_str("ws://peer.test:80/peer").unwrap();
+    let meta = space.peer_meta_store().clone();
+    meta.set_unresponsive(
+        peer.clone(),
+        Timestamp::now() + std::time::Duration::from_secs(600),
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    assert!(meta.get_unresponsive(peer.clone()).await.unwrap().is_some());
+
+    translator.peer_connect(peer.clone()).unwrap();
+
+    iter_check!(1000, {
+        if meta.get_unresponsive(peer.clone()).await.unwrap().is_none() {
+            break;
+        }
+    });
 }

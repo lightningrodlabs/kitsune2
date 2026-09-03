@@ -22,6 +22,16 @@ pub trait Bootstrap: 'static + Send + Sync + std::fmt::Debug {
 /// Trait-object [Bootstrap].
 pub type DynBootstrap = Arc<dyn Bootstrap>;
 
+/// A [`Bootstrap`] that accepts puts and does nothing with them: the
+/// stand-in for a bootstrap that is switched off, could not start, or is
+/// not wanted in a test, so that a builder stack stays uniform.
+#[derive(Debug)]
+pub struct NoopBootstrap;
+
+impl Bootstrap for NoopBootstrap {
+    fn put(&self, _info: Arc<AgentInfoSigned>) {}
+}
+
 /// A factory for constructing Bootstrap instances.
 pub trait BootstrapFactory: 'static + Send + Sync + std::fmt::Debug {
     /// Help the builder construct a default config from the chosen
@@ -32,11 +42,15 @@ pub trait BootstrapFactory: 'static + Send + Sync + std::fmt::Debug {
     fn validate_config(&self, config: &Config) -> K2Result<()>;
 
     /// Construct a bootstrap instance.
+    ///
+    /// `tx` is the space's transport, so that a bootstrap which learns peer
+    /// URLs by some out-of-band means can have them dialled directly.
     fn create(
         &self,
         builder: Arc<Builder>,
         peer_store: DynPeerStore,
         space_id: SpaceId,
+        tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>>;
 }
 

@@ -20,6 +20,15 @@ pub use core_local_agent_store::*;
 mod core_bootstrap;
 pub use core_bootstrap::*;
 
+mod composite_bootstrap;
+pub use composite_bootstrap::*;
+
+mod optional_bootstrap;
+pub use optional_bootstrap::*;
+
+#[cfg(test)]
+mod bootstrap_test_support;
+
 mod mem_peer_meta_store;
 pub use mem_peer_meta_store::*;
 
@@ -49,3 +58,9 @@ pub use core_known_peers::*;
 
 mod core_access;
 pub use core_access::*;
+
+mod core_space_secret;
+pub use core_space_secret::*;
+
+mod core_hello;
+pub use core_hello::*;

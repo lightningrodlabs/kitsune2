@@ -95,7 +95,7 @@ async fn graceful_remote_close_releases_quietly_with_reason() {
     .expect("condition not met within timeout");
 
     assert_eq!(
-        recorder.unresponsive_calls.load(Ordering::SeqCst),
+        recorder.unresponsive_calls.lock().unwrap().len(),
         0,
         "a graceful remote close must not mark the peer unresponsive"
     );
@@ -136,7 +136,7 @@ async fn local_disconnect_closes_with_graceful_code_and_reason() {
                 .all(|reason| reason.as_deref() == Some("bye")),
         "local handlers must get peer_disconnect with the reason, got {disconnects:?}"
     );
-    assert_eq!(recorder.unresponsive_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.unresponsive_calls.lock().unwrap().len(), 0);
 }
 
 /// End-to-end: a graceful `Transport::disconnect` on one peer must inform

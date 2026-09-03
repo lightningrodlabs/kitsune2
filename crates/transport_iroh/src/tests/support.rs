@@ -13,12 +13,11 @@ use crate::url::endpoint_from_url;
 use bytes::Bytes;
 use iroh::EndpointId;
 use kitsune2_api::{
-    BoxFut, DefaultTransport, K2Error, K2Result, TransportStats, TxImp,
-    TxImpHnd, Url,
+    BoxFut, DefaultTransport, K2Error, K2Result, Timestamp, TransportStats,
+    TxImp, TxImpHnd, Url,
 };
 use kitsune2_test_utils::space::TEST_SPACE_ID;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Recorded [`Connection::close`] calls as `(code, reason)` pairs.
@@ -77,7 +76,7 @@ impl Connection for FakeConnection {
 /// register a space handler against the shared `TxImpHnd` (which is what
 /// makes `set_unresponsive` reach our recording handler).
 #[derive(Debug)]
-struct StubTxImp;
+pub(super) struct StubTxImp;
 
 impl TxImp for StubTxImp {
     fn url(&self) -> Option<Url> {
@@ -96,6 +95,10 @@ impl TxImp for StubTxImp {
         Box::pin(async { unreachable!("StubTxImp::send should not be called") })
     }
 
+    fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async { unreachable!("StubTxImp::dial should not be called") })
+    }
+
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
@@ -111,9 +114,12 @@ impl TxImp for StubTxImp {
     }
 }
 
+/// Recorded `set_unresponsive` calls as `(peer, when)` pairs.
+pub(super) type UnresponsiveCalls = Arc<Mutex<Vec<(Url, Timestamp)>>>;
+
 pub(super) struct Recorder {
     pub handler: Arc<TxImpHnd>,
-    pub unresponsive_calls: Arc<AtomicUsize>,
+    pub unresponsive_calls: UnresponsiveCalls,
     /// Reason of every `peer_disconnect` call, in order. NOTE: the handler
     /// fan-out delivers each disconnect to both the space handler and the
     /// base handler, so a single disconnect records two identical entries.
@@ -124,15 +130,16 @@ pub(super) struct Recorder {
 /// are recorded, with a space handler registered so `set_unresponsive`
 /// propagates.
 pub(super) fn build_recording_handler() -> Recorder {
-    let unresponsive_calls = Arc::new(AtomicUsize::new(0));
+    let unresponsive_calls: UnresponsiveCalls =
+        Arc::new(Mutex::new(Vec::new()));
     let disconnects: Arc<Mutex<Vec<Option<String>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let mock = {
         let unresponsive = unresponsive_calls.clone();
         let disconnects = disconnects.clone();
         Arc::new(MockTxHandler {
-            set_unresponsive: Arc::new(move |_peer, _ts| {
-                unresponsive.fetch_add(1, Ordering::SeqCst);
+            set_unresponsive: Arc::new(move |peer, ts| {
+                unresponsive.lock().unwrap().push((peer, ts));
                 Ok(())
             }),
             peer_disconnect: Arc::new(move |_peer, reason| {

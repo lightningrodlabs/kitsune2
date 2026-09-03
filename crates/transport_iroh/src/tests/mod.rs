@@ -4,7 +4,13 @@ use super::*;
 
 mod close;
 mod connect_failure;
+mod dial;
+mod fakes;
 mod frame;
+mod lan_dial;
+mod relay_qad;
+#[cfg(feature = "test-utils")]
+mod relay_status;
 mod simultaneous_open;
 mod stream;
 mod support;
@@ -221,4 +227,32 @@ fn validate_disallowed_plain_text_relay_url() {
     let result = builder.validate_config();
     assert!(result.is_err());
     assert!(format!("{result:?}").contains("Disallowed plaintext relay URL"));
+}
+
+/// LAN discovery is a compile-time capability; asking for it in config when
+/// the crate was built without it must be a validation error, not a silent
+/// no-op at runtime.
+#[cfg(not(feature = "mdns"))]
+#[test]
+fn validate_lan_discovery_requires_mdns_feature() {
+    let builder = Builder {
+        transport: IrohTransportFactory::create(),
+        ..kitsune2_core::default_test_builder()
+    };
+
+    builder
+        .config
+        .set_module_config(&IrohTransportModConfig {
+            iroh_transport: IrohTransportConfig {
+                enable_lan_discovery: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+    let result = builder.validate_config();
+    assert!(result.is_err());
+    assert!(
+        format!("{result:?}").contains("requires the `mdns` cargo feature")
+    );
 }
