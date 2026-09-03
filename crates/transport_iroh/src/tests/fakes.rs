@@ -16,7 +16,8 @@ use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayUrl, TransportAddr};
 use kitsune2_api::{BoxFut, K2Error, K2Result, TxImpHnd, Url};
 use n0_watcher::Disconnected;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -53,6 +54,8 @@ pub(super) struct FakeEndpoint {
     pub relay_known_down: bool,
     /// What `discover_direct_addrs` reports for any peer.
     pub direct_addrs: Vec<TransportAddr>,
+    /// What `local_ips` reports as this endpoint's own addresses.
+    pub local_ips: BTreeSet<IpAddr>,
 }
 
 impl Default for FakeEndpoint {
@@ -62,6 +65,7 @@ impl Default for FakeEndpoint {
             connect_targets: Arc::new(Mutex::new(Vec::new())),
             relay_known_down: false,
             direct_addrs: Vec::new(),
+            local_ips: BTreeSet::new(),
         }
     }
 }
@@ -114,6 +118,10 @@ impl Endpoint for FakeEndpoint {
 
     fn id_bytes(&self) -> [u8; 32] {
         [0u8; 32]
+    }
+
+    fn local_ips(&self) -> BTreeSet<IpAddr> {
+        self.local_ips.clone()
     }
 
     fn is_home_relay_known_down(&self) -> bool {

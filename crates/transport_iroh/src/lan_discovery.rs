@@ -14,25 +14,38 @@
 //! relay is known to be down and the dial would otherwise be skipped.
 //!
 //! mDNS answers are unauthenticated, so the transport keeps only addresses
-//! a LAN peer could actually have from the pre-resolve ([`is_lan_scoped`]);
+//! a LAN peer could actually have from the pre-resolve ([`is_on_link`]);
 //! an answer must not be able to steer a dial at an arbitrary public
 //! address. iroh's own in-connect lookup applies no such filter. In both
 //! cases the QUIC handshake pins the peer's `EndpointId`, so a spoofed
 //! address can only waste a connect attempt or bounce traffic off a third
 //! party — a DoS/reflection concern, not an impersonation one.
 //!
-//! The filter admits RFC 1918, IPv4 link-local and IPv6 unique-local
-//! addresses: the ranges that are on-link by definition. Three cases are
-//! deliberately outside it. IPv6 link-local (`fe80::/10`) addresses
-//! arrive from the lookup without a scope id and cannot be dialled, and a
-//! failed dial would mark the peer unresponsive, so they are dropped. A
-//! LAN numbered with global-unicast IPv6 (SLAAC from a delegated prefix)
-//! is not recognised as a LAN. Carrier-grade NAT space (`100.64.0.0/10`)
-//! is shared by an ISP's customers, not on-link, so a forged record could
-//! steer a dial at any host behind the same carrier; a LAN numbered from
-//! it is not recognised either. None of these are served by the
-//! relay-down bypass; the relay-up path, where iroh's in-connect lookup
-//! is unfiltered, is unaffected. All three are known limitations.
+//! The filter admits two kinds of address. The first are the ranges that
+//! are on-link by definition ([`is_lan_scoped`]): RFC 1918, IPv4
+//! link-local and IPv6 unique-local. The second are IPv6 global-unicast
+//! addresses that share a `/64` with one of this node's own global-unicast
+//! addresses: a LAN numbered by SLAAC from a delegated prefix has no
+//! private range to recognise, and the only thing that separates its
+//! hosts from the rest of the internet is the prefix this node was itself
+//! configured with. `/64` is the SLAAC subnet size and the only prefix
+//! length available without reading interface configuration; other
+//! subnets of the same delegation (a `/56` split into several `/64`s)
+//! are therefore not treated as on-link even though they may be one
+//! router hop away. IPv4 has no such rule: a public-v4 LAN cannot be
+//! told apart from the internet without prefix lengths, and RFC 1918
+//! covers the LANs that exist in practice.
+//!
+//! Two cases are deliberately outside the filter. IPv6 link-local
+//! (`fe80::/10`) addresses arrive from the lookup without a scope id and
+//! cannot be dialled, and a failed dial would mark the peer unresponsive,
+//! so they are dropped even when the local set holds a matching one.
+//! Carrier-grade NAT space (`100.64.0.0/10`) is shared by an ISP's
+//! customers, not on-link, so a forged record could steer a dial at any
+//! host behind the same carrier; a LAN numbered from it is not
+//! recognised. Neither is served by the relay-down bypass; the relay-up
+//! path, where iroh's in-connect lookup is unfiltered, is unaffected.
+//! Both are known limitations.
 //!
 //! The mDNS service joins the multicast group once, on the interfaces
 //! that exist when it is built, and never follows interface changes. A
@@ -46,10 +59,8 @@
 //! sound because the transport builds its endpoint from the `Minimal`
 //! preset and the mDNS lookup is the only service it ever attaches.
 
-#[cfg(any(test, feature = "mdns"))]
 use std::collections::BTreeSet;
-#[cfg(any(test, feature = "mdns"))]
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 /// How long a dial that would otherwise be skipped waits for the LAN
@@ -119,14 +130,12 @@ pub(crate) async fn resolve_direct_addrs(
         .unwrap_or_default()
 }
 
-/// Whether `ip` is one a peer on the same LAN could hold and that this
-/// node can dial: RFC 1918 private, link-local or carrier-grade NAT
-/// (`100.64.0.0/10`) for IPv4, unique-local (`fc00::/7`) for IPv6.
-/// IPv4-mapped IPv6 addresses are judged by the IPv4 they carry. IPv6
-/// link-local is excluded on purpose: without a scope id it is not
-/// dialable (see the module doc).
-pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
-    use std::net::{IpAddr, Ipv4Addr};
+/// Whether `ip` lies in a range that is on-link by definition and that
+/// this node can dial: RFC 1918 private or link-local for IPv4,
+/// unique-local (`fc00::/7`) for IPv6. IPv4-mapped IPv6 addresses are
+/// judged by the IPv4 they carry. IPv6 link-local and carrier-grade NAT
+/// space are excluded on purpose (see the module doc).
+pub(crate) fn is_lan_scoped(ip: IpAddr) -> bool {
     fn v4_lan(v4: Ipv4Addr) -> bool {
         v4.is_private() || v4.is_link_local()
     }
@@ -139,6 +148,49 @@ pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether `v6` is an IPv6 global-unicast address (`2000::/3`). The block
+/// excludes loopback, unspecified, IPv4-mapped, unique-local, link-local
+/// and multicast by construction, so the top three bits are the whole
+/// test.
+fn is_global_unicast_v6(v6: Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xe000 == 0x2000
+}
+
+/// Whether two IPv6 addresses share their first 64 bits, the SLAAC
+/// subnet size.
+fn same_slaac_subnet(a: Ipv6Addr, b: Ipv6Addr) -> bool {
+    a.segments()[..4] == b.segments()[..4]
+}
+
+/// Whether `candidate` is an address a peer on one of this node's LANs
+/// could hold, given the node's own addresses `local_ips`.
+///
+/// True for anything [`is_lan_scoped`] accepts, and for an IPv6
+/// global-unicast candidate that shares a `/64` with one of this node's
+/// global-unicast addresses. The `/64` is the SLAAC assumption spelled out
+/// in the module doc: a wider delegation's other subnets do not match.
+/// IPv4 gets no on-link rule; `local_ips` only ever widens the IPv6 case.
+pub(crate) fn is_on_link(
+    candidate: IpAddr,
+    local_ips: &BTreeSet<IpAddr>,
+) -> bool {
+    if is_lan_scoped(candidate) {
+        return true;
+    }
+    let IpAddr::V6(candidate) = candidate else {
+        return false;
+    };
+    if !is_global_unicast_v6(candidate) {
+        return false;
+    }
+    local_ips.iter().any(|local| match local {
+        IpAddr::V6(local) => {
+            is_global_unicast_v6(*local) && same_slaac_subnet(*local, candidate)
+        }
+        IpAddr::V4(_) => false,
+    })
+}
+
 /// How long the local IP set has to stay unchanged before the LAN
 /// discovery service is rebuilt. An interface coming up typically fires
 /// several address updates in quick succession (v4, v6, temporary
@@ -149,8 +201,7 @@ pub(crate) const LAN_REBIND_DEBOUNCE: Duration = Duration::from_secs(1);
 /// The set of local IP addresses in an endpoint address, ignoring ports
 /// and relay entries. Ports change with every socket rebind while the
 /// interfaces stay the same, and relays say nothing about the LAN, so
-/// neither is part of what decides a rebind.
-#[cfg(any(test, feature = "mdns"))]
+/// neither is part of what decides a rebind or what counts as on-link.
 pub(crate) fn local_ip_set(addr: &iroh::EndpointAddr) -> BTreeSet<IpAddr> {
     addr.ip_addrs().map(|sock| sock.ip()).collect()
 }
@@ -328,7 +379,13 @@ pub(crate) fn validate_lan_discovery_config(
 
 #[cfg(test)]
 mod scope_tests {
-    use super::is_lan_scoped;
+    use super::{is_lan_scoped, is_on_link};
+    use std::collections::BTreeSet;
+    use std::net::IpAddr;
+
+    fn ips(list: &[&str]) -> BTreeSet<IpAddr> {
+        list.iter().map(|ip| ip.parse().unwrap()).collect()
+    }
 
     #[test]
     fn lan_scoped_admits_only_dialable_local_addresses() {
@@ -357,6 +414,49 @@ mod scope_tests {
         for (ip, expected) in cases {
             let ip: std::net::IpAddr = ip.parse().unwrap();
             assert_eq!(is_lan_scoped(ip), *expected, "{ip}");
+        }
+    }
+
+    // The on-link rule widens the filter only for a global-unicast IPv6
+    // candidate on one of our own /64s; everything else is decided as by
+    // `is_lan_scoped`, whatever the local set holds.
+    #[test]
+    fn on_link_admits_global_ipv6_on_our_slaac_subnet() {
+        let local = ips(&["2001:db8:1:2::10", "192.168.1.20"]);
+        let no_v6 = ips(&["192.168.1.20"]);
+        let link_local_only = ips(&["fe80::1"]);
+        let empty = ips(&[]);
+        let cases: &[(&str, &BTreeSet<IpAddr>, bool)] = &[
+            // Same /64 as our global address.
+            ("2001:db8:1:2::20", &local, true),
+            ("2001:db8:1:2:abcd:ef01:2345:6789", &local, true),
+            // Another /64, including a sibling subnet of the same /56.
+            ("2001:db8:1:3::20", &local, false),
+            ("2001:db8:9:2::20", &local, false),
+            // Global candidate with no local global v6 to match against.
+            ("2001:db8:1:2::20", &no_v6, false),
+            ("2001:db8:1:2::20", &empty, false),
+            // Ranges on-link by definition need no local match.
+            ("fd00::20", &empty, true),
+            ("192.168.1.20", &empty, true),
+            ("10.0.0.1", &no_v6, true),
+            // IPv6 link-local stays out even when it matches a local one.
+            ("fe80::1", &link_local_only, false),
+            ("fe80::20", &link_local_only, false),
+            // Carrier-grade NAT stays out.
+            ("100.64.0.1", &local, false),
+            // An IPv4-mapped candidate is judged as its IPv4.
+            ("::ffff:192.168.1.20", &empty, true),
+            ("::ffff:8.8.8.8", &local, false),
+            // Public IPv4 has no on-link rule.
+            ("203.0.113.9", &local, false),
+            // Non-global v6 that is not ULA never matches.
+            ("::1", &local, false),
+            ("ff02::1", &local, false),
+        ];
+        for (ip, local, expected) in cases {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(is_on_link(ip, local), *expected, "{ip} vs {local:?}");
         }
     }
 }

@@ -168,6 +168,13 @@ KITSUNE2_LAN_TEST=1 cargo test -p kitsune2 --features mdns --test mdns_lan
   transport keys its connection by, in which case the peer looks
   unconnected every round and is dialled again each interval. Holochain
   does not use per-space relays.
+- When the relay is known down, `transport_iroh` dials only discovered
+  addresses it judges on-link: RFC 1918, IPv4 link-local, IPv6 ULA, and
+  IPv6 global-unicast addresses on the same `/64` as one of its own. The
+  `/64` is the SLAAC subnet assumption; a wider delegation's other
+  subnets, a LAN numbered from carrier-grade NAT space, a public-IPv4 LAN
+  and IPv6 link-local (no scope id) are not recognised. The relay-up path
+  is unaffected.
 - `Transport::dial` returning `DialOutcome` and `TxImp::dial` being a
   required method break external transport implementors. That is accepted
   on this fork branch.
