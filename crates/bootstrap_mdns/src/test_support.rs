@@ -45,21 +45,34 @@ pub async fn wait_for_dials(dials: &Dials, n: usize) -> Vec<Url> {
     dials.lock().unwrap().clone()
 }
 
-/// A transport recording its dials, each answered as connected, and
-/// reporting `connected` as its open connections.
-pub fn recording_transport(connected: Vec<Url>) -> (DynTransport, Dials) {
+/// A transport reporting `connected` as its open connections and
+/// recording every dial before answering it with `dial_fn`.
+pub fn transport_with<F, Fut>(
+    connected: Vec<Url>,
+    dial_fn: F,
+) -> (DynTransport, Dials)
+where
+    F: Fn(Url) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = K2Result<DialOutcome>> + Send + 'static,
+{
     let dials: Dials = Arc::new(Mutex::new(Vec::new()));
     let record = dials.clone();
     let mut mock = MockTransport::new();
     mock.expect_dial().returning(move |_space, url| {
-        record.lock().unwrap().push(url);
-        Box::pin(async { Ok(DialOutcome::Connected) })
+        record.lock().unwrap().push(url.clone());
+        Box::pin(dial_fn(url))
     });
     mock.expect_get_connected_peers().returning(move || {
         let connected = connected.clone();
         Box::pin(async move { Ok(connected) })
     });
     (Arc::new(mock), dials)
+}
+
+/// A transport recording its dials, each answered as connected, and
+/// reporting `connected` as its open connections.
+pub fn recording_transport(connected: Vec<Url>) -> (DynTransport, Dials) {
+    transport_with(connected, |_| async { Ok(DialOutcome::Connected) })
 }
 
 /// A transport recording its dials, each of which blocks until `release`

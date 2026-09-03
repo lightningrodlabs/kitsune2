@@ -54,6 +54,7 @@ impl SpaceEntry {
     }
 
     /// The peer URL currently announced for this space.
+    #[cfg(test)]
     pub fn advertised(&self) -> Option<Url> {
         self.advertised.lock().expect("poison").clone()
     }
@@ -79,10 +80,7 @@ impl SpaceEntry {
             txt.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         self.daemon.register(&self.instance, &txt)?;
         *advertised = Some(url.clone());
-        drop(advertised);
-        // An echo of our own URL under another name may have been
-        // recorded before we knew it was ours.
-        self.announced.forget_url(url);
+        self.announced.set_own(url);
         Ok(first)
     }
 
@@ -94,12 +92,6 @@ impl SpaceEntry {
         {
             debug!(?err, fullname = %self.fullname(), "mdns: failed to withdraw record");
         }
-    }
-
-    /// Whether a record with this name or URL is this node's own
-    /// announcement for the space.
-    pub fn is_own_record(&self, fullname: &str, url: &Url) -> bool {
-        fullname == self.fullname() || self.advertised().as_ref() == Some(url)
     }
 
     /// Whether the LAN has announced anything for this space.
@@ -122,9 +114,9 @@ impl SpaceEntry {
     /// The LAN resolved the record `fullname` naming `url` for this space.
     /// A URL heard for the first time is dialled right away; one heard
     /// before waits for the next reconciliation, which only dials it if it
-    /// is still unconnected.
+    /// is still unconnected. Our own record and our own URL are neither.
     pub fn record_resolved(&self, fullname: &str, url: Url) {
-        if self.is_own_record(fullname, &url) {
+        if fullname == self.fullname() {
             return;
         }
         if !self.announced.record_resolved(fullname, url.clone()) {
@@ -151,15 +143,15 @@ impl SpaceEntry {
         if !self.is_dialable() || self.announced.is_empty() {
             return;
         }
-        let own = self.advertised();
         for url in self.announced.due_urls() {
-            if connected.contains(&url) || own.as_ref() == Some(&url) {
+            if connected.contains(&url) {
                 continue;
             }
             trace!(%url, space = ?self.space_id, "mdns: announced peer not connected, redialling");
-            if !self.announced.try_dial(&self.tx, &self.space_id, url) {
-                break;
-            }
+            // A URL that found no free slot is skipped, not queued, and
+            // the ones after it are still tried: map order must not
+            // decide which peers ever get a slot.
+            self.announced.try_dial(&self.tx, &self.space_id, url);
         }
     }
 
@@ -299,9 +291,13 @@ mod tests {
 
         // An echo of our URL recorded before we knew it was ours.
         entry.record_resolved("echo", url(SELF_URL));
+        assert!(entry.has_record("echo"));
         entry.advertise(&url(SELF_URL)).unwrap();
+        assert!(!entry.has_record("echo"), "forgotten once known as ours");
         entry.record_resolved(&entry.fullname(), url(PEER_A));
         entry.record_resolved("echo-again", url(SELF_URL));
+        assert!(!entry.has_record("echo-again"));
+        assert!(!entry.has_announcements());
         entry.reconcile_from_transport().await;
         settle().await;
         assert!(dials.lock().unwrap().is_empty());
@@ -320,9 +316,12 @@ mod tests {
         assert_eq!(entry.advertised(), Some(url(PEER_A)));
         assert_eq!(daemon.registered.lock().unwrap().len(), 1);
         assert!(daemon.unregistered.lock().unwrap().is_empty());
-        assert!(entry.is_own_record("someone-else", &url(PEER_A)));
-        assert!(entry.is_own_record(&entry.fullname(), &url(PEER_B)));
-        assert!(!entry.is_own_record("someone-else", &url(PEER_B)));
+        // Neither an echo of our URL nor our own record is recorded.
+        entry.record_resolved("someone-else", url(PEER_A));
+        entry.record_resolved(&entry.fullname(), url(PEER_B));
+        assert!(!entry.has_announcements());
+        entry.record_resolved("someone-else", url(PEER_B));
+        assert!(entry.has_record("someone-else"));
 
         entry.advertise(&url(PEER_B)).unwrap();
         assert_eq!(daemon.registered.lock().unwrap().len(), 2);
