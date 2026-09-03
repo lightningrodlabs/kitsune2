@@ -8,7 +8,6 @@ use crate::fingerprint::SpaceFingerprint;
 use crate::shared::SharedMdns;
 use crate::space::SpaceEntry;
 use kitsune2_api::*;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,10 +26,12 @@ pub(crate) const FAILED_START_RETRY: Duration = Duration::from_secs(60);
 
 /// The [`BootstrapFactory`] behind mDNS LAN discovery.
 ///
-/// One factory owns one mDNS daemon per service type, started the first
-/// time an enabled space asks for that type and kept for the factory's
-/// life; every space on the same type shares that daemon, its single
-/// browse and its reconciliation ticker.
+/// One factory owns one mDNS daemon, started the first time an enabled
+/// space asks for it and kept for the factory's life; every space shares
+/// that daemon, its single browse and its reconciliation ticker. The
+/// daemon serves one service type, that of the space which started it,
+/// and a space configured for another type is refused: a node announces
+/// itself under one name.
 pub struct MdnsBootstrapFactory {
     inner: Arc<FactoryInner>,
 }
@@ -38,9 +39,12 @@ pub struct MdnsBootstrapFactory {
 /// The state a factory's `create` futures and bootstraps share with it:
 /// they outlive the borrow of the factory, so it lives behind an `Arc`.
 struct FactoryInner {
-    /// One slot per service type, held across a start so that spaces
-    /// created together do not race to start the same daemon.
-    daemons: tokio::sync::Mutex<HashMap<String, DaemonSlot>>,
+    /// The daemon, once a start has been attempted.
+    slot: Mutex<Option<DaemonSlot>>,
+    /// Held while a start is in progress, so that spaces created together
+    /// do not race to start the daemon; a space that finds the daemon
+    /// running never waits on it.
+    starting: tokio::sync::Mutex<()>,
     daemon_start: DaemonStart,
     /// How long a failed start is remembered before it is tried again.
     failed_start_retry: Duration,
@@ -50,15 +54,25 @@ struct FactoryInner {
     start_failure_warned: AtomicBool,
 }
 
-/// What a service type's daemon is doing.
+/// What the factory's daemon is doing.
 enum DaemonSlot {
-    Running(Arc<SharedMdns>),
+    Running {
+        shared: Arc<SharedMdns>,
+        service_type: String,
+    },
     /// The last start failed at `at`; retried after the factory's
     /// `failed_start_retry`.
-    Failed {
-        at: Instant,
-        err: String,
-    },
+    Failed { at: Instant, err: String },
+}
+
+/// Why a space could not join the daemon.
+enum JoinError {
+    /// No daemon is running and none could be started right now. A later
+    /// put tries again.
+    Unavailable(K2Error),
+    /// The daemon this factory runs cannot serve the space's config.
+    /// Trying again will not help.
+    Mismatch(K2Error),
 }
 
 impl std::fmt::Debug for FactoryInner {
@@ -93,7 +107,8 @@ impl MdnsBootstrapFactory {
     ) -> Self {
         Self {
             inner: Arc::new(FactoryInner {
-                daemons: tokio::sync::Mutex::new(HashMap::new()),
+                slot: Mutex::new(None),
+                starting: tokio::sync::Mutex::new(()),
                 daemon_start,
                 failed_start_retry,
                 start_failure_warned: AtomicBool::new(false),
@@ -107,43 +122,33 @@ impl MdnsBootstrapFactory {
         &self,
         service_type: &str,
     ) -> Option<Arc<SharedMdns>> {
-        match self
-            .inner
-            .daemons
-            .try_lock()
-            .expect("unlocked")
-            .get(service_type)
-        {
-            Some(DaemonSlot::Running(shared)) => Some(shared.clone()),
+        match &*self.inner.slot.lock().expect("poison") {
+            Some(DaemonSlot::Running {
+                shared,
+                service_type: running,
+            }) if running == service_type => Some(shared.clone()),
             _ => None,
         }
     }
 }
 
 impl FactoryInner {
-    /// The shared mDNS presence for the space's service type, started on
-    /// first use. The reconciliation interval is that of the space which
-    /// starts the daemon; later spaces on the same service type share it.
+    /// The shared mDNS presence, started on first use. The reconciliation
+    /// interval is that of the space which starts the daemon; later
+    /// spaces share it.
     ///
     /// Starting the daemon binds sockets and spawns a thread, so it runs on
-    /// the blocking pool.
+    /// the blocking pool, and only one space at a time runs it.
     async fn shared(
         &self,
         cfg: &MdnsBootstrapConfig,
-        tx: DynTransport,
-    ) -> K2Result<Arc<SharedMdns>> {
-        let mut daemons = self.daemons.lock().await;
-        match daemons.get(&cfg.service_type) {
-            Some(DaemonSlot::Running(shared)) => return Ok(shared.clone()),
-            Some(DaemonSlot::Failed { at, err })
-                if at.elapsed() < self.failed_start_retry =>
-            {
-                return Err(K2Error::other(format!(
-                    "mdns daemon start failed {:?} ago, not retrying yet: {err}",
-                    at.elapsed()
-                )));
-            }
-            _ => {}
+    ) -> Result<Arc<SharedMdns>, JoinError> {
+        if let Some(shared) = self.running(cfg)? {
+            return Ok(shared);
+        }
+        let _starting = self.starting.lock().await;
+        if let Some(shared) = self.running(cfg)? {
+            return Ok(shared);
         }
         let start = self.daemon_start.clone();
         let service_type = cfg.service_type.clone();
@@ -153,12 +158,14 @@ impl FactoryInner {
             .and_then(|daemon| {
                 SharedMdns::start(
                     daemon?,
-                    tx,
                     Duration::from_millis(cfg.redial_interval_ms as u64),
                 )
             });
         let slot = match &started {
-            Ok(shared) => DaemonSlot::Running(shared.clone()),
+            Ok(shared) => DaemonSlot::Running {
+                shared: shared.clone(),
+                service_type: cfg.service_type.clone(),
+            },
             Err(err) => {
                 self.report_start_failure(err);
                 DaemonSlot::Failed {
@@ -167,8 +174,40 @@ impl FactoryInner {
                 }
             }
         };
-        daemons.insert(cfg.service_type.clone(), slot);
-        started
+        *self.slot.lock().expect("poison") = Some(slot);
+        started.map_err(JoinError::Unavailable)
+    }
+
+    /// The running daemon if there is one and it serves `cfg`; `None`
+    /// when a start is worth attempting.
+    fn running(
+        &self,
+        cfg: &MdnsBootstrapConfig,
+    ) -> Result<Option<Arc<SharedMdns>>, JoinError> {
+        match &*self.slot.lock().expect("poison") {
+            Some(DaemonSlot::Running {
+                shared,
+                service_type,
+            }) => {
+                if *service_type == cfg.service_type {
+                    Ok(Some(shared.clone()))
+                } else {
+                    Err(JoinError::Mismatch(K2Error::other(format!(
+                        "mdns daemon is running for service type {service_type:?}, this space is configured for {:?}",
+                        cfg.service_type
+                    ))))
+                }
+            }
+            Some(DaemonSlot::Failed { at, err })
+                if at.elapsed() < self.failed_start_retry =>
+            {
+                Err(JoinError::Unavailable(K2Error::other(format!(
+                    "mdns daemon start failed {:?} ago, not retrying yet: {err}",
+                    at.elapsed()
+                ))))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Say that the daemon could not be started: loudly the first time
@@ -242,7 +281,7 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                     membership: Mutex::new(Membership::Detached),
                 }),
             };
-            boot.space.try_join().await;
+            boot.space.try_join().await?;
             let out: DynBootstrap = Arc::new(boot);
             Ok(out)
         })
@@ -343,7 +382,7 @@ impl Bootstrap for MdnsBootstrap {
                 let space = self.space.clone();
                 // `put` cannot await, and a start may block on the network.
                 tokio::spawn(async move {
-                    if space.try_join().await {
+                    if let Ok(true) = space.try_join().await {
                         space.advertise(&url);
                     }
                 });
@@ -371,21 +410,26 @@ fn advertise(entry: &Arc<SpaceEntry>, url: &Url) {
 
 impl SpaceState {
     /// Try to join the shared daemon, starting it if need be. Returns
-    /// whether the space is registered on a daemon afterwards.
-    async fn try_join(&self) -> bool {
-        let result = self.factory.shared(&self.cfg, self.tx.clone()).await;
+    /// whether the space is registered on a daemon afterwards; the error
+    /// is a configuration the daemon cannot serve, which no retry fixes.
+    async fn try_join(&self) -> K2Result<bool> {
+        let result = self.factory.shared(&self.cfg).await;
         let mut membership = self.membership.lock().expect("poison");
         match &*membership {
             Membership::Detached | Membership::Joining => {}
-            Membership::Joined { .. } => return true,
-            Membership::Left => return false,
+            Membership::Joined { .. } => return Ok(true),
+            Membership::Left => return Ok(false),
         }
         let shared = match result {
             Ok(shared) => shared,
-            Err(err) => {
+            Err(JoinError::Unavailable(err)) => {
                 debug!(?err, space_id = ?self.space_id, "mdns: no daemon to join yet");
                 *membership = Membership::Detached;
-                return false;
+                return Ok(false);
+            }
+            Err(JoinError::Mismatch(err)) => {
+                *membership = Membership::Detached;
+                return Err(err);
             }
         };
         let entry = shared.join(
@@ -400,7 +444,7 @@ impl SpaceState {
             "mdns bootstrap joined the shared daemon"
         );
         *membership = Membership::Joined { shared, entry };
-        true
+        Ok(true)
     }
 
     /// Announce `url`, if the space is registered on a daemon.

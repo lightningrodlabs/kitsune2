@@ -42,9 +42,10 @@
 //! such a space without LAN discovery wraps the factory in
 //! `OptionalBootstrapFactory`, which turns that error into a no-op.
 //!
-//! One factory keeps one mDNS daemon per service type, shared by every
-//! space announcing under it: one browse, one reconciliation ticker, one
-//! hostname.
+//! One factory keeps one mDNS daemon, shared by every space it creates:
+//! one browse, one reconciliation ticker, one hostname. The daemon
+//! serves the service type of the space that started it; a space
+//! configured for another type is refused.
 //!
 //! ## Privacy
 //!

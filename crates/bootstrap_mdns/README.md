@@ -18,8 +18,9 @@ someone else's job.
    URL. The instance name is a random token per space, the port is zero,
    and the daemon fills in and maintains the host's interface addresses.
    The record is replaced when the URL changes. All spaces of one factory
-   that announce under the same `serviceType` share one daemon, one
-   browse, one reconciliation ticker and one hostname. A space created
+   share one daemon, one browse, one reconciliation ticker and one
+   hostname; the daemon serves the `serviceType` of the space that
+   started it, and a space configured for another is refused. A space created
    while the daemon cannot start joins it from a later put once it can;
    a failed start is not tried again for a minute.
 2. **Browse.** Every resolved record that carries our fingerprint and a

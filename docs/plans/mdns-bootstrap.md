@@ -112,10 +112,12 @@ the hello proof uses, so a non-member cannot compute it. With no secret
 configured kitsune2 falls back to the space id, and the candidate-list
 attack in the threat model applies to that default.
 
-One `mdns-sd` daemon per factory per service type serves every space
-announcing under it: one browse, one reconciliation ticker, one hostname,
-and a registry that routes each resolved record to the space whose
-fingerprint it carries. A daemon that fails to start is not retried for a
+One `mdns-sd` daemon per factory serves every space it creates: one
+browse, one reconciliation ticker (each space reconciling against its own
+transport's connections), one hostname, and a registry that routes each
+resolved record to the space whose fingerprint it carries. The daemon
+serves the service type of the space that started it; a space configured
+for another type is refused. A daemon that fails to start is not retried for a
 minute, so many spaces created together cost one attempt; each of those
 spaces stays detached and tries to join again on its later puts, so a host
 that gains a network after its spaces were created recovers LAN discovery
