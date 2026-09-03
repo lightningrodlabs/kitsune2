@@ -1244,7 +1244,7 @@ impl IrohTransport {
         let connected = self
             .connections
             .read()
-            .expect("poisoned")
+            .expect("poison")
             .contains_key(remote_url);
         if connected {
             debug!(

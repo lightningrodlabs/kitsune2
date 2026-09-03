@@ -185,10 +185,12 @@ a relay.
   round and is dialled again each interval. Holochain does not use
   per-space relays.
 - The relay-down LAN bypass in `transport_iroh` only trusts LAN-scoped
-  addresses (RFC 1918, IPv4 link-local, CGNAT, IPv6 ULA). IPv6 link-local
-  is dropped because the lookup delivers it without a scope id, and a LAN
-  numbered with global-unicast IPv6 is not recognised; iroh's unfiltered
-  in-connect lookup on the relay-up path is unaffected.
+  addresses (RFC 1918, IPv4 link-local, IPv6 ULA). IPv6 link-local is
+  dropped because the lookup delivers it without a scope id; a LAN
+  numbered with global-unicast IPv6 or from carrier-grade NAT space
+  (`100.64.0.0/10`, shared by an ISP's customers rather than on-link) is
+  not recognised; iroh's unfiltered in-connect lookup on the relay-up
+  path is unaffected.
 - The api change (`TxImp::dial` required, `Transport::dial` returning
   `DialOutcome`) breaks external transport implementors. Accepted on this
   fork branch.

@@ -5,23 +5,30 @@
 //! over that. Rather than having every such factory decide for itself to
 //! swallow its own errors, the decision is made where the stack is
 //! assembled, by wrapping the factory in this one. An inner `create` error
-//! is logged once for the space and replaced by a bootstrap that does
-//! nothing.
+//! is replaced by a bootstrap that does nothing; the first such error a
+//! factory sees is a warning, since every space on a host without the
+//! facility fails the same way, and the rest are debug noise.
 
 use kitsune2_api::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Factory that turns an inner factory's `create` error into a no-op
 /// bootstrap for that space.
 #[derive(Debug)]
 pub struct OptionalBootstrapFactory {
     inner: DynBootstrapFactory,
+    /// Whether an inner failure has been reported at warning level yet.
+    warned: Arc<AtomicBool>,
 }
 
 impl OptionalBootstrapFactory {
     /// Wrap `inner` so that a space it cannot serve runs without it.
     pub fn create(inner: DynBootstrapFactory) -> DynBootstrapFactory {
-        Arc::new(Self { inner })
+        Arc::new(Self {
+            inner,
+            warned: Arc::new(AtomicBool::new(false)),
+        })
     }
 }
 
@@ -42,6 +49,7 @@ impl BootstrapFactory for OptionalBootstrapFactory {
         tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         let inner = self.inner.clone();
+        let warned = self.warned.clone();
         Box::pin(async move {
             match inner
                 .create(builder, peer_store, space_id.clone(), tx)
@@ -49,11 +57,19 @@ impl BootstrapFactory for OptionalBootstrapFactory {
             {
                 Ok(bootstrap) => Ok(bootstrap),
                 Err(err) => {
-                    tracing::warn!(
-                        ?err,
-                        ?space_id,
-                        "optional bootstrap could not start, the space runs without it"
-                    );
+                    if !warned.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            ?err,
+                            ?space_id,
+                            "optional bootstrap could not start, the space runs without it"
+                        );
+                    } else {
+                        tracing::debug!(
+                            ?err,
+                            ?space_id,
+                            "optional bootstrap could not start, the space runs without it"
+                        );
+                    }
                     let out: DynBootstrap = Arc::new(NoopBootstrap);
                     Ok(out)
                 }

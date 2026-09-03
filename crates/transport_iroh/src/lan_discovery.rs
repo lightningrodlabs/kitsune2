@@ -21,14 +21,18 @@
 //! address can only waste a connect attempt or bounce traffic off a third
 //! party — a DoS/reflection concern, not an impersonation one.
 //!
-//! Two IPv6 cases are deliberately outside the filter. Link-local
-//! (`fe80::/10`) addresses arrive from the lookup without a scope id and
-//! cannot be dialled, and a failed dial would mark the peer unresponsive,
-//! so they are dropped. A LAN numbered with global-unicast addresses
-//! (SLAAC from a delegated prefix) is not recognised as a LAN, so the
-//! relay-down bypass does not serve it; the relay-up path, where iroh's
-//! in-connect lookup is unfiltered, is unaffected. Both are known
-//! limitations.
+//! The filter admits RFC 1918, IPv4 link-local and IPv6 unique-local
+//! addresses: the ranges that are on-link by definition. Three cases are
+//! deliberately outside it. IPv6 link-local (`fe80::/10`) addresses
+//! arrive from the lookup without a scope id and cannot be dialled, and a
+//! failed dial would mark the peer unresponsive, so they are dropped. A
+//! LAN numbered with global-unicast IPv6 (SLAAC from a delegated prefix)
+//! is not recognised as a LAN. Carrier-grade NAT space (`100.64.0.0/10`)
+//! is shared by an ISP's customers, not on-link, so a forged record could
+//! steer a dial at any host behind the same carrier; a LAN numbered from
+//! it is not recognised either. None of these are served by the
+//! relay-down bypass; the relay-up path, where iroh's in-connect lookup
+//! is unfiltered, is unaffected. All three are known limitations.
 
 use std::time::Duration;
 
@@ -108,9 +112,7 @@ pub(crate) async fn resolve_direct_addrs(
 pub(crate) fn is_lan_scoped(ip: std::net::IpAddr) -> bool {
     use std::net::{IpAddr, Ipv4Addr};
     fn v4_lan(v4: Ipv4Addr) -> bool {
-        let [a, b, _, _] = v4.octets();
-        let cgnat = a == 100 && (64..128).contains(&b);
-        v4.is_private() || v4.is_link_local() || cgnat
+        v4.is_private() || v4.is_link_local()
     }
     match ip {
         IpAddr::V4(v4) => v4_lan(v4),
@@ -174,14 +176,12 @@ mod scope_tests {
             ("172.31.255.254", true),
             ("192.168.1.20", true),
             ("169.254.7.7", true),
-            ("100.64.0.1", true),
-            ("100.127.255.254", true),
             ("fd00::20", true),
             ("fc00::1", true),
             ("::ffff:192.168.1.20", true),
-            ("::ffff:100.100.1.1", true),
-            ("100.63.255.255", false),
-            ("100.128.0.0", false),
+            ("100.64.0.1", false),
+            ("100.127.255.254", false),
+            ("::ffff:100.100.1.1", false),
             ("172.32.0.1", false),
             ("8.8.8.8", false),
             ("203.0.113.9", false),
