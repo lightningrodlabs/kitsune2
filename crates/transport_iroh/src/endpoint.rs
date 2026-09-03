@@ -4,6 +4,8 @@ use crate::connection::{DynConnection, IrohConnection};
 use iroh::{EndpointAddr, EndpointId, RelayConfig, RelayUrl, TransportAddr};
 use kitsune2_api::{BoxFut, K2Error, K2Result};
 use n0_watcher::{Disconnected, Watcher};
+use std::collections::BTreeSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,6 +71,14 @@ pub(crate) trait Endpoint:
     /// a connection attempt might succeed; `Disconnected` means the relay has
     /// explicitly failed and iroh is waiting to retry.
     fn is_home_relay_known_down(&self) -> bool;
+
+    /// The IP addresses this endpoint currently holds, without ports or
+    /// relays. They decide which discovered addresses count as on-link.
+    /// An endpoint that does not know its addresses reports none, which
+    /// leaves only the ranges that are on-link by definition.
+    fn local_ips(&self) -> BTreeSet<IpAddr> {
+        BTreeSet::new()
+    }
 
     /// Resolves direct (IP) transport addresses for the given peer via the
     /// endpoint's address lookup services (e.g. mDNS LAN discovery).
@@ -175,6 +185,10 @@ impl Endpoint for IrohEndpoint {
 
     fn id_bytes(&self) -> [u8; 32] {
         *self.inner.id().as_bytes()
+    }
+
+    fn local_ips(&self) -> BTreeSet<IpAddr> {
+        crate::lan_discovery::local_ip_set(&self.inner.watch_addr().get())
     }
 
     fn is_home_relay_known_down(&self) -> bool {

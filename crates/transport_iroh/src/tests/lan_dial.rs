@@ -112,6 +112,48 @@ async fn relay_down_ignores_addresses_that_are_not_lan_scoped() {
     assert!(!targets[0].addrs.contains(&TransportAddr::Ip(public)));
 }
 
+/// A LAN numbered with global-unicast IPv6 has no private range to
+/// recognise: a discovered address is dialled when it shares a /64 with
+/// one of our own global addresses, and dropped when it does not.
+#[tokio::test]
+async fn relay_down_dials_global_ipv6_on_our_subnet_only() {
+    let ours: SocketAddr = "[2001:db8:1:2::20]:4433".parse().unwrap();
+    let other_subnet: SocketAddr = "[2001:db8:1:3::20]:4433".parse().unwrap();
+    let endpoint = Arc::new(FakeEndpoint {
+        connect: connect_fails("no route"),
+        relay_known_down: true,
+        direct_addrs: vec![
+            TransportAddr::Ip(ours),
+            TransportAddr::Ip(other_subnet),
+        ],
+        local_ips: ["2001:db8:1:2::10".parse().unwrap()].into(),
+        ..Default::default()
+    });
+
+    let (err, _) = attempt(endpoint.clone(), lan_config()).await;
+
+    assert!(err.contains("iroh connect error"), "got: {err}");
+    {
+        let targets = endpoint.connect_targets.lock().unwrap();
+        assert_eq!(targets.len(), 1, "connect must be attempted once");
+        assert!(targets[0].addrs.contains(&TransportAddr::Ip(ours)));
+        assert!(!targets[0].addrs.contains(&TransportAddr::Ip(other_subnet)));
+    }
+
+    // Without a global IPv6 address of our own there is nothing to match
+    // against, and the attempt is skipped as if the lookup were silent.
+    let endpoint = Arc::new(FakeEndpoint {
+        relay_known_down: true,
+        direct_addrs: vec![TransportAddr::Ip(ours)],
+        local_ips: ["192.168.1.20".parse().unwrap()].into(),
+        ..Default::default()
+    });
+    let (err, calls) = attempt(endpoint.clone(), lan_config()).await;
+    assert!(err.contains(RELAY_NOT_CONNECTED_ERR), "got: {err}");
+    assert!(endpoint.connect_targets.lock().unwrap().is_empty());
+    assert!(calls.lock().unwrap().is_empty());
+}
+
 /// With the relay known down and nothing known on the LAN, the attempt is
 /// skipped without touching the peer's standing.
 #[tokio::test]
