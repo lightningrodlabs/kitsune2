@@ -415,10 +415,10 @@ async fn a_detached_space_joins_on_a_later_put_once_the_daemon_starts() {
     assert_eq!(h.daemon.unregistered.lock().unwrap().len(), 1);
 }
 
-/// A space whose config names another service type gets a daemon of its
-/// own rather than silently joining the first one.
+/// A node announces itself under one service type: a space configured
+/// for another one is refused rather than silently joining the first.
 #[tokio::test]
-async fn each_service_type_gets_its_own_daemon() {
+async fn a_second_service_type_is_refused() {
     let h = harness(enabled());
     let other = builder_with(
         &h.factory,
@@ -430,13 +430,42 @@ async fn each_service_type_gets_its_own_daemon() {
 
     let (_boot_a, _, _) = create_space(&h, b"space-a", vec![]).await;
     let (boot_b, _, _) = try_create_space(&h, &other, b"space-b", vec![]).await;
-    let _boot_b = boot_b.unwrap();
+    let err = boot_b.expect_err("another service type").to_string();
+    assert!(err.contains(OTHER_TYPE), "{err}");
     let (_boot_c, _, _) = create_space(&h, b"space-c", vec![]).await;
 
-    assert_eq!(
-        *h.starts.lock().unwrap(),
-        vec![SERVICE_TYPE.to_string(), OTHER_TYPE.to_string()]
-    );
+    assert_eq!(*h.starts.lock().unwrap(), vec![SERVICE_TYPE.to_string()]);
     assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 2);
-    assert_eq!(h.factory.shared_for(OTHER_TYPE).unwrap().space_count(), 1);
+    assert!(h.factory.shared_for(OTHER_TYPE).is_none());
+}
+
+/// Each space reconciles against its own transport's connections: the
+/// same peer, announced to two spaces, is redialled only by the space
+/// whose transport is not connected to it.
+#[tokio::test]
+async fn each_space_reconciles_against_its_own_transport() {
+    let h = harness(MdnsBootstrapConfig {
+        redial_interval_ms: 50,
+        ..enabled()
+    });
+    let (boot_a, space_a, dials_a) =
+        create_space(&h, b"space-a", vec![url(PEER_A)]).await;
+    let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
+    put(&boot_a, &space_a, &url(SELF_URL));
+    put(&boot_b, &space_b, &url(SELF_URL));
+
+    h.daemon.deliver(resolved_peer(
+        "peer-1",
+        &fp_of(&h, &space_a).await,
+        PEER_A,
+    ));
+    h.daemon.deliver(resolved_peer(
+        "peer-2",
+        &fp_of(&h, &space_b).await,
+        PEER_A,
+    ));
+    // Dialled on arrival by both; B, unconnected, keeps redialling while
+    // A, whose transport reports the peer connected, stops at that.
+    wait_for_dials(&dials_b, 3).await;
+    assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
 }

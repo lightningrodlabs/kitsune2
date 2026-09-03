@@ -31,9 +31,9 @@ pub struct MdnsBootstrapConfig {
     /// announcing the peer. A fresh announcement restarts the short
     /// schedule.
     ///
-    /// All spaces announcing under one `serviceType` share one
-    /// reconciliation ticker, whose interval is that of the space that
-    /// started it.
+    /// All spaces of one factory share one reconciliation ticker, whose
+    /// interval is that of the space that started the daemon; a
+    /// per-space override of this value is not honoured by later spaces.
     ///
     /// Default: 30 seconds.
     #[cfg_attr(feature = "schema", schemars(default))]
