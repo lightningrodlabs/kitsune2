@@ -701,7 +701,8 @@ pub trait Transport: 'static + Send + Sync + std::fmt::Debug {
     /// counted like any other dropped outgoing message, and the outcome is
     /// [`DialOutcome::Blocked`]. A peer that has no grant yet is dialled,
     /// since the connection is what the access module needs to negotiate
-    /// one.
+    /// one. A space with no handler registered, or no local agents to
+    /// preflight with, is an `Err`: nothing about the peer is known then.
     fn dial(
         &self,
         space_id: SpaceId,
@@ -971,17 +972,29 @@ impl Transport for DefaultTransport {
         peer_url: Url,
     ) -> BoxFut<'_, K2Result<DialOutcome>> {
         Box::pin(async move {
-            self.error_if_no_local_agents(space_id.clone()).await?;
-            // A dial is checked as if it were addressed to the space's access
-            // module: that exemption exists precisely for the traffic that
-            // lets an ungranted peer become granted, and a dial opens the
-            // connection that traffic needs. A block still wins.
-            let access_module = self
+            // A space that has no handler yet cannot preflight or apply its
+            // access rules, so there is nothing a dial could achieve for
+            // it; that is an error for the caller to retry later, not a
+            // decision about the peer.
+            let handler = self
                 .space_map
                 .lock()
                 .expect("poison")
                 .get(&space_id)
-                .map(|handler| handler.access_module_id());
+                .cloned();
+            let Some(handler) = handler else {
+                return Err(K2Error::other(
+                    "space not registered with the transport",
+                ));
+            };
+            if !handler.has_local_agents().await? {
+                return Err(K2Error::NoLocalAgentsDuringPreflight);
+            }
+            // A dial is checked as if it were addressed to the space's access
+            // module: that exemption exists precisely for the traffic that
+            // lets an ungranted peer become granted, and a dial opens the
+            // connection that traffic needs. A block still wins.
+            let access_module = Some(handler.access_module_id());
             match check_peer_access(
                 self.space_map.clone(),
                 self.blocked_message_counts.clone(),

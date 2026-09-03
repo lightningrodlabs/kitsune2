@@ -880,6 +880,35 @@ async fn dial_runs_the_preflight_and_a_following_send_reuses_the_connection() {
     assert_eq!(h2.preflight_recv_count(), 1);
 }
 
+/// A dial for a space the transport does not know is an error, not a
+/// verdict about the peer: nothing is opened and nothing is counted as
+/// blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_for_an_unregistered_space_is_an_error() {
+    let h1 = TrackHnd::new();
+    let t1 = gen_tx(h1.clone()).await;
+
+    let h2 = TrackHnd::new();
+    let t2 = gen_tx(h2.clone()).await;
+    t2.register_space_handler(TEST_SPACE_ID, h2.clone());
+    let u2 = h2.url();
+
+    let err = t1
+        .dial(TEST_SPACE_ID, u2.clone())
+        .await
+        .expect_err("no handler for the space");
+    assert!(err.to_string().contains("not registered"), "{err}");
+
+    assert!(t1.get_connected_peers().await.unwrap().is_empty());
+    assert!(
+        t1.dump_network_stats()
+            .await
+            .unwrap()
+            .blocked_message_counts
+            .is_empty()
+    );
+}
+
 /// A dial toward a peer blocked in the space opens nothing and is counted
 /// as a dropped outgoing message.
 #[tokio::test(flavor = "multi_thread")]

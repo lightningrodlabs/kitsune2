@@ -51,6 +51,11 @@ struct Records {
     /// The reconciliation rounds run so far; schedules count in rounds
     /// rather than time so that they need no clock of their own.
     round: u64,
+    /// The URL this node announces for the space. An echo of our own
+    /// record, under whatever name, names nobody to dial, and the
+    /// decision is taken here, under the same lock that starts dials, so
+    /// that an announcement racing an echo cannot slip one through.
+    own: Option<Url>,
 }
 
 /// One URL's standing: when it was last heard, and when it may be dialled
@@ -65,6 +70,9 @@ struct UrlState {
     /// Whether the last dial connected. A peer this node has reached is
     /// worth more than any number of announcements when room is short.
     connected: bool,
+    /// Whether a dial toward the URL is running. A URL being dialled is
+    /// not due for another one.
+    in_flight: bool,
 }
 
 impl UrlState {
@@ -74,6 +82,7 @@ impl UrlState {
             next_round: 0,
             backoff_rounds: 1,
             connected: false,
+            in_flight: false,
         }
     }
 
@@ -97,8 +106,11 @@ impl UrlState {
 
 impl Records {
     /// Record that `fullname` now names `url`. Returns `true` when no
-    /// record named `url` before.
+    /// record named `url` before. Our own URL is never recorded.
     fn resolved(&mut self, fullname: &str, url: Url) -> bool {
+        if self.own.as_ref() == Some(&url) {
+            return false;
+        }
         if let Some(previous) =
             self.by_name.insert(fullname.to_string(), url.clone())
             && previous != url
@@ -132,15 +144,46 @@ impl Records {
     }
 
     /// Start a reconciliation round and return the URLs due for a dial in
-    /// it.
+    /// it: those whose schedule allows one and that are not being dialled
+    /// right now.
     fn due(&mut self) -> Vec<Url> {
         self.round += 1;
         let round = self.round;
         self.urls
             .iter()
-            .filter(|(_, state)| state.next_round <= round)
+            .filter(|(_, state)| !state.in_flight && state.next_round <= round)
             .map(|(url, _)| url.clone())
             .collect()
+    }
+
+    /// Claim `url` for a dial. Returns `false` when there is nothing to
+    /// dial: the URL is not announced (any more), is our own, or is being
+    /// dialled already.
+    fn start_dial(&mut self, url: &Url) -> bool {
+        if self.own.as_ref() == Some(url) {
+            return false;
+        }
+        match self.urls.get_mut(url) {
+            Some(state) if !state.in_flight => {
+                state.in_flight = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The dial toward `url` is over, however it ended.
+    fn end_dial(&mut self, url: &Url) {
+        if let Some(state) = self.urls.get_mut(url) {
+            state.in_flight = false;
+        }
+    }
+
+    /// This node now announces `url` for the space: forget whatever the
+    /// LAN said under that URL, and record none of it from now on.
+    fn set_own(&mut self, url: &Url) {
+        self.forget_url(url);
+        self.own = Some(url.clone());
     }
 
     /// A dial toward `url` failed: wait longer before the next one, up to
@@ -241,9 +284,10 @@ impl Announcements {
             .contains_key(fullname)
     }
 
-    /// Drop every record naming `url` until the LAN announces it afresh.
-    pub fn forget_url(&self, url: &Url) {
-        self.records.lock().expect("poison").forget_url(url)
+    /// This node now announces `url` for the space, so nothing the LAN
+    /// says under that URL is worth a dial.
+    pub fn set_own(&self, url: &Url) {
+        self.records.lock().expect("poison").set_own(url)
     }
 
     /// Every URL some record currently names.
@@ -269,8 +313,9 @@ impl Announcements {
         self.records.lock().expect("poison").due()
     }
 
-    /// Start a dial toward `url` in its own task if a slot is free.
-    /// Returns `false` when every slot is taken; the peer is not queued.
+    /// Start a dial toward `url` in its own task, if `url` is still worth
+    /// one and a slot is free. Returns whether a dial was started; a peer
+    /// that found every slot taken is not queued.
     pub fn try_dial(
         &self,
         tx: &DynTransport,
@@ -281,29 +326,42 @@ impl Announcements {
             trace!(%url, "mdns: no free dial slot, skipping until the next round");
             return false;
         };
+        // Claiming the URL and spawning happen under one lock, so that
+        // whatever changes the URL's standing meanwhile — a withdrawal,
+        // our own announcement of it — sees the dial in flight or the
+        // dial sees the change; never neither.
+        let mut records = self.records.lock().expect("poison");
+        if !records.start_dial(&url) {
+            trace!(%url, "mdns: nothing to dial for this url");
+            return false;
+        }
         let tx = tx.clone();
         let space_id = space_id.clone();
-        let records = self.records.clone();
+        let records_for_task = self.records.clone();
         let mut dials = self.dials.lock().expect("poison");
         // Finished dials leave their result behind until collected.
         while dials.try_join_next().is_some() {}
         dials.spawn(async move {
             let _permit = permit;
-            match tx.dial(space_id, url.clone()).await {
+            let outcome = tx.dial(space_id, url.clone()).await;
+            let mut records = records_for_task.lock().expect("poison");
+            records.end_dial(&url);
+            match outcome {
                 Ok(DialOutcome::Connected) => {
                     debug!(%url, "mdns: dial succeeded");
-                    records.lock().expect("poison").connected(&url);
+                    records.connected(&url);
                 }
                 Ok(DialOutcome::Blocked) => {
                     debug!(%url, "mdns: peer is blocked in this space, retrying on the longest schedule");
-                    records.lock().expect("poison").blocked(&url);
+                    records.blocked(&url);
                 }
                 Err(err) => {
                     debug!(?err, %url, "mdns: dial failed");
-                    records.lock().expect("poison").failed(&url);
+                    records.failed(&url);
                 }
             }
         });
+        drop(records);
         true
     }
 }
@@ -317,6 +375,11 @@ mod tests {
 
     const A: &str = "ws://a.test:80/peerA";
     const B: &str = "ws://b.test:80/peerB";
+    const C: &str = "ws://c.test:80/peerC";
+
+    fn url_of(s: &str) -> Url {
+        url(s)
+    }
 
     fn space() -> SpaceId {
         space_id(b"space")
@@ -368,15 +431,17 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_a_url_drops_every_record_naming_it() {
+    fn announcing_a_url_as_our_own_drops_every_record_naming_it() {
         let state = Announcements::new(4);
         state.record_resolved("r1", url(A));
         state.record_resolved("r2", url(A));
         state.record_resolved("r3", url(B));
 
-        state.forget_url(&url(A));
+        state.set_own(&url(A));
         assert_eq!(state.urls(), vec![url(B)]);
-        assert!(state.record_resolved("r1", url(A)), "new again");
+        assert!(!state.has_record("r1"));
+        assert!(!state.record_resolved("r1", url(A)), "never again");
+        assert_eq!(state.urls(), vec![url(B)]);
     }
 
     fn forged(i: usize) -> Url {
@@ -515,6 +580,8 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let (tx, dials) = blocking_transport(release.clone(), vec![]);
         let state = Announcements::new(1);
+        state.record_resolved("a", url(A));
+        state.record_resolved("b", url(B));
 
         assert!(state.try_dial(&tx, &space(), url(A)));
         assert!(!state.try_dial(&tx, &space(), url(B)));
@@ -559,11 +626,59 @@ mod tests {
         assert_eq!(state.urls(), vec![url(A)], "still known");
     }
 
+    /// A URL being dialled is not due for another dial, and its slot is
+    /// the only one it holds: the rest keep flowing.
+    #[tokio::test]
+    async fn a_url_with_a_dial_in_flight_is_not_due() {
+        let (tx, dials) = transport_with(vec![], |url| async move {
+            if url == url_of(A) {
+                std::future::pending::<()>().await;
+            }
+            Ok(DialOutcome::Connected)
+        });
+        let state = Announcements::new(4);
+        state.record_resolved("a", url(A));
+        state.record_resolved("b", url(B));
+        state.record_resolved("c", url(C));
+
+        round(&state, &tx).await;
+        round(&state, &tx).await;
+        assert_eq!(state.in_flight.available_permits(), 3, "A holds one");
+
+        let dialled = dials.lock().unwrap().clone();
+        assert_eq!(
+            dialled.iter().filter(|u| **u == url(A)).count(),
+            1,
+            "one dial for the url in flight: {dialled:?}"
+        );
+        assert_eq!(dialled.iter().filter(|u| **u == url(B)).count(), 2);
+        assert_eq!(dialled.iter().filter(|u| **u == url(C)).count(), 2);
+    }
+
+    /// Announcing a URL as our own closes the door on a dial toward it
+    /// even when the echo was recorded first and a dial is about to
+    /// start.
+    #[tokio::test]
+    async fn our_own_url_is_neither_recorded_nor_dialled() {
+        let (tx, dials) = recording_transport(vec![]);
+        let state = Announcements::new(4);
+
+        assert!(state.record_resolved("echo", url(A)));
+        state.set_own(&url(A));
+        assert!(state.urls().is_empty(), "the echo is forgotten");
+        assert!(!state.try_dial(&tx, &space(), url(A)));
+        assert!(!state.record_resolved("echo-again", url(A)));
+        assert!(state.urls().is_empty());
+        settle().await;
+        assert!(dials.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn dropping_the_state_aborts_dials_in_flight() {
         let release = Arc::new(tokio::sync::Notify::new());
         let (tx, _dials) = blocking_transport(release, vec![]);
         let state = Announcements::new(1);
+        state.record_resolved("a", url(A));
         assert!(state.try_dial(&tx, &space(), url(A)));
         let slots = state.in_flight.clone();
         tokio::time::sleep(Duration::from_millis(50)).await;
