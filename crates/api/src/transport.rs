@@ -625,7 +625,6 @@ pub type DynTxImp = Arc<dyn TxImp>;
 /// transport, so it is reported as an outcome rather than an error: the
 /// caller learns that the peer is off limits in that space and can stop
 /// asking, while a real transport error stays an `Err`.
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialOutcome {
     /// A connection with a completed preflight is open to the peer.
