@@ -13,36 +13,48 @@
 //! a space that joins after a LAN peer's record was resolved would never
 //! hear it. The loop therefore keeps the latest record of every name it
 //! has heard, for every fingerprint, and a joining space is replayed the
-//! ones carrying its own.
+//! ones carrying its own. That cache serves replay only: which space
+//! holds a record — and must forget it when the LAN withdraws it — is a
+//! question for the spaces themselves, so that a record the cache made
+//! room for is still forgotten by its owner.
 
+use crate::cap::evict_past_cap;
 use crate::discovery;
 use crate::space::SpaceEntry;
 use mdns_sd::ServiceEvent;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::trace;
 
-/// The most records remembered for replay. Past this, the record heard
-/// longest ago makes room.
-pub const MAX_CACHED_RECORDS: usize = 1024;
+/// The most records remembered for replay per fingerprint. Past this, the
+/// record heard longest ago for that fingerprint makes room, so what the
+/// LAN says about other spaces never costs a space its own records.
+pub const MAX_RECORDS_PER_FINGERPRINT: usize = 64;
+
+/// The most fingerprints remembered for replay. Past this, the
+/// fingerprint heard from longest ago makes room, unless a space of this
+/// node is registered for it.
+pub const MAX_CACHED_FINGERPRINTS: usize = 256;
 
 /// The latest resolution of one record name.
 #[derive(Debug)]
 struct CachedRecord {
-    /// The `spacefp` TXT value as announced.
-    fp: String,
     /// The `url` TXT value as announced.
     url: String,
     /// Position in the order of hearing, for eviction.
     seq: u64,
 }
 
+/// The records heard for one fingerprint, by name.
+type Bucket = HashMap<String, CachedRecord>;
+
 /// The spaces sharing the daemon, keyed by the fingerprint string they
 /// announce and match on, and the records heard for every fingerprint.
 #[derive(Debug, Default)]
 pub struct BrowseState {
     spaces: HashMap<String, Arc<SpaceEntry>>,
-    cache: HashMap<String, CachedRecord>,
+    cache: HashMap<String, Bucket>,
     next_seq: u64,
 }
 
@@ -58,10 +70,7 @@ impl BrowseState {
         entry: Arc<SpaceEntry>,
     ) -> Option<Arc<SpaceEntry>> {
         let key = entry.fingerprint().encode();
-        for (fullname, record) in &self.cache {
-            if record.fp != key {
-                continue;
-            }
+        for (fullname, record) in self.cache.get(&key).into_iter().flatten() {
             if let Some(url) = discovery::parse_peer_url(&record.url) {
                 trace!(fullname, %url, "mdns: replaying cached record to a joining space");
                 entry.record_resolved(fullname, url);
@@ -98,55 +107,57 @@ impl BrowseState {
         self.spaces.get(fp).cloned()
     }
 
-    /// Remember the latest resolution of `fullname`. Returns the space
-    /// that previously owned the name, when the record moved to another
-    /// fingerprint and that space must forget it.
-    fn resolved(
-        &mut self,
-        fullname: &str,
-        fp: &str,
-        url: &str,
-    ) -> Option<Arc<SpaceEntry>> {
+    /// Remember the latest resolution of `fullname` under `fp`.
+    fn resolved(&mut self, fullname: &str, fp: &str, url: &str) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let previous = self.cache.insert(
+        // A name that moved to another fingerprint is one record, not two.
+        self.forget(fullname, Some(fp));
+        let bucket = self.cache.entry(fp.to_string()).or_default();
+        bucket.insert(
             fullname.to_string(),
             CachedRecord {
-                fp: fp.to_string(),
                 url: url.to_string(),
                 seq,
             },
         );
-        self.evict_past_cap();
-        previous
-            .filter(|previous| previous.fp != fp)
-            .and_then(|previous| self.space(&previous.fp))
+        evict_past_cap(bucket, MAX_RECORDS_PER_FINGERPRINT, |_, record| {
+            Some(Reverse(record.seq))
+        });
+        let registered = &self.spaces;
+        evict_past_cap(
+            &mut self.cache,
+            MAX_CACHED_FINGERPRINTS,
+            |fp, bucket| {
+                if registered.contains_key(fp) {
+                    return None;
+                }
+                let last_heard = bucket.values().map(|r| r.seq).max();
+                Some(Reverse(last_heard))
+            },
+        );
     }
 
-    /// Forget `fullname`, returning the space it was routed to.
-    fn removed(&mut self, fullname: &str) -> Option<Arc<SpaceEntry>> {
-        let record = self.cache.remove(fullname)?;
-        self.space(&record.fp)
+    /// Forget `fullname` wherever it is cached.
+    fn removed(&mut self, fullname: &str) {
+        self.forget(fullname, None);
     }
 
-    fn evict_past_cap(&mut self) {
-        while self.cache.len() > MAX_CACHED_RECORDS {
-            let Some(oldest) = self
-                .cache
-                .iter()
-                .min_by_key(|(_, record)| record.seq)
-                .map(|(fullname, _)| fullname.clone())
-            else {
-                break;
-            };
-            self.cache.remove(&oldest);
-        }
+    /// Drop `fullname` from every bucket but `except`, and the buckets it
+    /// leaves empty.
+    fn forget(&mut self, fullname: &str, except: Option<&str>) {
+        self.cache.retain(|fp, bucket| {
+            if except != Some(fp.as_str()) {
+                bucket.remove(fullname);
+            }
+            !bucket.is_empty()
+        });
     }
 
-    /// How many records are cached.
+    /// How many records are cached, over every fingerprint.
     #[cfg(test)]
     pub fn cached_count(&self) -> usize {
-        self.cache.len()
+        self.cache.values().map(Bucket::len).sum()
     }
 }
 
@@ -162,12 +173,21 @@ pub async fn browse_loop(
                     trace!(fullname = %svc.fullname, "mdns: ignoring record without spacefp and url");
                     continue;
                 };
-                let (lost_by, entry) = {
+                let (entry, others) = {
                     let mut state = state.lock().expect("poison");
-                    (state.resolved(&svc.fullname, fp, url), state.space(fp))
+                    state.resolved(&svc.fullname, fp, url);
+                    (state.space(fp), state.entries())
                 };
-                if let Some(lost_by) = lost_by {
-                    lost_by.record_removed(&svc.fullname);
+                // A name that re-resolves under another fingerprint has
+                // left whichever space held it, whatever the new
+                // fingerprint says.
+                for other in others {
+                    let is_owner = entry
+                        .as_ref()
+                        .is_some_and(|entry| Arc::ptr_eq(entry, &other));
+                    if !is_owner && other.has_record(&svc.fullname) {
+                        other.record_removed(&svc.fullname);
+                    }
                 }
                 let Some(entry) = entry else {
                     trace!(fullname = %svc.fullname, "mdns: record for a space this node is not in");
@@ -181,9 +201,15 @@ pub async fn browse_loop(
                 entry.record_resolved(&svc.fullname, url);
             }
             ServiceEvent::ServiceRemoved(_, fullname) => {
-                let entry = state.lock().expect("poison").removed(&fullname);
-                if let Some(entry) = entry {
-                    entry.record_removed(&fullname);
+                let entries = {
+                    let mut state = state.lock().expect("poison");
+                    state.removed(&fullname);
+                    state.entries()
+                };
+                for entry in entries {
+                    if entry.has_record(&fullname) {
+                        entry.record_removed(&fullname);
+                    }
                 }
             }
             _ => {}
@@ -197,7 +223,6 @@ mod tests {
     use super::*;
     use crate::discovery::Daemon as _;
     use crate::test_support::*;
-    use kitsune2_api::Url;
 
     const PEER_A: &str = "ws://a.test:80/peera";
     const PEER_B: &str = "ws://b.test:80/peerb";
@@ -384,18 +409,93 @@ mod tests {
         assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
     }
 
-    #[test]
-    fn the_record_heard_longest_ago_makes_room_past_the_cap() {
-        let mut state = BrowseState::default();
-        for i in 0..MAX_CACHED_RECORDS {
-            state.resolved(&format!("r{i}"), "fp", "ws://x.test:80/x");
+    fn fill(state: &mut BrowseState, fp: &str, prefix: &str, n: usize) {
+        for i in 0..n {
+            state.resolved(&format!("{prefix}{i}"), fp, "ws://x.test:80/x");
         }
-        state.resolved("r0", "fp", "ws://x.test:80/x");
-        state.resolved("extra", "fp", "ws://x.test:80/x");
-        assert_eq!(state.cached_count(), MAX_CACHED_RECORDS);
-        assert!(state.cache.contains_key("extra"));
-        assert!(state.cache.contains_key("r0"), "re-heard");
-        assert!(!state.cache.contains_key("r1"), "the oldest made room");
-        let _: Option<Url> = None;
+    }
+
+    fn cached(state: &BrowseState, fp: &str, fullname: &str) -> bool {
+        state
+            .cache
+            .get(fp)
+            .is_some_and(|bucket| bucket.contains_key(fullname))
+    }
+
+    #[test]
+    fn each_fingerprint_keeps_its_own_records_past_its_cap() {
+        let mut state = BrowseState::default();
+        state.resolved("mine", "fp-a", "ws://x.test:80/x");
+        fill(&mut state, "fp-b", "r", MAX_RECORDS_PER_FINGERPRINT);
+        state.resolved("r0", "fp-b", "ws://x.test:80/x");
+        state.resolved("extra", "fp-b", "ws://x.test:80/x");
+
+        assert!(
+            cached(&state, "fp-a", "mine"),
+            "another fingerprint's flood"
+        );
+        assert_eq!(state.cache["fp-b"].len(), MAX_RECORDS_PER_FINGERPRINT);
+        assert!(cached(&state, "fp-b", "extra"));
+        assert!(cached(&state, "fp-b", "r0"), "re-heard");
+        assert!(!cached(&state, "fp-b", "r1"), "the oldest made room");
+    }
+
+    /// A flood of fingerprints this node is not in must not evict the
+    /// records of a space it is in; among the rest the fingerprint heard
+    /// from longest ago goes first.
+    #[tokio::test]
+    async fn a_registered_fingerprint_survives_a_flood_of_others() {
+        let h = harness();
+        let (a, _) = join(&h, b"space-a");
+        let key = a.fingerprint().encode();
+        let mut state = h.state.lock().unwrap();
+        state.resolved("mine", &key, "ws://x.test:80/x");
+        state.resolved("early", "fp-early", "ws://x.test:80/x");
+        for i in 0..MAX_CACHED_FINGERPRINTS {
+            state.resolved(
+                &format!("flood-{i}"),
+                &format!("fp-{i}"),
+                "ws://x.test:80/x",
+            );
+        }
+
+        assert_eq!(state.cache.len(), MAX_CACHED_FINGERPRINTS);
+        assert!(cached(&state, &key, "mine"));
+        assert!(!state.cache.contains_key("fp-early"));
+    }
+
+    /// The cache serves replay; which space must forget a withdrawn
+    /// record is asked of the spaces, so a record the cache made room for
+    /// is still forgotten by the space that holds it.
+    #[tokio::test]
+    async fn a_record_evicted_from_the_cache_is_still_forgotten_on_removal() {
+        let h = harness();
+        let (a, dials) = join(&h, b"space-a");
+        for i in 0..=MAX_RECORDS_PER_FINGERPRINT {
+            h.daemon.deliver(resolved_peer(
+                &format!("peer-{i}"),
+                a.fingerprint(),
+                &format!("ws://p{i}.test:80/peer{i}"),
+            ));
+        }
+        let last = discovery::fullname(
+            SERVICE_TYPE,
+            &format!("peer-{MAX_RECORDS_PER_FINGERPRINT}"),
+        );
+        wait_until(|| a.has_record(&last)).await;
+        assert!(!dials.lock().unwrap().is_empty());
+        let first = discovery::fullname(SERVICE_TYPE, "peer-0");
+        assert!(a.has_record(&first));
+        assert!(
+            !cached(
+                &h.state.lock().unwrap(),
+                &a.fingerprint().encode(),
+                &first
+            ),
+            "the cache made room for the newest record"
+        );
+
+        h.daemon.deliver(removed("peer-0"));
+        wait_until(|| !a.has_record(&first)).await;
     }
 }

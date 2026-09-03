@@ -26,17 +26,20 @@ someone else's job.
    parseable peer URL — and is not our own instance or our own URL — is a
    candidate. Records are tracked by name, so a restarted peer whose old
    record lingers next to its new one stays known until both are gone;
-   the latest record of every name heard is kept (up to 1024) and replayed
-   to a space that joins later, since mDNS delivers a record only once.
+   the latest record of every name heard is kept (64 per fingerprint,
+   256 fingerprints) and replayed to a space that joins later, since mDNS
+   delivers a record only once.
 3. **Dial.** Once the space has a URL of its own (before that it cannot be
    dialled back or preflight), a candidate is handed to
    `Transport::dial(space, url)` when it is first heard. While the LAN
    keeps announcing it and the transport reports no connection to it, it
    is dialled again after one `redialIntervalMs`, then two, four, up to
    sixteen intervals between dials; a fresh announcement restarts the
-   short schedule, and a peer the space blocks is forgotten until it is
-   announced again. At most `maxConcurrentDials` dials are in flight and
-   at most 256 URLs are remembered per space. A dial opens a transport
+   short schedule, and a peer the space blocks is retried on the longest
+   schedule only, so a lifted block is noticed without a re-announcement.
+   At most `maxConcurrentDials` dials are in flight and at most 256 URLs
+   are remembered per space — past that, the URLs that keep failing make
+   room first and a peer that connected last. A dial opens a transport
    connection and runs its preflight.
 4. **Hand over.** The space's access module (the *hello* module in
    `kitsune2_core`) sees the new connection, challenges the peer to prove

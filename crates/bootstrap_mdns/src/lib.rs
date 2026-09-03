@@ -74,6 +74,7 @@ pub mod config;
 pub mod fingerprint;
 
 mod browse;
+mod cap;
 mod dials;
 mod discovery;
 mod factory;

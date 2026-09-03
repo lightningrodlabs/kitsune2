@@ -21,7 +21,9 @@
 //! announced. What the LAN says can grow without bound; what this node
 //! does about it cannot.
 
+use crate::cap::evict_past_cap;
 use kitsune2_api::{DialOutcome, DynTransport, SpaceId, Url};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex};
@@ -30,9 +32,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, trace};
 
-/// The most URLs remembered for one space. Past this, the URL heard
-/// longest ago makes room, so a LAN full of announcements — or a flood of
-/// forged ones — costs a fixed amount of memory per space.
+/// The most URLs remembered for one space, so that a LAN full of
+/// announcements — or a flood of forged ones — costs a fixed amount of
+/// memory per space. Past this, the URLs that keep failing make room
+/// first, the oldest-heard among equals, and a URL that connected last.
 pub const MAX_URLS: usize = 256;
 
 /// The most reconciliation rounds a URL waits between dials. A peer that
@@ -59,6 +62,9 @@ struct UrlState {
     next_round: u64,
     /// How many rounds the next failure will push `next_round` out by.
     backoff_rounds: u64,
+    /// Whether the last dial connected. A peer this node has reached is
+    /// worth more than any number of announcements when room is short.
+    connected: bool,
 }
 
 impl UrlState {
@@ -67,7 +73,19 @@ impl UrlState {
             last_heard: Instant::now(),
             next_round: 0,
             backoff_rounds: 1,
+            connected: false,
         }
+    }
+
+    /// How readily this URL makes room when the cap is hit: the ones that
+    /// never connected go before the ones that did, the ones that keep
+    /// failing before the ones that do not, the oldest-heard among equals.
+    fn eviction_rank(&self) -> (bool, u64, Reverse<Instant>) {
+        (
+            !self.connected,
+            self.backoff_rounds,
+            Reverse(self.last_heard),
+        )
     }
 
     /// Heard again, or connected: back on the short schedule.
@@ -87,7 +105,7 @@ impl Records {
         {
             self.release(&previous);
         }
-        let new = match self.urls.entry(url) {
+        let new = match self.urls.entry(url.clone()) {
             Entry::Occupied(mut state) => {
                 state.get_mut().last_heard = Instant::now();
                 state.get_mut().reset();
@@ -98,7 +116,7 @@ impl Records {
                 true
             }
         };
-        self.enforce_cap();
+        self.enforce_cap(&url);
         new
     }
 
@@ -129,9 +147,21 @@ impl Records {
     /// [`MAX_BACKOFF_ROUNDS`].
     fn failed(&mut self, url: &Url) {
         if let Some(state) = self.urls.get_mut(url) {
+            state.connected = false;
             state.next_round = self.round + state.backoff_rounds;
             state.backoff_rounds =
                 (state.backoff_rounds * 2).min(MAX_BACKOFF_ROUNDS);
+        }
+    }
+
+    /// The space refuses `url`. A block can be lifted while the record
+    /// stands unchanged, so the URL stays known and is tried again on the
+    /// longest schedule, where the block is checked anew.
+    fn blocked(&mut self, url: &Url) {
+        if let Some(state) = self.urls.get_mut(url) {
+            state.connected = false;
+            state.next_round = self.round + MAX_BACKOFF_ROUNDS;
+            state.backoff_rounds = MAX_BACKOFF_ROUNDS;
         }
     }
 
@@ -139,6 +169,7 @@ impl Records {
     fn connected(&mut self, url: &Url) {
         if let Some(state) = self.urls.get_mut(url) {
             state.reset();
+            state.connected = true;
         }
     }
 
@@ -155,19 +186,15 @@ impl Records {
         }
     }
 
-    /// Make room by forgetting the URLs heard longest ago. The URL just
-    /// heard is the newest, so it is never the one to go.
-    fn enforce_cap(&mut self) {
-        while self.urls.len() > MAX_URLS {
-            let Some(oldest) = self
-                .urls
-                .iter()
-                .min_by_key(|(_, state)| state.last_heard)
-                .map(|(url, _)| url.clone())
-            else {
-                break;
-            };
-            self.forget_url(&oldest);
+    /// Make room past [`MAX_URLS`] by forgetting the URLs that rank
+    /// highest for eviction. `just_heard` is what the LAN said last and is
+    /// never the one to go.
+    fn enforce_cap(&mut self, just_heard: &Url) {
+        let evicted = evict_past_cap(&mut self.urls, MAX_URLS, |url, state| {
+            (url != just_heard).then(|| state.eviction_rank())
+        });
+        for url in evicted {
+            self.by_name.retain(|_, named| named != &url);
         }
     }
 }
@@ -203,6 +230,15 @@ impl Announcements {
     /// The record `fullname` was withdrawn.
     pub fn record_removed(&self, fullname: &str) {
         self.records.lock().expect("poison").removed(fullname)
+    }
+
+    /// Whether a record of that name is known.
+    pub fn has_record(&self, fullname: &str) -> bool {
+        self.records
+            .lock()
+            .expect("poison")
+            .by_name
+            .contains_key(fullname)
     }
 
     /// Drop every record naming `url` until the LAN announces it afresh.
@@ -259,14 +295,8 @@ impl Announcements {
                     records.lock().expect("poison").connected(&url);
                 }
                 Ok(DialOutcome::Blocked) => {
-                    // The space refuses this peer, so no round should
-                    // dial it again; only a fresh announcement puts it
-                    // back, where the block is checked anew.
-                    debug!(%url, "mdns: peer is blocked in this space, forgetting it until re-announced");
-                    records.lock().expect("poison").forget_url(&url);
-                }
-                Ok(outcome) => {
-                    debug!(?outcome, %url, "mdns: dial ended with an outcome this crate does not know")
+                    debug!(%url, "mdns: peer is blocked in this space, retrying on the longest schedule");
+                    records.lock().expect("poison").blocked(&url);
                 }
                 Err(err) => {
                     debug!(?err, %url, "mdns: dial failed");
@@ -349,29 +379,61 @@ mod tests {
         assert!(state.record_resolved("r1", url(A)), "new again");
     }
 
+    fn forged(i: usize) -> Url {
+        url(&format!("ws://p{i}.test:80/peer{i}"))
+    }
+
+    /// Fill the state with `n` forged records, named `f0..`.
+    fn flood(state: &Announcements, n: usize) {
+        for i in 0..n {
+            state.record_resolved(&format!("f{i}"), forged(i));
+        }
+    }
+
     #[test]
     fn the_url_heard_longest_ago_makes_room_past_the_cap() {
         let state = Announcements::new(4);
-        for i in 0..MAX_URLS {
-            state.record_resolved(
-                &format!("r{i}"),
-                url(&format!("ws://p{i}.test:80/peer{i}")),
-            );
-        }
+        flood(&state, MAX_URLS);
         assert_eq!(state.urls().len(), MAX_URLS);
 
         // Hearing the very first URL again makes it the newest.
-        state.record_resolved("r0", url("ws://p0.test:80/peer0"));
+        state.record_resolved("f0", forged(0));
         state.record_resolved("extra", url(A));
 
         let urls = state.urls();
         assert_eq!(urls.len(), MAX_URLS);
         assert!(urls.contains(&url(A)), "the newcomer is kept");
-        assert!(urls.contains(&url("ws://p0.test:80/peer0")), "re-heard");
-        assert!(
-            !urls.contains(&url("ws://p1.test:80/peer1")),
-            "the oldest made room"
-        );
+        assert!(urls.contains(&forged(0)), "re-heard");
+        assert!(!urls.contains(&forged(1)), "the oldest made room");
+    }
+
+    /// A flood of announcements must not push out the peers this node
+    /// actually talks to: a URL that connected is the last to go, and
+    /// among the rest the ones that keep failing go first.
+    #[tokio::test]
+    async fn a_connected_url_survives_a_flood_and_failing_urls_go_first() {
+        let (tx, _) = failing_transport();
+        let state = Announcements::new(4);
+        state.record_resolved("good", url(A));
+        state.record_resolved("bad", url(B));
+        state.records.lock().unwrap().connected(&url(A));
+        // B fails twice, so it carries the highest backoff around.
+        for _ in 0..2 {
+            for u in state.due_urls() {
+                if u == url(B) {
+                    state.try_dial(&tx, &space(), u);
+                }
+            }
+            settle().await;
+        }
+
+        flood(&state, MAX_URLS + 1);
+
+        let urls = state.urls();
+        assert_eq!(urls.len(), MAX_URLS);
+        assert!(urls.contains(&url(A)), "the connected peer is kept");
+        assert!(!urls.contains(&url(B)), "the failing peer went first");
+        assert!(!urls.contains(&forged(0)), "then the oldest forged one");
     }
 
     /// A transport whose every dial fails.
@@ -466,10 +528,12 @@ mod tests {
         assert_eq!(dials.lock().unwrap().len(), 2);
     }
 
-    /// A peer the space blocks must not be dialled round after round: the
-    /// blocked outcome drops it until the LAN announces it afresh.
+    /// A peer the space blocks must not be dialled round after round, but
+    /// a block can be lifted while the record stands unchanged, so the
+    /// blocked outcome puts the URL on the longest schedule rather than
+    /// forgetting it.
     #[tokio::test]
-    async fn a_blocked_dial_forgets_the_url_until_re_announced() {
+    async fn a_blocked_dial_is_retried_on_the_longest_schedule() {
         let dials: Dials = Arc::new(Mutex::new(Vec::new()));
         let mut mock = MockTransport::new();
         {
@@ -481,16 +545,18 @@ mod tests {
         }
         let tx: DynTransport = Arc::new(mock);
         let state = Announcements::new(4);
+        state.record_resolved("r1", url(A));
 
-        assert!(state.record_resolved("r1", url(A)));
-        assert!(state.try_dial(&tx, &space(), url(A)));
-        settle().await;
-        assert_eq!(dials.lock().unwrap().len(), 1);
-        assert!(state.urls().is_empty(), "a blocked peer is forgotten");
-
-        // Announced again, it counts as new and is checked again.
-        assert!(state.record_resolved("r1", url(A)));
-        assert_eq!(state.urls(), vec![url(A)]);
+        let mut dialled_in = Vec::new();
+        for r in 1..=(MAX_BACKOFF_ROUNDS * 2 + 1) {
+            let before = dials.lock().unwrap().len();
+            round(&state, &tx).await;
+            if dials.lock().unwrap().len() > before {
+                dialled_in.push(r);
+            }
+        }
+        assert_eq!(dialled_in, vec![1, 17, 33]);
+        assert_eq!(state.urls(), vec![url(A)], "still known");
     }
 
     #[tokio::test]

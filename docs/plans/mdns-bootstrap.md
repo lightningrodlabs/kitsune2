@@ -85,7 +85,9 @@ preflight exchanges agent infos (Holochain's does) gets the faster
   heard, then at most once per `redialIntervalMs` with exponential backoff
   (up to sixteen intervals) while it stays announced and unconnected, at
   most `maxConcurrentDials` in flight and at most 256 URLs remembered per
-  space. A peer the space blocks is forgotten until announced afresh.
+  space, the ones that keep failing making room first and a peer that
+  connected last. A peer the space blocks is retried on the longest
+  schedule only, so a lifted block is noticed without a re-announcement.
   Cannot put anything in a peer store.
 - **Adversary with a candidate space_id list** can derive fingerprints
   and confirm presence for spaces that configure no secret (the open-space
@@ -121,9 +123,11 @@ without recreating them.
 
 Records are tracked by name per space, so a restarted peer whose old record
 lingers next to its new one stays known until both are gone. The browse
-loop keeps the latest record of every name it hears (up to 1024) and
-replays the matching ones to a space that joins later, since mDNS delivers
-an unchanged record only once.
+loop keeps the latest record of every name it hears — up to 64 per
+fingerprint and 256 fingerprints, a registered space's never making room
+for others' — and replays the matching ones to a space that joins later,
+since mDNS delivers an unchanged record only once. Which space must forget
+a withdrawn record is asked of the spaces, not of that cache.
 
 The URL is taken from the local agent infos delivered through
 `Bootstrap::put`; browsing starts immediately, announcing — and dialling,

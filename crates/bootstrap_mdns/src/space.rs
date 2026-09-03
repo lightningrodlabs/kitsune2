@@ -107,6 +107,11 @@ impl SpaceEntry {
         !self.announced.is_empty()
     }
 
+    /// Whether this space holds a record of that name.
+    pub fn has_record(&self, fullname: &str) -> bool {
+        self.announced.has_record(fullname)
+    }
+
     /// Whether this node can be dialled back yet. Until a local agent has
     /// a URL the space has no handler registered and no agents to
     /// preflight with, so a dial would fail on our own side.
