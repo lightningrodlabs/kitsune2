@@ -302,6 +302,18 @@ impl Announcements {
             .collect()
     }
 
+    /// How many URLs have a dial in flight.
+    #[cfg(test)]
+    pub fn in_flight_count(&self) -> usize {
+        self.records
+            .lock()
+            .expect("poison")
+            .urls
+            .values()
+            .filter(|state| state.in_flight)
+            .count()
+    }
+
     /// Whether any record is known at all.
     pub fn is_empty(&self) -> bool {
         self.records.lock().expect("poison").urls.is_empty()
@@ -371,7 +383,6 @@ mod tests {
     use super::*;
     use crate::test_support::*;
     use kitsune2_api::MockTransport;
-    use std::time::Duration;
 
     const A: &str = "ws://a.test:80/peerA";
     const B: &str = "ws://b.test:80/peerB";
@@ -489,7 +500,7 @@ mod tests {
                     state.try_dial(&tx, &space(), u);
                 }
             }
-            settle().await;
+            wait_until(|| state.in_flight_count() == 0).await;
         }
 
         flood(&state, MAX_URLS + 1);
@@ -513,13 +524,18 @@ mod tests {
         (Arc::new(mock), dials)
     }
 
-    /// Run one reconciliation round: dial everything due, and let the
-    /// dials finish so their outcome is recorded before the next round.
-    async fn round(state: &Announcements, tx: &DynTransport) {
+    /// Dial everything due this round.
+    fn dial_due(state: &Announcements, tx: &DynTransport) {
         for url in state.due_urls() {
             state.try_dial(tx, &space(), url);
         }
-        settle().await;
+    }
+
+    /// Run one reconciliation round: dial everything due, and let the
+    /// dials finish so their outcome is recorded before the next round.
+    async fn round(state: &Announcements, tx: &DynTransport) {
+        dial_due(state, tx);
+        wait_until(|| state.in_flight_count() == 0).await;
     }
 
     /// A failing URL is dialled at rounds 1, 2, 4, 8, 16, then every 16.
@@ -585,14 +601,12 @@ mod tests {
 
         assert!(state.try_dial(&tx, &space(), url(A)));
         assert!(!state.try_dial(&tx, &space(), url(B)));
-        settle().await;
-        assert_eq!(dials.lock().unwrap().len(), 1);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(A)]);
 
         release.notify_one();
-        settle().await;
+        wait_until(|| state.in_flight.available_permits() == 1).await;
         assert!(state.try_dial(&tx, &space(), url(B)));
-        settle().await;
-        assert_eq!(dials.lock().unwrap().len(), 2);
+        assert_eq!(wait_for_dials(&dials, 2).await, vec![url(A), url(B)]);
     }
 
     /// A peer the space blocks must not be dialled round after round, but
@@ -641,11 +655,13 @@ mod tests {
         state.record_resolved("b", url(B));
         state.record_resolved("c", url(C));
 
-        round(&state, &tx).await;
-        round(&state, &tx).await;
+        // A never completes, so a round cannot wait for it: B and C are
+        // dialled in both rounds, A in the first only.
+        dial_due(&state, &tx);
+        wait_for_dials(&dials, 3).await;
+        dial_due(&state, &tx);
+        let dialled = wait_for_dials(&dials, 5).await;
         assert_eq!(state.in_flight.available_permits(), 3, "A holds one");
-
-        let dialled = dials.lock().unwrap().clone();
         assert_eq!(
             dialled.iter().filter(|u| **u == url(A)).count(),
             1,
@@ -669,7 +685,7 @@ mod tests {
         assert!(!state.try_dial(&tx, &space(), url(A)));
         assert!(!state.record_resolved("echo-again", url(A)));
         assert!(state.urls().is_empty());
-        settle().await;
+        assert_eq!(state.in_flight_count(), 0, "nothing was spawned");
         assert!(dials.lock().unwrap().is_empty());
     }
 
@@ -681,15 +697,11 @@ mod tests {
         state.record_resolved("a", url(A));
         assert!(state.try_dial(&tx, &space(), url(A)));
         let slots = state.in_flight.clone();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_dials(&_dials, 1).await;
         assert_eq!(slots.available_permits(), 0);
 
         drop(state);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            slots.available_permits(),
-            1,
-            "an aborted dial must release its slot"
-        );
+        // An aborted dial must release its slot.
+        wait_until(|| slots.available_permits() == 1).await;
     }
 }

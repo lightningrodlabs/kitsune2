@@ -223,10 +223,13 @@ mod tests {
     use super::*;
     use crate::discovery::Daemon as _;
     use crate::test_support::*;
+    use kitsune2_api::Url;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PEER_A: &str = "ws://a.test:80/peera";
     const PEER_B: &str = "ws://b.test:80/peerb";
     const SELF_URL: &str = "ws://self.test:80/selfpeer";
+    const SENTINEL: &str = "ws://sentinel.test:80/sentinel";
 
     struct Harness {
         daemon: Arc<FakeDaemon>,
@@ -243,6 +246,32 @@ mod tests {
             daemon,
             state,
             _loop_task: loop_task,
+        }
+    }
+
+    impl Harness {
+        /// Prove a negative: everything delivered before this has been
+        /// routed, and any dial it started has been recorded. A sentinel
+        /// record for `entry` is delivered behind the events in question
+        /// and its dial awaited — dial tasks start in the order they were
+        /// spawned — then the sentinel is withdrawn and scrubbed from
+        /// `dials` so the caller sees only the dials it asked about.
+        async fn flushed(&self, entry: &SpaceEntry, dials: &Dials) -> Vec<Url> {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let name =
+                format!("sentinel-{}", N.fetch_add(1, Ordering::Relaxed));
+            self.daemon.deliver(resolved_peer(
+                &name,
+                entry.fingerprint(),
+                SENTINEL,
+            ));
+            wait_until(|| dials.lock().unwrap().contains(&url(SENTINEL))).await;
+            self.daemon.deliver(removed(&name));
+            let fullname = discovery::fullname(SERVICE_TYPE, &name);
+            wait_until(|| !entry.has_record(&fullname)).await;
+            let mut dials = dials.lock().unwrap();
+            dials.retain(|u| u != &url(SENTINEL));
+            dials.clone()
         }
     }
 
@@ -277,10 +306,9 @@ mod tests {
         h.daemon
             .deliver(resolved_peer("peer-3", &test_fp(&[9u8; 32]), PEER_A));
         h.daemon.deliver(resolved("peer-4", &[("url", PEER_A)]));
-        settle().await;
 
-        assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
-        assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
+        assert_eq!(h.flushed(&a, &dials_a).await, vec![url(PEER_A)]);
+        assert_eq!(h.flushed(&b, &dials_b).await, vec![url(PEER_B)]);
     }
 
     #[tokio::test]
@@ -299,32 +327,31 @@ mod tests {
         ));
         h.daemon
             .deliver(resolved_peer("echo", a.fingerprint(), SELF_URL));
-        settle().await;
-        assert!(dials.lock().unwrap().is_empty());
+        assert!(h.flushed(&a, &dials).await.is_empty());
     }
 
     #[tokio::test]
     async fn a_withdrawn_record_is_forgotten() {
         let h = harness();
         let (a, dials) = join(&h, b"space-a");
+        let fullname = discovery::fullname(SERVICE_TYPE, "peer-1");
 
         h.daemon
             .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_A)]);
 
         h.daemon.deliver(removed("peer-1"));
-        settle().await;
-        a.reconcile_from_transport().await;
-        settle().await;
-        assert_eq!(dials.lock().unwrap().len(), 1, "nothing left to redial");
+        wait_until(|| !a.has_record(&fullname)).await;
         assert_eq!(h.state.lock().unwrap().cached_count(), 0);
+        // Nothing is due, so the round starts no dial.
+        a.reconcile_from_transport().await;
+        assert_eq!(a.dials_in_flight(), 0);
+        assert_eq!(dials.lock().unwrap().len(), 1, "nothing left to redial");
 
         // Heard again, it is new again.
         h.daemon
             .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
-        settle().await;
-        assert_eq!(dials.lock().unwrap().len(), 2);
+        assert_eq!(wait_for_dials(&dials, 2).await.len(), 2);
     }
 
     #[tokio::test]
@@ -336,12 +363,12 @@ mod tests {
             .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
         h.daemon
             .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_B));
-        settle().await;
+        wait_for_dials(&dials, 2).await;
         dials.lock().unwrap().clear();
 
+        // Only B is still announced, so only B can be due.
         a.reconcile_from_transport().await;
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_B)]);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_B)]);
     }
 
     /// A record name that re-resolves under another fingerprint has left
@@ -351,27 +378,27 @@ mod tests {
         let h = harness();
         let (a, dials_a) = join(&h, b"space-a");
         let (b, dials_b) = join(&h, b"space-bb");
+        let fullname = discovery::fullname(SERVICE_TYPE, "peer-1");
 
         h.daemon
             .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
-        settle().await;
-        assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials_a, 1).await, vec![url(PEER_A)]);
 
         h.daemon
             .deliver(resolved_peer("peer-1", b.fingerprint(), PEER_A));
-        settle().await;
-        assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials_b, 1).await, vec![url(PEER_A)]);
+        wait_until(|| !a.has_record(&fullname)).await;
         dials_a.lock().unwrap().clear();
 
         // A has nothing left to redial; the removal reaches B only.
         a.reconcile_from_transport().await;
-        settle().await;
+        assert_eq!(a.dials_in_flight(), 0);
         assert!(dials_a.lock().unwrap().is_empty());
 
         h.daemon.deliver(removed("peer-1"));
-        settle().await;
+        wait_until(|| !b.has_record(&fullname)).await;
         b.reconcile_from_transport().await;
-        settle().await;
+        assert_eq!(b.dials_in_flight(), 0);
         assert_eq!(dials_b.lock().unwrap().len(), 1, "B forgot the record");
     }
 
@@ -386,10 +413,12 @@ mod tests {
             .deliver(resolved_peer("peer-1", a.fingerprint(), PEER_A));
         h.daemon
             .deliver(resolved_peer("peer-2", b.fingerprint(), PEER_B));
-        settle().await;
 
+        // Events are routed in order: by the time B's dial is seen, A's
+        // record has been dropped for want of a space.
+        assert_eq!(wait_for_dials(&dials_b, 1).await, vec![url(PEER_B)]);
         assert!(dials_a.lock().unwrap().is_empty());
-        assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
+        assert!(!a.has_record(&discovery::fullname(SERVICE_TYPE, "peer-1")));
     }
 
     /// A space created after a LAN peer's record was resolved is replayed
@@ -401,12 +430,10 @@ mod tests {
         h.daemon.deliver(resolved_peer("peer-1", &fp, PEER_A));
         h.daemon
             .deliver(resolved_peer("peer-2", &test_fp(b"other"), PEER_B));
-        settle().await;
-        assert_eq!(h.state.lock().unwrap().cached_count(), 2);
+        wait_until(|| h.state.lock().unwrap().cached_count() == 2).await;
 
         let (_a, dials_a) = join(&h, b"space-a");
-        settle().await;
-        assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials_a, 1).await, vec![url(PEER_A)]);
     }
 
     fn fill(state: &mut BrowseState, fp: &str, prefix: &str, n: usize) {

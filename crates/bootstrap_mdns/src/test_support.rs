@@ -9,7 +9,6 @@ use kitsune2_api::{
 };
 use mdns_sd::{ServiceEvent, ServiceInfo};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub const SERVICE_TYPE: &str = "_k2test._udp.local.";
 
@@ -19,11 +18,6 @@ pub fn url(s: &str) -> Url {
 
 pub fn space_id(bytes: &[u8]) -> SpaceId {
     SpaceId::from(bytes::Bytes::copy_from_slice(bytes))
-}
-
-/// Long enough for spawned dial tasks and browse-loop routing to run.
-pub async fn settle() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 /// Every URL a recording transport was asked to dial, in order.
@@ -81,22 +75,13 @@ pub fn blocking_transport(
     release: Arc<tokio::sync::Notify>,
     connected: Vec<Url>,
 ) -> (DynTransport, Dials) {
-    let dials: Dials = Arc::new(Mutex::new(Vec::new()));
-    let record = dials.clone();
-    let mut mock = MockTransport::new();
-    mock.expect_dial().returning(move |_space, url| {
-        record.lock().unwrap().push(url);
+    transport_with(connected, move |_| {
         let release = release.clone();
-        Box::pin(async move {
+        async move {
             release.notified().await;
             Ok(DialOutcome::Connected)
-        })
-    });
-    mock.expect_get_connected_peers().returning(move || {
-        let connected = connected.clone();
-        Box::pin(async move { Ok(connected) })
-    });
-    (Arc::new(mock), dials)
+        }
+    })
 }
 
 /// A resolved-service event as `mdns-sd` would deliver it for an
@@ -166,6 +151,13 @@ impl FakeDaemon {
     /// Deliver a browse event as if the LAN had produced it.
     pub fn deliver(&self, event: ServiceEvent) {
         self.events.send(event).unwrap();
+    }
+
+    /// Whether the browse loop has taken every delivered event. The loop
+    /// handles an event without yielding, so on the test runtime this
+    /// means every event has been handled too.
+    pub fn drained(&self) -> bool {
+        self.browse_rx.is_empty()
     }
 }
 

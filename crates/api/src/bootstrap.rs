@@ -22,6 +22,16 @@ pub trait Bootstrap: 'static + Send + Sync + std::fmt::Debug {
 /// Trait-object [Bootstrap].
 pub type DynBootstrap = Arc<dyn Bootstrap>;
 
+/// A [`Bootstrap`] that accepts puts and does nothing with them: the
+/// stand-in for a bootstrap that is switched off, could not start, or is
+/// not wanted in a test, so that a builder stack stays uniform.
+#[derive(Debug)]
+pub struct NoopBootstrap;
+
+impl Bootstrap for NoopBootstrap {
+    fn put(&self, _info: Arc<AgentInfoSigned>) {}
+}
+
 /// A factory for constructing Bootstrap instances.
 pub trait BootstrapFactory: 'static + Send + Sync + std::fmt::Debug {
     /// Help the builder construct a default config from the chosen

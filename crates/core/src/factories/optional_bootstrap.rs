@@ -78,13 +78,5 @@ impl BootstrapFactory for OptionalBootstrapFactory {
     }
 }
 
-/// What a space gets in place of the bootstrap that could not start.
-#[derive(Debug)]
-struct NoopBootstrap;
-
-impl Bootstrap for NoopBootstrap {
-    fn put(&self, _info: Arc<AgentInfoSigned>) {}
-}
-
 #[cfg(test)]
 mod test;
