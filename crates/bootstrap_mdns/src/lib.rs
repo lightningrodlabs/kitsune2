@@ -23,17 +23,24 @@
 //!
 //! ## Wiring
 //!
-//! The factory reports honestly when its daemon cannot start. Whether a
-//! space may run without LAN discovery is decided where the bootstrap stack
-//! is assembled, and the intended wiring — the one Holochain uses — makes
-//! the WAN bootstrap mandatory and the LAN one optional:
+//! A daemon that cannot start when a space is created — no network yet,
+//! no multicast on this interface — is the host's condition of the
+//! moment, so the space still gets a bootstrap: one that retries the join
+//! on every `put`, and agent infos are re-signed periodically. Composing
+//! the factory next to the WAN bootstrap is therefore all the daemon
+//! case needs:
 //!
 //! ```ignore
 //! CompositeBootstrapFactory::create(vec![
 //!     CoreBootstrapFactory::create(),
-//!     OptionalBootstrapFactory::create(MdnsBootstrapFactory::create()),
+//!     MdnsBootstrapFactory::create(),
 //! ])
 //! ```
+//!
+//! A fingerprint that cannot be derived is a misconfiguration of the
+//! space, and `create` fails on it. An embedder that would rather run
+//! such a space without LAN discovery wraps the factory in
+//! `OptionalBootstrapFactory`, which turns that error into a no-op.
 //!
 //! One factory keeps one mDNS daemon per service type, shared by every
 //! space announcing under it: one browse, one reconciliation ticker, one

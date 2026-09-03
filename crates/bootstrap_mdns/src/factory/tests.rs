@@ -5,6 +5,7 @@ use super::*;
 use crate::test_support::*;
 use kitsune2_test_utils::agent::{AgentBuilder, TestLocalAgent};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const PEER_A: &str = "ws://a.test:80/peera";
 const PEER_B: &str = "ws://b.test:80/peerb";
@@ -45,9 +46,11 @@ fn builder_with(
     Arc::new(builder)
 }
 
-/// A harness whose daemon-start hook runs `start`.
-fn harness_with(
+/// A harness whose daemon-start hook runs `start`, and whose failed
+/// starts are retried after `retry`.
+fn harness_with_retry(
     cfg: MdnsBootstrapConfig,
+    retry: Duration,
     start: impl Fn(&str, &Arc<FakeDaemon>) -> K2Result<DynDaemon>
     + Send
     + Sync
@@ -58,12 +61,13 @@ fn harness_with(
     let factory = {
         let daemon = daemon.clone();
         let starts = starts.clone();
-        Arc::new(MdnsBootstrapFactory::with_daemon_start(Arc::new(
-            move |service_type| {
+        Arc::new(MdnsBootstrapFactory::with_daemon_start_and_retry(
+            Arc::new(move |service_type| {
                 starts.lock().unwrap().push(service_type.to_string());
                 start(service_type, &daemon)
-            },
-        )))
+            }),
+            retry,
+        ))
     };
     let builder = builder_with(&factory, cfg);
     Harness {
@@ -74,6 +78,17 @@ fn harness_with(
     }
 }
 
+/// A harness whose daemon-start hook runs `start`.
+fn harness_with(
+    cfg: MdnsBootstrapConfig,
+    start: impl Fn(&str, &Arc<FakeDaemon>) -> K2Result<DynDaemon>
+    + Send
+    + Sync
+    + 'static,
+) -> Harness {
+    harness_with_retry(cfg, FAILED_START_RETRY, start)
+}
+
 fn harness(cfg: MdnsBootstrapConfig) -> Harness {
     harness_with(cfg, |_, daemon| Ok(daemon.clone() as DynDaemon))
 }
@@ -82,6 +97,18 @@ fn harness(cfg: MdnsBootstrapConfig) -> Harness {
 fn failing_harness() -> Harness {
     harness_with(enabled(), |_, _| {
         Err(K2Error::other("no multicast on this host"))
+    })
+}
+
+/// A harness whose daemon starts only once `ready` is set, and which
+/// retries a failed start on every attempt.
+fn harness_ready_when(ready: Arc<AtomicBool>) -> Harness {
+    harness_with_retry(enabled(), Duration::ZERO, move |_, daemon| {
+        if ready.load(Ordering::Relaxed) {
+            Ok(daemon.clone() as DynDaemon)
+        } else {
+            Err(K2Error::other("no network yet"))
+        }
     })
 }
 
@@ -302,38 +329,90 @@ async fn a_space_created_later_hears_records_resolved_before_it() {
     assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
 }
 
-/// A daemon that cannot start is reported as the error it is; making the
-/// LAN path optional is the wrapping factory's job.
+/// A daemon that cannot start is the host's condition, not the space's
+/// misconfiguration: the space still gets a bootstrap, one that has not
+/// joined anything yet.
 #[tokio::test]
-async fn a_failing_daemon_start_fails_create() {
+async fn a_failing_daemon_start_still_yields_a_bootstrap() {
     let h = failing_harness();
 
-    let (boot, _, _) =
+    let (boot, space_a, _) =
         try_create_space(&h, &h.builder, b"space-a", vec![]).await;
-    let err = boot.expect_err("a daemon that cannot start fails the create");
-    assert!(err.to_string().contains("no multicast"), "{err}");
+    let boot =
+        boot.expect("a daemon that cannot start does not fail the space");
     assert_eq!(h.start_count(), 1);
     assert!(h.factory.shared_for(SERVICE_TYPE).is_none());
+
+    // Nothing to announce on: the put is remembered as a reason to retry,
+    // not as a record.
+    put(&boot, &space_a, &url(SELF_URL));
+    assert!(h.daemon.registered.lock().unwrap().is_empty());
 }
 
 /// Fifty spaces created on a host without multicast must not cost fifty
-/// daemon start attempts: the failure is remembered for a while.
+/// daemon start attempts, and neither must their puts: the failure is
+/// remembered for a while.
 #[tokio::test]
 async fn a_failed_start_is_not_retried_within_the_window() {
     let h = failing_harness();
 
-    let (first, _, _) =
+    let (first, space_a, _) =
         try_create_space(&h, &h.builder, b"space-a", vec![]).await;
     let (second, _, _) =
         try_create_space(&h, &h.builder, b"space-b", vec![]).await;
-    assert!(first.is_err());
-    let err = second.expect_err("still failing").to_string();
-    assert!(err.contains("not retrying yet"), "{err}");
-    assert!(
-        err.contains("no multicast"),
-        "the original error is kept: {err}"
-    );
+    let first = first.unwrap();
+    second.unwrap();
     assert_eq!(h.start_count(), 1, "one start attempt for both spaces");
+
+    put(&first, &space_a, &url(SELF_URL));
+    tokio::task::yield_now().await;
+    assert_eq!(h.start_count(), 1, "a put inside the window does not retry");
+    assert!(h.factory.shared_for(SERVICE_TYPE).is_none());
+}
+
+/// A space created while the daemon could not start joins it from a
+/// later put once it can: agent infos are re-signed periodically, so the
+/// puts keep coming, and the join announces the URL from that put and
+/// replays what the LAN said meanwhile.
+#[tokio::test]
+async fn a_detached_space_joins_on_a_later_put_once_the_daemon_starts() {
+    let ready = Arc::new(AtomicBool::new(false));
+    let h = harness_ready_when(ready.clone());
+
+    let (boot, space_a, dials) = create_space(&h, b"space-a", vec![]).await;
+    assert_eq!(h.start_count(), 1);
+    assert!(h.factory.shared_for(SERVICE_TYPE).is_none());
+
+    put(&boot, &space_a, &url(SELF_URL));
+    wait_until(|| h.start_count() == 2).await;
+    tokio::task::yield_now().await;
+    assert!(
+        h.factory.shared_for(SERVICE_TYPE).is_none(),
+        "still failing"
+    );
+    assert!(h.daemon.registered.lock().unwrap().is_empty());
+
+    ready.store(true, Ordering::Relaxed);
+    h.daemon.deliver(resolved_peer(
+        "peer-1",
+        &fp_of(&h, &space_a).await,
+        PEER_A,
+    ));
+    put(&boot, &space_a, &url(SELF_URL));
+    wait_until(|| h.factory.shared_for(SERVICE_TYPE).is_some()).await;
+    assert_eq!(h.start_count(), 3);
+    assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 1);
+    wait_until(|| h.daemon.registered.lock().unwrap().len() == 1).await;
+    // The record arrives around the first put, so it may be dialled both
+    // on arrival and by that put's reconciliation; what matters is that
+    // it is dialled at all, and nothing else is.
+    let dials = wait_for_dials(&dials, 1).await;
+    assert!(dials.iter().all(|u| u == &url(PEER_A)), "{dials:?}");
+
+    // The joined space leaves like any other.
+    drop(boot);
+    assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 0);
+    assert_eq!(h.daemon.unregistered.lock().unwrap().len(), 1);
 }
 
 /// A space whose config names another service type gets a daemon of its

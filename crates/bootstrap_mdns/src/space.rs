@@ -43,11 +43,6 @@ impl SpaceEntry {
         })
     }
 
-    /// The space this entry belongs to.
-    pub fn space_id(&self) -> &SpaceId {
-        &self.space_id
-    }
-
     /// The commitment this space announces and matches on.
     pub fn fingerprint(&self) -> &SpaceFingerprint {
         &self.fp
