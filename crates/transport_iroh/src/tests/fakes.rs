@@ -210,6 +210,7 @@ pub(super) fn build_transport(
         watch_addr_task: noop_handle(),
         accept_task: noop_handle(),
         relay_keepalive_task: None,
+        lan_rebind_task: None,
         space_relay_keepalives: Arc::new(Mutex::new(HashMap::new())),
         config,
         space_relays: Arc::new(RwLock::new(HashMap::new())),

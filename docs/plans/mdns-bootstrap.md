@@ -176,6 +176,12 @@ a relay.
 
 ## Known limitations
 
+- iroh's mDNS lookup joins the multicast group once, on the interfaces
+  present when it is built. `transport_iroh` watches the endpoint's local
+  IP set and rebuilds the lookup after a debounced change (one second), so
+  an interface that appears after start is joined without a restart. The
+  rebuild replaces the endpoint's service list, which is sound only while
+  the mDNS lookup is the transport's sole address-lookup service.
 - The early URL announce (`transport_iroh`, on `enable_lan_discovery`)
   derives the peer URL from the global `relay_url` alone. Per-space relays
   get their URL from the relay handshake, so a space on a per-space relay
