@@ -215,18 +215,17 @@ async fn a_record_for_one_space_never_dials_for_another() {
     let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
     put(&boot_a, &space_a, &url(SELF_URL));
     put(&boot_b, &space_b, &url(SELF_URL));
-    // The first put reconciles what was heard so far (nothing yet); let
-    // that run before the LAN speaks, so each record is dialled once.
-    settle().await;
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
         &fp_of(&h, &space_a).await,
         PEER_A,
     ));
-    settle().await;
 
-    assert_eq!(*dials_a.lock().unwrap(), vec![url(PEER_A)]);
+    // Routing is by fingerprint, so B never holds the record and can
+    // never dial it, however many rounds run.
+    let dials = wait_for_dials(&dials_a, 1).await;
+    assert!(dials.iter().all(|u| u == &url(PEER_A)), "{dials:?}");
     assert!(dials_b.lock().unwrap().is_empty());
 }
 
@@ -237,7 +236,6 @@ async fn dropping_one_space_leaves_the_other_browsing() {
     let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
     put(&boot_a, &space_a, &url(SELF_URL));
     put(&boot_b, &space_b, &url(SELF_URL));
-    settle().await;
 
     drop(boot_a);
     assert_eq!(h.factory.shared_for(SERVICE_TYPE).unwrap().space_count(), 1);
@@ -257,10 +255,11 @@ async fn dropping_one_space_leaves_the_other_browsing() {
         &fp_of(&h, &space_b).await,
         PEER_B,
     ));
-    settle().await;
 
+    // Events are routed in order: by the time B's dial is seen, A's
+    // record has been dropped for want of a registered space.
+    assert_eq!(wait_for_dials(&dials_b, 1).await, vec![url(PEER_B)]);
     assert!(dials_a.lock().unwrap().is_empty());
-    assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
 }
 
 #[tokio::test]
@@ -271,21 +270,15 @@ async fn unconnected_peers_are_redialled_on_the_interval() {
     });
     let (boot, space_a, dials) = create_space(&h, b"space-a", vec![]).await;
     put(&boot, &space_a, &url(SELF_URL));
-    settle().await;
 
     h.daemon.deliver(resolved_peer(
         "peer-1",
         &fp_of(&h, &space_a).await,
         PEER_A,
     ));
-    settle().await;
-    let first = dials.lock().unwrap().len();
-    assert!(first >= 1, "the announcement is dialled on arrival");
-
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let count = dials.lock().unwrap().len();
-    assert!(count > first, "expected redials, saw {count} dials");
-    assert!(dials.lock().unwrap().iter().all(|u| u == &url(PEER_A)));
+    // Dialled on arrival, then again by the ticker while unconnected.
+    let dials = wait_for_dials(&dials, 3).await;
+    assert!(dials.iter().all(|u| u == &url(PEER_A)), "{dials:?}");
 }
 
 /// A record heard before the space's first put is dialled by that put:
@@ -301,12 +294,13 @@ async fn the_first_put_dials_what_was_heard_before_it() {
         &fp_of(&h, &space_a).await,
         PEER_A,
     ));
-    settle().await;
+    wait_until(|| h.daemon.drained()).await;
     assert!(dials.lock().unwrap().is_empty(), "not dialable yet");
 
+    // The put's reconciliation is the only thing that can dial here, and
+    // it dials the record once.
     put(&boot, &space_a, &url(SELF_URL));
-    settle().await;
-    assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+    assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_A)]);
 }
 
 /// A space created after the LAN peer's record was resolved still hears
@@ -321,12 +315,14 @@ async fn a_space_created_later_hears_records_resolved_before_it() {
         &fp_of(&h, &space_b).await,
         PEER_B,
     ));
-    settle().await;
+    wait_until(|| h.daemon.drained()).await;
 
     let (boot_b, space_b, dials_b) = create_space(&h, b"space-b", vec![]).await;
     put(&boot_b, &space_b, &url(SELF_URL));
-    settle().await;
-    assert_eq!(*dials_b.lock().unwrap(), vec![url(PEER_B)]);
+    // Replayed on join, then dialled by the put's reconciliation: at
+    // least once, and nothing but the replayed record.
+    let dials = wait_for_dials(&dials_b, 1).await;
+    assert!(dials.iter().all(|u| u == &url(PEER_B)), "{dials:?}");
 }
 
 /// A daemon that cannot start is the host's condition, not the space's

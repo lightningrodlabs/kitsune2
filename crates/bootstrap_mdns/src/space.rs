@@ -15,6 +15,9 @@ pub struct SpaceEntry {
     space_id: SpaceId,
     fp: SpaceFingerprint,
     instance: String,
+    /// Full mDNS name of this space's own record, compared against every
+    /// record the LAN resolves.
+    fullname: String,
     daemon: DynDaemon,
     tx: DynTransport,
     /// The peer URL currently announced for this space, if any.
@@ -32,10 +35,12 @@ impl SpaceEntry {
         tx: DynTransport,
         max_concurrent_dials: usize,
     ) -> Arc<Self> {
+        let instance = discovery::random_name();
         Arc::new(Self {
             space_id,
             fp,
-            instance: discovery::random_name(),
+            fullname: discovery::fullname(daemon.service_type(), &instance),
+            instance,
             daemon,
             tx,
             advertised: Mutex::new(None),
@@ -49,8 +54,8 @@ impl SpaceEntry {
     }
 
     /// Full mDNS name of this space's own record.
-    pub fn fullname(&self) -> String {
-        discovery::fullname(self.daemon.service_type(), &self.instance)
+    pub fn fullname(&self) -> &str {
+        &self.fullname
     }
 
     /// The peer URL currently announced for this space.
@@ -90,7 +95,7 @@ impl SpaceEntry {
         if advertised.take().is_some()
             && let Err(err) = self.daemon.unregister(&self.instance)
         {
-            debug!(?err, fullname = %self.fullname(), "mdns: failed to withdraw record");
+            debug!(?err, fullname = %self.fullname, "mdns: failed to withdraw record");
         }
     }
 
@@ -102,6 +107,12 @@ impl SpaceEntry {
     /// Whether this space holds a record of that name.
     pub fn has_record(&self, fullname: &str) -> bool {
         self.announced.has_record(fullname)
+    }
+
+    /// How many dials this space has in flight.
+    #[cfg(test)]
+    pub fn dials_in_flight(&self) -> usize {
+        self.announced.in_flight_count()
     }
 
     /// Whether this node can be dialled back yet. Until a local agent has
@@ -116,7 +127,7 @@ impl SpaceEntry {
     /// before waits for the next reconciliation, which only dials it if it
     /// is still unconnected. Our own record and our own URL are neither.
     pub fn record_resolved(&self, fullname: &str, url: Url) {
-        if fullname == self.fullname() {
+        if fullname == self.fullname {
             return;
         }
         if !self.announced.record_resolved(fullname, url.clone()) {
@@ -205,12 +216,14 @@ mod tests {
         entry.record_resolved("r1", url(PEER_A));
         entry.record_resolved("r1", url(PEER_A));
         entry.record_resolved("r2", url(PEER_A));
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_A)]);
+        wait_until(|| entry.dials_in_flight() == 0).await;
 
         entry.reconcile_from_transport().await;
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A), url(PEER_A)]);
+        assert_eq!(
+            wait_for_dials(&dials, 2).await,
+            vec![url(PEER_A), url(PEER_A)]
+        );
     }
 
     /// Before the space has a URL of its own it is not dialable back and
@@ -223,13 +236,12 @@ mod tests {
 
         entry.record_resolved("r1", url(PEER_A));
         entry.reconcile_from_transport().await;
-        settle().await;
+        assert_eq!(entry.dials_in_flight(), 0, "nothing was started");
         assert!(dials.lock().unwrap().is_empty());
 
         assert!(entry.advertise(&url(SELF_URL)).unwrap(), "first url");
         entry.reconcile_soon();
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_A)]);
 
         assert!(!entry.advertise(&url(PEER_B)).unwrap(), "a later url");
     }
@@ -241,19 +253,20 @@ mod tests {
 
         entry.record_resolved("r1", url(PEER_A));
         entry.record_resolved("r2", url(PEER_B));
-        settle().await;
+        wait_for_dials(&dials, 2).await;
+        wait_until(|| entry.dials_in_flight() == 0).await;
         dials.lock().unwrap().clear();
 
         // A is connected, B is not: only B is redialled.
         entry.reconcile_from_transport().await;
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_B)]);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_B)]);
+        wait_until(|| entry.dials_in_flight() == 0).await;
         dials.lock().unwrap().clear();
 
         // Once the LAN withdraws B, nothing is left to redial.
         entry.record_removed("r2");
         entry.reconcile_from_transport().await;
-        settle().await;
+        assert_eq!(entry.dials_in_flight(), 0, "nothing was started");
         assert!(dials.lock().unwrap().is_empty());
     }
 
@@ -268,20 +281,20 @@ mod tests {
 
         entry.record_resolved("r1", url(PEER_A));
         entry.record_resolved("r2", url(PEER_B));
-        settle().await;
-        assert_eq!(*dials.lock().unwrap(), vec![url(PEER_A)]);
+        assert_eq!(wait_for_dials(&dials, 1).await, vec![url(PEER_A)]);
 
         // The round finds the slot still taken by A's dial.
         entry.reconcile_from_transport().await;
-        settle().await;
+        assert_eq!(entry.dials_in_flight(), 1, "only A's dial");
         assert_eq!(dials.lock().unwrap().len(), 1);
 
         release.notify_one();
-        settle().await;
+        wait_until(|| entry.dials_in_flight() == 0).await;
         entry.reconcile_from_transport().await;
-        settle().await;
-        assert_eq!(dials.lock().unwrap().len(), 2);
-        assert!(dials.lock().unwrap().contains(&url(PEER_B)));
+        assert_eq!(
+            wait_for_dials(&dials, 2).await,
+            vec![url(PEER_A), url(PEER_B)]
+        );
     }
 
     #[tokio::test]
@@ -294,12 +307,12 @@ mod tests {
         assert!(entry.has_record("echo"));
         entry.advertise(&url(SELF_URL)).unwrap();
         assert!(!entry.has_record("echo"), "forgotten once known as ours");
-        entry.record_resolved(&entry.fullname(), url(PEER_A));
+        entry.record_resolved(entry.fullname(), url(PEER_A));
         entry.record_resolved("echo-again", url(SELF_URL));
         assert!(!entry.has_record("echo-again"));
         assert!(!entry.has_announcements());
         entry.reconcile_from_transport().await;
-        settle().await;
+        assert_eq!(entry.dials_in_flight(), 0, "nothing was started");
         assert!(dials.lock().unwrap().is_empty());
     }
 
@@ -318,7 +331,7 @@ mod tests {
         assert!(daemon.unregistered.lock().unwrap().is_empty());
         // Neither an echo of our URL nor our own record is recorded.
         entry.record_resolved("someone-else", url(PEER_A));
-        entry.record_resolved(&entry.fullname(), url(PEER_B));
+        entry.record_resolved(entry.fullname(), url(PEER_B));
         assert!(!entry.has_announcements());
         entry.record_resolved("someone-else", url(PEER_B));
         assert!(entry.has_record("someone-else"));

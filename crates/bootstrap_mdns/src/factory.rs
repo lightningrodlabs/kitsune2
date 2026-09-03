@@ -263,7 +263,8 @@ impl BootstrapFactory for MdnsBootstrapFactory {
                 builder.config.get_module_config()?;
             let cfg = cfg.mdns_bootstrap;
             if !cfg.enabled {
-                return Ok(noop());
+                let out: DynBootstrap = Arc::new(NoopBootstrap);
+                return Ok(out);
             }
             // A fingerprint that cannot be derived is a misconfiguration
             // of the space, and the space should know. A daemon that
@@ -286,20 +287,6 @@ impl BootstrapFactory for MdnsBootstrapFactory {
             Ok(out)
         })
     }
-}
-
-/// What a space gets while mDNS discovery is switched off in config: a
-/// bootstrap that accepts puts and does nothing, so the builder stack
-/// stays uniform.
-fn noop() -> DynBootstrap {
-    #[derive(Debug)]
-    struct DisabledMdnsBootstrap;
-
-    impl Bootstrap for DisabledMdnsBootstrap {
-        fn put(&self, _info: Arc<AgentInfoSigned>) {}
-    }
-
-    Arc::new(DisabledMdnsBootstrap)
 }
 
 /// One space's membership of the shared mDNS presence.
