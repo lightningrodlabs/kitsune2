@@ -19,7 +19,9 @@ someone else's job.
    and the daemon fills in and maintains the host's interface addresses.
    The record is replaced when the URL changes. All spaces of one factory
    that announce under the same `serviceType` share one daemon, one
-   browse, one reconciliation ticker and one hostname.
+   browse, one reconciliation ticker and one hostname. A space created
+   while the daemon cannot start joins it from a later put once it can;
+   a failed start is not tried again for a minute.
 2. **Browse.** Every resolved record that carries our fingerprint and a
    parseable peer URL — and is not our own instance or our own URL — is a
    candidate. Records are tracked by name, so a restarted peer whose old
@@ -71,20 +73,25 @@ signature, and carries no wire protocol of its own.
 ```rust
 use kitsune2_api::DynBootstrapFactory;
 use kitsune2_bootstrap_mdns::MdnsBootstrapFactory;
-use kitsune2_core::factories::{
-    CompositeBootstrapFactory, CoreBootstrapFactory, OptionalBootstrapFactory,
-};
+use kitsune2_core::factories::{CompositeBootstrapFactory, CoreBootstrapFactory};
 
 // Run WAN bootstrap and LAN mDNS discovery side by side. `put` fans out
-// to both. The mDNS factory fails honestly when its daemon cannot start;
-// the `Optional` wrapper is what turns that into a warning and a no-op
-// for the space, so the WAN bootstrap carries on alone. This is the
-// intended wiring, and the one Holochain uses.
+// to both. A daemon that cannot start when a space is created (no
+// network yet, no multicast on the interface) does not cost the space
+// anything: the mDNS bootstrap stays detached and retries the join on
+// later puts, which keep coming as agent infos are re-signed. This is
+// the intended wiring, and the one Holochain uses.
 let bootstrap: DynBootstrapFactory = CompositeBootstrapFactory::create(vec![
     CoreBootstrapFactory::create(),
-    OptionalBootstrapFactory::create(MdnsBootstrapFactory::create()),
+    MdnsBootstrapFactory::create(),
 ]);
 ```
+
+A fingerprint that cannot be derived from the space secret is a
+misconfiguration, and `create` fails on it. An embedder that would rather
+run such a space without LAN discovery wraps the factory in
+`OptionalBootstrapFactory::create(MdnsBootstrapFactory::create())`, which
+turns that error into a warning and a no-op.
 
 Then enable discovery in config (disabled by default):
 

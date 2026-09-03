@@ -29,6 +29,22 @@ pub async fn settle() {
 /// Every URL a recording transport was asked to dial, in order.
 pub type Dials = Arc<Mutex<Vec<Url>>>;
 
+/// Poll until `cond` holds, failing the test if it does not within two
+/// seconds.
+pub async fn wait_until(cond: impl Fn() -> bool) {
+    kitsune2_test_utils::iter_check!(2000, 5, {
+        if cond() {
+            break;
+        }
+    });
+}
+
+/// Poll until at least `n` dials were recorded, then return them all.
+pub async fn wait_for_dials(dials: &Dials, n: usize) -> Vec<Url> {
+    wait_until(|| dials.lock().unwrap().len() >= n).await;
+    dials.lock().unwrap().clone()
+}
+
 /// A transport recording its dials, each answered as connected, and
 /// reporting `connected` as its open connections.
 pub fn recording_transport(connected: Vec<Url>) -> (DynTransport, Dials) {

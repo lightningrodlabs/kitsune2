@@ -20,13 +20,14 @@ Branch: `feat/mdns-bootstrap-hello` (based on the hello access module line)
   `BootstrapFactory`s over one peer store; an inner factory that fails
   fails the space, as it would alone, and an empty composite is an error.
   `OptionalBootstrapFactory` wraps a factory whose failure to start the
-  space may survive: a warning and a no-op bootstrap. The intended
-  wiring, which Holochain uses, is
-  `Composite([Core, Optional(Mdns)])`.
+  space may survive: a warning and a no-op bootstrap.
 - `crates/bootstrap_mdns` — `MdnsBootstrapFactory`: announce the space
   fingerprint and our peer URL, browse for the same, `dial` what matches.
-  Fails honestly when the daemon cannot start; whether that is fatal is
-  the wrapper's call.
+  A daemon that cannot start leaves the space detached, retrying the join
+  on later puts; a fingerprint that cannot be derived fails `create`. The
+  intended wiring, which Holochain uses, is `Composite([Core, Mdns])`;
+  `Optional(Mdns)` is for embedders that want the derive error tolerated
+  too.
 - `crates/kitsune2/tests/mdns_lan.rs` (feature `mdns`, gated on
   `KITSUNE2_LAN_TEST=1`) — two production-wired nodes, unreachable relay,
   no bootstrap server, each ends up with the other's agent info.
@@ -113,7 +114,10 @@ One `mdns-sd` daemon per factory per service type serves every space
 announcing under it: one browse, one reconciliation ticker, one hostname,
 and a registry that routes each resolved record to the space whose
 fingerprint it carries. A daemon that fails to start is not retried for a
-minute, so many spaces created together cost one attempt.
+minute, so many spaces created together cost one attempt; each of those
+spaces stays detached and tries to join again on its later puts, so a host
+that gains a network after its spaces were created recovers LAN discovery
+without recreating them.
 
 Records are tracked by name per space, so a restarted peer whose old record
 lingers next to its new one stays known until both are gone. The browse
