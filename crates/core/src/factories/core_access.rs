@@ -303,7 +303,9 @@ mod test {
 
     /// Discovery can return a current endpoint together with another peer's
     /// stale cached advertisement for the same agent. Batch order must not
-    /// leave the current endpoint without an access decision.
+    /// leave the current endpoint blocked. Storing an agent info never grants
+    /// access on its own: the endpoint stays undecided until the peer proves
+    /// knowledge of the space secret to the access module.
     #[tokio::test]
     async fn stale_endpoint_batch_preserves_peer_access() {
         let old_url = make_url("old");
@@ -353,12 +355,12 @@ mod test {
                     .unwrap()
                     .is_empty()
             );
-            assert_eq!(
+            assert_ne!(
                 access_state
                     .get_access_decision(new_url.clone())
                     .unwrap()
                     .map(|d| d.decision),
-                Some(AccessDecision::Granted)
+                Some(AccessDecision::Blocked)
             );
 
             // A later replay must preserve the same consistency.
