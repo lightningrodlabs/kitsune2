@@ -232,7 +232,9 @@ mod endpoint;
 mod lan_discovery;
 mod stream;
 use connection_context::*;
-use connection_registry::{ConnectionRegistry, ConnectionResolution, RegistryEntry};
+use connection_registry::{
+    ConnectionRegistry, ConnectionResolution, RegistryEntry,
+};
 #[cfg(feature = "metrics")]
 mod metrics;
 

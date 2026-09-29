@@ -2525,9 +2525,9 @@ dependencies = [
 
 [[package]]
 name = "kitsune2_bootstrap_mdns"
-version = "0.6.0-dev.0"
+version = "0.6.0-dev.2"
 dependencies = [
- "base64 0.23.0",
+ "base64 0.23.1",
  "bytes",
  "flume",
  "kitsune2_api",
@@ -4919,7 +4919,7 @@ dependencies = [
  "hickory-proto",
  "rand 0.10.2",
  "socket2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]

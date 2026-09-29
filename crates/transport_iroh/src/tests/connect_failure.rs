@@ -6,9 +6,9 @@
 //! that are difficult to trigger reproducibly via the real iroh stack.
 
 use super::fakes::*;
+use super::support::{build_recording_handler, remote_url};
 use crate::connection::DynConnection;
 use crate::endpoint::{DynIrohEndpoint, Endpoint, EndpointAddrWatcher};
-use super::support::{build_recording_handler, remote_url};
 use crate::url::endpoint_from_url;
 use crate::{IrohTransport, IrohTransportConfig};
 use bytes::Bytes;
@@ -730,9 +730,7 @@ mod preflight_timeout {
                 "pending sends must finish when the preflight deadline expires",
             );
 
-            assert!(
-                self.transport.connections.get(&remote_url()).is_none()
-            );
+            assert!(self.transport.connections.get(&remote_url()).is_none());
             assert_eq!(
                 self.recorder.unresponsive_calls.lock().unwrap().len(),
                 1
@@ -835,7 +833,9 @@ mod preflight_timeout {
 /// connections map already holds a live connection for the URL.
 #[tokio::test]
 async fn a_live_connection_spares_the_peer_the_unresponsive_mark() {
-    use crate::connection_context::{ConnectionContext, ConnectionContextParams};
+    use crate::connection_context::{
+        ConnectionContext, ConnectionContextParams,
+    };
 
     let recorder = build_recording_handler();
     let calls = recorder.unresponsive_calls.clone();
