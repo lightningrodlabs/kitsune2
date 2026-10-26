@@ -63,7 +63,7 @@ impl std::fmt::Debug for Ed25519LocalAgent {
 
 impl Default for Ed25519LocalAgent {
     fn default() -> Self {
-        Self::new(ed25519_dalek::SigningKey::generate(&mut rand::thread_rng()))
+        Self::new(ed25519_dalek::SigningKey::generate(&mut rand::rng()))
     }
 }
 
@@ -154,6 +154,7 @@ impl LocalAgent for Ed25519LocalAgent {
 /// - `publish` - The default publish module is [factories::CorePublishFactory].
 /// - `blocks` - The default blocks module is [factories::MemBlocksFactory].
 /// - `known_peers` - The default known-peers index is [factories::CoreKnownPeersFactory].
+/// - `space_secret` - The default space secret is [factories::CoreSpaceSecretFactory].
 pub fn default_test_builder() -> Builder {
     Builder {
         config: Config::default(),
@@ -174,6 +175,7 @@ pub fn default_test_builder() -> Builder {
         publish: factories::CorePublishFactory::create(),
         blocks: factories::MemBlocksFactory::create(),
         known_peers: factories::CoreKnownPeersFactory::create(),
+        space_secret: factories::CoreSpaceSecretFactory::create(),
     }
 }
 

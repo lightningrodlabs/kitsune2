@@ -93,8 +93,9 @@
 //!
 //! # Connection establishment
 //!
-//! The transport handlers [`TxImp::send`] implementation contains the logic
-//! for connection establishment.
+//! Both [`TxImp::send`] and [`TxImp::dial`] go through the same
+//! get-or-create step for the peer's connection; `send` then writes a data
+//! frame on it, while `dial` stops once the preflight has been sent.
 //!
 //! ```text
 //!                  ┌────────────────┐
@@ -226,9 +227,14 @@ mod url;
 use url::*;
 mod connection;
 mod connection_context;
+mod connection_registry;
 mod endpoint;
+mod lan_discovery;
 mod stream;
 use connection_context::*;
+use connection_registry::{
+    ConnectionRegistry, ConnectionResolution, RegistryEntry,
+};
 #[cfg(feature = "metrics")]
 mod metrics;
 
@@ -305,6 +311,19 @@ pub mod config {
         #[serde(default = "default_relay_keepalive_interval_s")]
         #[cfg_attr(feature = "schema", schemars(default))]
         pub relay_keepalive_interval_s: u32,
+
+        /// Enable mDNS-based LAN discovery so that two nodes on the same
+        /// local network can dial each other by iroh EndpointId without a
+        /// relay. Requires the `mdns` cargo feature on
+        /// `kitsune2_transport_iroh`.
+        ///
+        /// Note: this only provides *dialability*. Agent-info distribution
+        /// over the LAN is the job of the `kitsune2_bootstrap_mdns` crate.
+        ///
+        /// Default: false.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub enable_lan_discovery: bool,
     }
 
     fn default_relay_keepalive_interval_s() -> u32 {
@@ -321,6 +340,7 @@ pub mod config {
                 auth_material_relay_base64: None,
                 relay_keepalive_interval_s: default_relay_keepalive_interval_s(
                 ),
+                enable_lan_discovery: false,
             }
         }
     }
@@ -374,6 +394,11 @@ impl TransportFactory for IrohTransportFactory {
             }
         }
 
+        lan_discovery::validate_lan_discovery_config(
+            config.iroh_transport.enable_lan_discovery,
+        )
+        .map_err(K2Error::other)?;
+
         Ok(())
     }
 
@@ -400,7 +425,7 @@ impl TransportFactory for IrohTransportFactory {
                 });
 
             let auth_material = builder.auth_material_relay.clone();
-            let imp = IrohTransport::create(
+            let imp: DynTxImp = IrohTransport::create(
                 transport_config,
                 handler.clone(),
                 auth_material,
@@ -411,7 +436,7 @@ impl TransportFactory for IrohTransportFactory {
     }
 }
 
-type Connections = Arc<RwLock<HashMap<Url, Arc<ConnectionContext>>>>;
+type Connections = ConnectionRegistry<ConnectionContext>;
 
 /// Per-space relay state: maps SpaceId to (relay URL, our local URL on that relay).
 type SpaceRelays = Arc<RwLock<HashMap<SpaceId, (RelayUrl, Option<Url>)>>>;
@@ -445,6 +470,9 @@ struct IrohTransport {
     watch_addr_task: AbortHandle,
     accept_task: AbortHandle,
     relay_keepalive_task: Option<AbortHandle>,
+    /// Rebuilds LAN discovery when the local IP set changes; only present
+    /// with LAN discovery enabled.
+    lan_rebind_task: Option<AbortHandle>,
     /// Keepalive tasks for per-space relays, keyed by relay URL.
     space_relay_keepalives: Arc<Mutex<HashMap<RelayUrl, AbortHandle>>>,
     config: IrohTransportConfig,
@@ -459,6 +487,9 @@ impl Drop for IrohTransport {
         if let Some(handle) = self.relay_keepalive_task.take() {
             handle.abort();
         }
+        if let Some(handle) = self.lan_rebind_task.take() {
+            handle.abort();
+        }
         self.space_relay_keepalives
             .lock()
             .expect("poisoned")
@@ -468,14 +499,10 @@ impl Drop for IrohTransport {
         // holds a reference to the context. Thus the context can
         // only be dropped once that reference is dropped, which
         // happens when the task is aborted.
-        self.connections
-            .write()
-            .expect("poisoned")
-            .drain()
-            .for_each(|(remote_url, ctx)| {
-                debug!(?remote_url, "Aborting connection context tasks");
-                ctx.abort_tasks();
-            });
+        self.connections.drain().into_iter().for_each(|ctx| {
+            debug!(remote_url = ?ctx.remote_url(), "Aborting connection context tasks");
+            ctx.abort_tasks();
+        });
         let endpoint = self.endpoint.clone();
         tokio::spawn(async move { endpoint.close().await });
     }
@@ -486,7 +513,7 @@ impl IrohTransport {
         config: IrohTransportConfig,
         handler: Arc<TxImpHnd>,
         auth_material: Option<Vec<u8>>,
-    ) -> K2Result<DynTxImp> {
+    ) -> K2Result<Arc<Self>> {
         // Determine whether we need to authenticate for relay access.
         // Authentication is required when both a relay URL and auth material
         // are provided.
@@ -535,9 +562,22 @@ impl IrohTransport {
             );
         }
 
+        builder = lan_discovery::maybe_enable_lan_discovery(
+            builder,
+            config.enable_lan_discovery,
+        );
+
         let endpoint = builder.bind().await.map_err(|err| {
             K2Error::other_src("Failed to bind iroh endpoint", err)
         })?;
+
+        // Interfaces that appear after this point are only joined by a
+        // rebuilt lookup service, so the rebind task starts as soon as
+        // the endpoint exists.
+        let lan_rebind_task = lan_discovery::maybe_spawn_lan_rebind_task(
+            &endpoint,
+            config.enable_lan_discovery,
+        );
 
         // If relay auth is needed, obtain a bearer token from the bootstrap
         // server before inserting the relay into the endpoint. The token is
@@ -597,9 +637,9 @@ impl IrohTransport {
             None
         };
 
-        let endpoint = Arc::new(IrohEndpoint::new(endpoint));
+        let endpoint: DynIrohEndpoint = Arc::new(IrohEndpoint::new(endpoint));
         let local_url = Arc::new(RwLock::new(None));
-        let connections = Arc::new(RwLock::new(HashMap::new()));
+        let connections = ConnectionRegistry::new();
         let connection_locks = Arc::new(Mutex::new(HashMap::new()));
 
         let watch_addr_task = Self::spawn_watch_addr_task(
@@ -628,6 +668,18 @@ impl IrohTransport {
             );
         }
 
+        if config.enable_lan_discovery
+            && let Some(relay_url_str) = &config.relay_url
+        {
+            Self::announce_url_from_configured_relay(
+                &endpoint,
+                &handler,
+                &local_url,
+                relay_url_str,
+            )
+            .await?;
+        }
+
         let space_relays: SpaceRelays = Arc::new(RwLock::new(HashMap::new()));
 
         let accept_task = Self::spawn_accept_task(
@@ -647,7 +699,7 @@ impl IrohTransport {
             )
         });
 
-        let out: DynTxImp = Arc::new(Self {
+        let out = Arc::new(Self {
             endpoint,
             handler,
             local_url,
@@ -656,11 +708,48 @@ impl IrohTransport {
             watch_addr_task,
             accept_task,
             relay_keepalive_task,
+            lan_rebind_task,
             space_relay_keepalives: Arc::new(Mutex::new(HashMap::new())),
             config,
             space_relays,
         });
         Ok(out)
+    }
+
+    /// The iroh id of our own endpoint.
+    fn local_endpoint_id(endpoint: &DynIrohEndpoint) -> K2Result<EndpointId> {
+        Ok(EndpointId::from(
+            iroh::PublicKey::from_bytes(&endpoint.id_bytes()).map_err(|e| {
+                K2Error::other_src("invalid endpoint public key", e)
+            })?,
+        ))
+    }
+
+    /// Announce the peer URL that the configured relay fully determines,
+    /// without waiting for the relay handshake.
+    ///
+    /// With LAN discovery on, peers can reach this node over mDNS-discovered
+    /// direct paths even while the relay is unreachable, so the node has to
+    /// be addressable from the start. The address watcher announces the same
+    /// URL again once the relay actually connects. Without LAN discovery a
+    /// node is only reachable via its relay, so an early announcement would
+    /// only invite dials that cannot succeed yet.
+    async fn announce_url_from_configured_relay(
+        endpoint: &DynIrohEndpoint,
+        handler: &Arc<TxImpHnd>,
+        local_url: &Arc<RwLock<Option<Url>>>,
+        relay_url_str: &str,
+    ) -> K2Result<()> {
+        let relay_url = RelayUrl::from_str(relay_url_str)
+            .map_err(|err| K2Error::other_src("Invalid relay URL", err))?;
+        let url = canonicalize_relay_url(
+            &relay_url,
+            Self::local_endpoint_id(endpoint)?,
+        )?;
+        info!(%url, "Announcing peer URL derived from configured relay");
+        *local_url.write().expect("poisoned") = Some(url.clone());
+        handler.new_listening_address(url, None).await;
+        Ok(())
     }
 
     /// Keep the endpoint public key registered with the bootstrap server's
@@ -723,7 +812,7 @@ impl IrohTransport {
         relay_url: &RelayUrl,
         token: Option<&str>,
     ) -> Arc<RelayConfig> {
-        let mut config = RelayConfig::new(relay_url.clone(), None);
+        let mut config = RelayConfig::from(relay_url.clone());
         if let Some(token) = token {
             config = config.with_auth_token(token);
         }
@@ -829,11 +918,24 @@ impl IrohTransport {
 
     /// Choose which of our own URLs to advertise in a preflight to `peer_url`.
     ///
-    /// If the peer is on one of our per-space relays, return our URL on
-    /// that relay. If the peer is on our global relay, return our global
-    /// URL. If the peer is on an unknown relay, return `None` — the
-    /// preflight must fail rather than silently falling back to the wrong
-    /// relay.
+    /// We prefer to introduce ourselves on the relay the peer is already on:
+    /// first a per-space relay we share with it, then our global relay. If the
+    /// peer is on a relay we know nothing about, we fall back to our global
+    /// URL rather than refusing to speak.
+    ///
+    /// That fallback is not a compromise, it is the ordinary cross-relay case.
+    /// Iroh dials a peer through the relay that *peer* advertises, so what we
+    /// put in a preflight is the address we want to be reached back on — our
+    /// own home relay — and it is no less reachable for the peer being homed
+    /// somewhere else. Refusing instead makes any relay heterogeneity fatal
+    /// and permanent: the preflight fails in both directions and repeats
+    /// forever. And heterogeneity is normal. Nodes home onto whichever member
+    /// of a relay fleet is nearest, fall back to a public relay when
+    /// registration with the configured one fails, and drift apart as
+    /// configuration is rolled out.
+    ///
+    /// `None` therefore means only one thing: we have no URL of our own yet,
+    /// so there is nothing we could truthfully advertise.
     pub(crate) fn own_url_for_preflight(
         peer_url: &Url,
         space_relays: &HashMap<SpaceId, (RelayUrl, Option<Url>)>,
@@ -841,17 +943,24 @@ impl IrohTransport {
     ) -> Option<Url> {
         let peer_relay = match relay_url_from_peer_url(peer_url) {
             Ok(r) => r,
-            Err(_) => {
-                warn!(%peer_url, "Cannot extract relay from peer URL, failing preflight");
-                return None;
+            Err(err) => {
+                // Not fatal any more: we cannot prefer a relay we cannot
+                // read, but our global URL is still a good address to be
+                // reached back on.
+                debug!(
+                    ?err,
+                    %peer_url,
+                    "Cannot extract relay from peer URL, advertising our global URL"
+                );
+                return global_url.clone();
             }
         };
 
         for (relay_url, our_url) in space_relays.values() {
-            if *relay_url == peer_relay
+            if relays_match(relay_url, &peer_relay)
                 && let Some(url) = our_url
             {
-                info!(
+                debug!(
                     %peer_url,
                     own_url = %url,
                     "Using per-space URL for preflight"
@@ -860,19 +969,73 @@ impl IrohTransport {
             }
         }
 
-        if let Some(global) = global_url
-            && let Ok(our_relay) = relay_url_from_peer_url(global)
-            && our_relay == peer_relay
-        {
-            return Some(global.clone());
+        let Some(global) = global_url else {
+            warn!(
+                %peer_url,
+                %peer_relay,
+                "No url of our own yet, cannot preflight"
+            );
+            return None;
+        };
+
+        // Whether or not the peer shares our global relay, this is the
+        // address we want it to reach us on.
+        if !matches!(
+            relay_url_from_peer_url(global),
+            Ok(our_relay) if relays_match(&our_relay, &peer_relay)
+        ) {
+            debug!(
+                %peer_url,
+                %peer_relay,
+                own_url = %global,
+                "Peer is on another relay, advertising our global URL"
+            );
         }
 
-        warn!(
-            %peer_url,
-            %peer_relay,
-            "Peer is on unknown relay, failing preflight"
-        );
-        None
+        Some(global.clone())
+    }
+
+    /// Direct addresses that LAN discovery knows for `endpoint_id` and
+    /// that a peer on one of our LANs could actually hold; none when LAN
+    /// discovery is off.
+    ///
+    /// Only consulted when the home relay is known to be down. On the
+    /// relay-up path iroh runs its own lookup while the connect is in
+    /// flight, so a lookup here would only add latency to every dial. The
+    /// lookup's answers are unauthenticated, so anything that is not
+    /// on-link — judged against our own addresses, so that a LAN numbered
+    /// with global IPv6 counts — is dropped rather than dialled.
+    async fn lan_direct_addrs(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Vec<iroh::TransportAddr> {
+        if !self.config.enable_lan_discovery {
+            return Vec::new();
+        }
+        let local_ips = self.endpoint.local_ips();
+        let (lan, other): (Vec<_>, Vec<_>) = self
+            .endpoint
+            .discover_direct_addrs(
+                endpoint_id,
+                lan_discovery::LAN_LOOKUP_TIMEOUT,
+            )
+            .await
+            .into_iter()
+            .partition(|addr| match addr {
+                iroh::TransportAddr::Ip(sock) => {
+                    lan_discovery::is_on_link(sock.ip(), &local_ips)
+                }
+                _ => false,
+            });
+        if !other.is_empty() {
+            debug!(
+                %endpoint_id,
+                ?other,
+                ?local_ips,
+                "ignoring LAN-discovered addresses that are not on-link"
+            );
+        }
+        lan
     }
 
     /// Creates a new connection and its associated context for a peer.
@@ -882,25 +1045,35 @@ impl IrohTransport {
     /// preflight, the context is dropped and an error returned.
     async fn create_connection_and_context(
         &self,
-        target: EndpointAddr,
+        mut target: EndpointAddr,
         remote_url: Url,
     ) -> K2Result<Arc<ConnectionContext>> {
         // Guard: if the relay has explicitly failed (Disconnected state), skip
-        // the attempt entirely. A 60-second QUIC timeout while the relay is
-        // recovering would falsely mark the peer as unresponsive (e.g. after
-        // Android doze mode kills the network).
+        // the attempt unless the peer is reachable over the LAN. A 60-second
+        // QUIC timeout while the relay is recovering would falsely mark the
+        // peer as unresponsive (e.g. after Android doze mode kills the
+        // network).
         //
         // We check for Disconnected specifically — not Connecting — because
         // Connecting at startup is normal and we must not block those attempts.
         // Disconnected means iroh detected an actual failure and has recorded
         // a last_error; Connecting means iroh is still dialling.
         if self.endpoint.is_home_relay_known_down() {
+            let lan_addrs = self.lan_direct_addrs(target.id).await;
+            if lan_addrs.is_empty() {
+                debug!(
+                    ?remote_url,
+                    "skipping outbound connection: relay known down, \
+                     peer will not be marked unresponsive"
+                );
+                return Err(K2Error::other(RELAY_NOT_CONNECTED_ERR));
+            }
             debug!(
-                ?remote_url,
-                "skipping outbound connection: relay known down, \
-                 peer will not be marked unresponsive"
+                remote = ?remote_url.peer_id(),
+                ?lan_addrs,
+                "Relay known down, dialling LAN-discovered direct addresses"
             );
-            return Err(K2Error::other(RELAY_NOT_CONNECTED_ERR));
+            target.addrs.extend(lan_addrs);
         }
 
         // Establish connection
@@ -913,21 +1086,11 @@ impl IrohTransport {
         .await
         {
             Err(e) => {
-                // On connection establishment error, mark the peer unresponsive
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
-
+                self.mark_unresponsive(&remote_url).await;
                 Err(K2Error::other_src("iroh connect timed out", e))
             }
             Ok(Err(e)) => {
-                // On connection establishment error, mark the peer unresponsive
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
-
+                self.mark_unresponsive(&remote_url).await;
                 Err(K2Error::other_src("iroh connect error", e))
             }
             Ok(Ok(conn)) => Ok(conn),
@@ -971,6 +1134,17 @@ impl IrohTransport {
                 max_frame_bytes: self.config.max_frame_bytes,
             });
 
+            // Register the candidate before sending the preflight, so that a
+            // competing inbound connection from the same peer resolves against
+            // this dial instead of racing an unpublished one. Both directions
+            // reach the same verdict whichever order they register in, because
+            // the tie-break is deterministic and the registry applies it
+            // atomically.
+            if !self.connections.register_candidate(&remote_url, &ctx) {
+                ctx.close_superseded();
+                return Ok(ctx);
+            }
+
             if let Err(e) = ctx
                 .send_preflight_frame(
                     current_local_url.clone(),
@@ -978,11 +1152,29 @@ impl IrohTransport {
                 )
                 .await
             {
-                // On send preflight error, mark the peer unresponsive
-                let _ = self
-                    .handler
-                    .set_unresponsive(remote_url.clone(), Timestamp::now())
-                    .await;
+                // Being published from this point on means a competing
+                // connection can take the peer's slot and close this dial
+                // underneath the preflight write. Either end can decide that:
+                // the remote rejecting this dial in favour of its own is in
+                // fact the more common way this write fails. That is
+                // simultaneous-open resolution working as intended, not a peer
+                // that failed: marking it unresponsive would stall gossip with
+                // it until its agent info expires. Hand the context back
+                // instead, so the caller retries on the connection that won.
+                if ctx.is_superseded() {
+                    debug!(
+                        remote = ?remote_url.peer_id(),
+                        "Dial superseded while sending preflight"
+                    );
+                    return Ok(ctx);
+                }
+
+                // On send preflight error, mark the peer unresponsive. The
+                // failed dial leaves the registry first, so it cannot count as
+                // the live connection that would spare the peer.
+                ctx.close_failed(e.to_string().as_bytes());
+                self.connections.remove_if_current(&remote_url, &ctx);
+                self.mark_unresponsive(&remote_url).await;
 
                 return Err(e);
             }
@@ -1057,12 +1249,10 @@ impl IrohTransport {
             )
             .await;
 
-        let endpoint_id = EndpointId::from(
-            iroh::PublicKey::from_bytes(&endpoint.id_bytes()).map_err(|e| {
-                K2Error::other_src("invalid endpoint public key", e)
-            })?,
-        );
-        let local_url = canonicalize_relay_url(&relay_url_parsed, endpoint_id)?;
+        let local_url = canonicalize_relay_url(
+            &relay_url_parsed,
+            Self::local_endpoint_id(&endpoint)?,
+        )?;
 
         info!(
             %local_url,
@@ -1071,6 +1261,120 @@ impl IrohTransport {
         );
 
         Ok((relay_url_parsed, local_url, auth_params))
+    }
+    /// Convert a peer URL into the iroh address to dial.
+    ///
+    /// A URL that cannot name an endpoint can never be reached, so the peer
+    /// is marked unresponsive right away rather than after a failed dial.
+    async fn dial_target(&self, remote_url: &Url) -> K2Result<EndpointAddr> {
+        match endpoint_from_url(remote_url) {
+            Ok(target) => Ok(target),
+            Err(e) => {
+                self.mark_unresponsive(remote_url).await;
+                Err(K2Error::other_src(
+                    format!(
+                        "iroh send error converting Url to EndpointAddr {remote_url}"
+                    ),
+                    e,
+                ))
+            }
+        }
+    }
+
+    /// Record that `remote_url` could not be reached, so the modules stop
+    /// paying the connect timeout for it until it connects again.
+    ///
+    /// A peer with a live connection is spared: it may have connected to us
+    /// while our own dial to it was stalled on the relay, and a peer we are
+    /// talking to is not unresponsive whatever our dial says.
+    async fn mark_unresponsive(&self, remote_url: &Url) {
+        let connected = self
+            .connections
+            .get(remote_url)
+            .is_some_and(|ctx| ctx.lifecycle().is_live());
+        if connected {
+            debug!(
+                ?remote_url,
+                "not marking peer unresponsive: a connection with it is live"
+            );
+            return;
+        }
+        let _ = self
+            .handler
+            .set_unresponsive(remote_url.clone(), Timestamp::now())
+            .await;
+    }
+
+    /// The lock that serializes connection creation towards one peer.
+    ///
+    /// Folding this into the connections map would move the complexity into
+    /// every reader of that map; a separate lock table keeps it local to the
+    /// one place that creates connections.
+    fn peer_connection_lock(
+        &self,
+        remote_url: &Url,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.connection_locks
+            .lock()
+            .expect("poisoned")
+            .entry(remote_url.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Return the active connection to `remote_url`, establishing one and
+    /// completing the preflight on it first if there is none.
+    ///
+    /// Concurrent callers for the same peer wait on the per-peer lock; the
+    /// first one to hold it creates the connection and the rest find it in
+    /// the map once the lock is released.
+    async fn ensure_connection(
+        &self,
+        remote_url: Url,
+    ) -> K2Result<Arc<ConnectionContext>> {
+        let target = self.dial_target(&remote_url).await?;
+
+        let peer_lock = self.peer_connection_lock(&remote_url);
+        let _lock_guard = peer_lock.lock().await;
+
+        if let Some(ctx) = self.connections.get(&remote_url) {
+            return Ok(ctx);
+        }
+
+        info!(remote = ?remote_url.peer_id(), "Establishing connection to remote");
+        self.create_connection_and_context(target, remote_url).await
+    }
+}
+
+async fn wait_for_send_replacement(
+    connections: &Connections,
+    remote_url: &Url,
+    superseded: &Arc<ConnectionContext>,
+    deadline: tokio::time::Instant,
+) -> K2Result<Arc<ConnectionContext>> {
+    if deadline <= tokio::time::Instant::now() {
+        connections.remove_if_current(remote_url, superseded);
+        return Err(K2Error::other(format!(
+            "timed out waiting for the connection selected for {remote_url}"
+        )));
+    }
+
+    match tokio::time::timeout_at(
+        deadline,
+        connections.wait_for_replacement(remote_url, superseded),
+    )
+    .await
+    {
+        Ok(replacement) => Ok(replacement),
+        Err(err) => {
+            connections.remove_if_current(remote_url, superseded);
+            Err(K2Error::other_src(
+                format!(
+                    "timed out waiting for the connection selected for {remote_url}"
+                ),
+                err,
+            ))
+        }
     }
 }
 
@@ -1084,9 +1388,8 @@ impl TxImp for IrohTransport {
         peer: Url,
         payload: Option<(String, Bytes)>,
     ) -> BoxFut<'_, ()> {
-        if let Some(ctx) =
-            self.connections.write().expect("poisoned").remove(&peer)
-        {
+        let ctx = self.connections.take(&peer);
+        if let Some(ctx) = ctx {
             // The reason string travels in the QUIC application close frame
             // itself, so the encoded payload message is intentionally not
             // sent as a data frame first.
@@ -1099,131 +1402,106 @@ impl TxImp for IrohTransport {
     }
 
     fn send(&self, remote_url: Url, data: Bytes) -> BoxFut<'_, K2Result<()>> {
-        let connections = self.connections.clone();
-        let connection_locks = self.connection_locks.clone();
-
         Box::pin(async move {
-            let remote = match endpoint_from_url(&remote_url) {
-                Err(e) => {
-                    // If we cannot convert the url to an endpoint address, mark the peer unresponsive
-                    let _ = self
-                        .handler
-                        .set_unresponsive(remote_url.clone(), Timestamp::now())
-                        .await;
+            let connections = self.connections.clone();
+            let mut ctx = self.ensure_connection(remote_url.clone()).await?;
+            let send_deadline = tokio::time::Instant::now() + PREFLIGHT_TIMEOUT;
 
-                    Err(K2Error::other_src(
-                        format!(
-                            "iroh send error converting Url to EndpointAddr {remote_url}"
-                        ),
-                        e,
-                    ))
-                }
-                ok => ok,
-            }?;
-
-            // Get or create the connection lock for this peer to serialize connection creation.
-            let peer_lock = {
-                let mut locks = connection_locks.lock().expect("poisoned");
-                locks
-                    .entry(remote_url.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                    .clone()
-            };
-
-            // Acquire the write lock to serialize connection creation for this peer.
-            //
-            // Other send requests to the same peer will wait here to acquire the lock.
-            // The lock is released immediately if there is a connection, Otherwise
-            // a connection is established and the preflight and host URL are sent
-            // to the remote, before the lock is released.
-            //
-            // The alternative to this mechanism would be fold the function of this
-            // lock into the connections map. That would slightly reduce the
-            // complexity in this method, but would increase complexity in all places
-            // where the connection map is used. The connecions_locks map is only
-            // used in this method. Overall it is simpler as is.
-            let _lock_guard = peer_lock.lock().await;
-
-            // Atomically check and create connection and context if needed.
-            let connection_context = {
-                // Check if connection already exists, as another call might have
-                // created it while this one was waiting for the lock.
-                let existing = connections
-                    .read()
-                    .expect("poisoned")
-                    .get(&remote_url)
-                    .cloned();
-                if let Some(ctx) = existing {
-                    // Connection already exists, use it (preflight already done).
-                    drop(_lock_guard);
-                    ctx
-                } else {
-                    // Connection doesn't exist, create it.
-                    // This establishes the connection and sends the preflight to the remote.
-                    info!(remote = ?remote_url.peer_id(), "Establishing connection to remote");
-                    let ctx = self
-                        .create_connection_and_context(
-                            remote,
-                            remote_url.clone(),
+            loop {
+                match ctx.wait_for_resolution().await {
+                    ConnectionResolution::Active => {
+                        let is_active = connections
+                            .get(&remote_url)
+                            .is_some_and(|active| Arc::ptr_eq(&active, &ctx));
+                        if !is_active {
+                            ctx = wait_for_send_replacement(
+                                &connections,
+                                &remote_url,
+                                &ctx,
+                                send_deadline,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                    ConnectionResolution::Superseded => {
+                        debug!(
+                            remote = ?remote_url.peer_id(),
+                            "Waiting for the connection that won simultaneous-open resolution"
+                        );
+                        ctx = wait_for_send_replacement(
+                            &connections,
+                            &remote_url,
+                            &ctx,
+                            send_deadline,
                         )
                         .await?;
-
-                    // Now that the preflight has been sent successfully, register
-                    // the connection. This resolves any simultaneous-open race
-                    // with an inbound connection from the same peer: if our dial
-                    // lost the deterministic tie-break, close it and send over the
-                    // connection that won instead.
-                    if ctx.register_as_active(&connections, &remote_url) {
-                        ctx
-                    } else {
-                        // Our dial lost the tie-break; discard it (its reader
-                        // then exits quietly) and use the connection that won.
-                        ctx.close_quietly();
-                        connections
-                            .read()
-                            .expect("poisoned")
-                            .get(&remote_url)
-                            .cloned()
-                            .unwrap_or(ctx)
+                        continue;
                     }
+                    // The remote rejected the preflight, or the connection
+                    // died before it was usable. Historically `send` returned
+                    // success here and the failure surfaced through
+                    // `peer_disconnect`/`set_unresponsive`; keep that
+                    // behavior so callers are not newly broken.
+                    ConnectionResolution::Closed => return Ok(()),
                 }
-            };
 
-            // Send actual message.
-            connection_context.send_data_frame(data).await?;
-
-            Ok(())
+                // The connection was the live one when it was picked, but a
+                // competing connection can still win the peer's slot while the
+                // frame is being written, which closes this one underneath the
+                // write. Either end can decide that, so `is_superseded` reads
+                // both the local verdict and the remote's close code; a write
+                // failure it does not recognize is reported as before.
+                //
+                // In principle the retry below can re-send a payload that
+                // actually reached the peer before a later flush/ack step
+                // failed. `send_space_notify` is at-most-once and every
+                // consumer already tolerates duplicates, so this is accepted.
+                match ctx.send_data_frame(data.clone()).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) if ctx.is_superseded() => {
+                        debug!(
+                            remote = ?remote_url.peer_id(),
+                            ?err,
+                            "Connection superseded mid-send; waiting for winner"
+                        );
+                        ctx = wait_for_send_replacement(
+                            &connections,
+                            &remote_url,
+                            &ctx,
+                            send_deadline,
+                        )
+                        .await?;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         })
     }
 
+    fn dial(&self, peer: Url) -> BoxFut<'_, K2Result<()>> {
+        Box::pin(async move { self.ensure_connection(peer).await.map(|_| ()) })
+    }
+
     fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
-        Box::pin(async {
-            Ok(self
-                .connections
-                .read()
-                .expect("poisoned")
-                .keys()
-                .cloned()
-                .collect())
-        })
+        Box::pin(async { Ok(self.connections.active_peers()) })
     }
 
     fn dump_network_stats(&self) -> BoxFut<'_, K2Result<TransportStats>> {
         Box::pin(async move {
-            let connections =
-                self.connections.read().expect("poisoned").clone();
             let mut peer_urls = Vec::new();
             if let Some(own_url) =
                 self.local_url.read().expect("poisoned").clone()
             {
                 peer_urls.push(own_url);
             }
-            let stat_connections = connections
-                .into_values()
-                .map(|context| {
+            let stat_connections = self
+                .connections
+                .active_entries()
+                .into_iter()
+                .map(|(_, context)| {
                     TransportConnectionStats {
-                        // When the context is added to the connections map, the handshake
-                        // with the URL exchange is already complete. URL must be `Some`.
+                        // Active contexts completed the URL exchange.
                         pub_key: context
                             .remote_url()
                             .unwrap()
@@ -1257,17 +1535,35 @@ impl TxImp for IrohTransport {
 
         let per_space = per_space_config.map(|c| c.iroh_transport);
 
-        let relay_url = per_space.as_ref().and_then(|c| c.relay_url.clone());
+        let space_relay = per_space_relay(
+            per_space.as_ref().and_then(|c| c.relay_url.as_deref()),
+            per_space
+                .as_ref()
+                .and_then(|c| c.auth_material_relay_base64.as_deref()),
+            self.config.relay_url.as_deref(),
+            self.config.auth_material_relay_base64.as_deref(),
+        );
 
-        let auth_material = per_space
-            .as_ref()
-            .and_then(|c| c.auth_material_relay_base64.as_ref())
-            .and_then(|b64| {
+        if let Some(SpaceRelay {
+            url,
+            auth_material_base64,
+        }) = space_relay
+        {
+            let auth_material = auth_material_base64.and_then(|b64| {
                 use ::base64::Engine;
-                ::base64::engine::general_purpose::STANDARD.decode(b64).ok()
+                let decoded = ::base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .ok();
+                if decoded.is_none() {
+                    tracing::warn!(
+                        ?space_id,
+                        "Ignoring per-space relay auth material that is not \
+                         valid base64; the relay will be used unauthenticated"
+                    );
+                }
+                decoded
             });
 
-        if let Some(url) = relay_url {
             let endpoint = self.endpoint.clone();
             let space_relays = self.space_relays.clone();
             let space_relay_keepalives = self.space_relay_keepalives.clone();
@@ -1347,7 +1643,28 @@ impl TxImp for IrohTransport {
                     .any(|(r, _)| r == &relay_url);
 
                 if !still_used {
-                    self.endpoint.remove_relay(&relay_url).await;
+                    // A space may have inserted the transport's own relay to
+                    // present auth material of its own. It does not own it, so
+                    // releasing the space must not take the relay with it.
+                    if is_transport_own_relay(
+                        relay_url.as_str(),
+                        self.config.relay_url.as_deref(),
+                    ) {
+                        tracing::debug!(
+                            ?space_id,
+                            %relay_url,
+                            "Keeping the transport's own relay after releasing the space"
+                        );
+                    } else {
+                        self.endpoint.remove_relay(&relay_url).await;
+                        tracing::info!(
+                            ?space_id,
+                            %relay_url,
+                            "Removed per-space relay from endpoint"
+                        );
+                    }
+
+                    // The space's keepalive goes with the space either way.
                     if let Some(handle) = self
                         .space_relay_keepalives
                         .lock()
@@ -1356,11 +1673,6 @@ impl TxImp for IrohTransport {
                     {
                         handle.abort();
                     }
-                    tracing::info!(
-                        ?space_id,
-                        %relay_url,
-                        "Removed per-space relay from endpoint"
-                    );
                 }
             }
 

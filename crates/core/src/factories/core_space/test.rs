@@ -191,19 +191,48 @@ async fn space_notify_send_recv() {
     s1.local_agent_join(ned.clone()).await.unwrap();
     s2.local_agent_join(bob.clone()).await.unwrap();
 
+    // Knowing where a peer is does not admit it. Each side challenges the
+    // other's url, and only once both have proven knowledge of the space
+    // secret does anything but the access module's own traffic flow.
+    let granted = |space: &DynSpace, url: &Url| {
+        matches!(
+            space
+                .peer_access_state()
+                .get_access_decision(url.clone())
+                .unwrap()
+                .map(|a| a.decision),
+            Some(AccessDecision::Granted)
+        )
+    };
+    iter_check!(15_000, 10, {
+        if granted(&s1, &u2) && granted(&s2, &u1) {
+            break;
+        }
+    });
+
     s1.send_notify(u2.clone(), bytes::Bytes::from_static(b"hello"))
         .await
         .unwrap();
 
+    iter_check!(5000, 10, {
+        if !recv.lock().unwrap().is_empty() {
+            break;
+        }
+    });
     let (f, s, d) = recv.lock().unwrap().remove(0);
     assert_eq!(u1.clone(), f);
     assert_eq!(TEST_SPACE_ID, s);
     assert_eq!("hello", String::from_utf8_lossy(&d));
 
-    s2.send_notify(u1, bytes::Bytes::from_static(b"world"))
+    s2.send_notify(u1.clone(), bytes::Bytes::from_static(b"world"))
         .await
         .unwrap();
 
+    iter_check!(5000, 10, {
+        if !recv.lock().unwrap().is_empty() {
+            break;
+        }
+    });
     let (f, s, d) = recv.lock().unwrap().remove(0);
     assert_eq!(u2, f);
     assert_eq!(TEST_SPACE_ID, s);
@@ -240,6 +269,7 @@ async fn space_local_agent_periodic_re_sign_and_bootstrap() {
             _builder: Arc<Builder>,
             _peer_store: DynPeerStore,
             _space_id: SpaceId,
+            _tx: DynTransport,
         ) -> BoxFut<'static, K2Result<DynBootstrap>> {
             let out: DynBootstrap = self.0.clone();
             Box::pin(async move { Ok(out) })
@@ -431,4 +461,517 @@ async fn broadcast_new_agent_info_on_resign() {
 
     let broadcast = p.0.lock().unwrap().last().cloned().unwrap();
     assert_eq!(bob.agent(), &broadcast.0.agent);
+}
+
+/// The per-space transport hook exists so a space can name a relay of its own.
+/// Calling it for a space that overrides nothing hands the transport the global
+/// config and presents the defaults as that space's own - which the transport
+/// cannot tell apart, and the iroh transport acts on by reconfiguring the relay
+/// it is already connected to.
+mod configure_for_space_only_when_overridden {
+    use super::*;
+
+    type Configured = Arc<Mutex<Vec<SpaceId>>>;
+
+    /// Records the per-space hook and does nothing else; this test only creates
+    /// spaces, it never moves data.
+    #[derive(Debug)]
+    struct RecordingTx {
+        configured: Configured,
+    }
+
+    impl TxImp for RecordingTx {
+        fn url(&self) -> Option<Url> {
+            None
+        }
+
+        fn disconnect(
+            &self,
+            _peer: Url,
+            _payload: Option<(String, bytes::Bytes)>,
+        ) -> BoxFut<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn send(
+            &self,
+            _peer: Url,
+            _data: bytes::Bytes,
+        ) -> BoxFut<'_, K2Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn dial(&self, _peer: Url) -> BoxFut<'_, K2Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn dump_network_stats(&self) -> BoxFut<'_, K2Result<TransportStats>> {
+            Box::pin(async {
+                Ok(TransportStats {
+                    backend: "recording".to_string(),
+                    peer_urls: Vec::new(),
+                    connections: Vec::new(),
+                })
+            })
+        }
+
+        fn configure_for_space(
+            &self,
+            space_id: SpaceId,
+            _config: &Config,
+        ) -> BoxFut<'_, K2Result<()>> {
+            self.configured.lock().expect("poison").push(space_id);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingTxFactory {
+        configured: Configured,
+    }
+
+    impl TransportFactory for RecordingTxFactory {
+        fn default_config(&self, _config: &mut Config) -> K2Result<()> {
+            Ok(())
+        }
+
+        fn validate_config(&self, _config: &Config) -> K2Result<()> {
+            Ok(())
+        }
+
+        fn create(
+            &self,
+            _builder: Arc<Builder>,
+            handler: DynTxHandler,
+        ) -> BoxFut<'static, K2Result<DynTransport>> {
+            let configured = self.configured.clone();
+            Box::pin(async move {
+                let handler = TxImpHnd::new(handler);
+                let imp: DynTxImp = Arc::new(RecordingTx { configured });
+                Ok(DefaultTransport::create(&handler, imp))
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct S;
+    impl SpaceHandler for S {}
+
+    #[derive(Debug)]
+    struct K;
+    impl KitsuneHandler for K {
+        fn create_space(
+            &self,
+            _space_id: SpaceId,
+            _config_override: Option<&Config>,
+        ) -> BoxFut<'_, K2Result<DynSpaceHandler>> {
+            Box::pin(async move {
+                let s: DynSpaceHandler = Arc::new(S);
+                Ok(s)
+            })
+        }
+    }
+
+    async fn configured_spaces_for(
+        config_override: Option<Config>,
+    ) -> Vec<SpaceId> {
+        let configured: Configured = Arc::new(Mutex::new(Vec::new()));
+        let builder = Builder {
+            verifier: Arc::new(TestVerifier),
+            transport: Arc::new(RecordingTxFactory {
+                configured: configured.clone(),
+            }),
+            ..crate::default_test_builder()
+        }
+        .with_default_config()
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+        builder
+            .register_handler(Arc::new(K) as DynKitsuneHandler)
+            .await
+            .unwrap();
+
+        builder.space(TEST_SPACE_ID, config_override).await.unwrap();
+
+        configured.lock().expect("poison").clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn not_called_when_the_space_overrides_nothing() {
+        assert!(
+            configured_spaces_for(None).await.is_empty(),
+            "the transport was handed the global config as if it were this space's own"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn called_when_the_space_overrides_something() {
+        let configured = configured_spaces_for(Some(Config::default())).await;
+        assert_eq!(configured, vec![TEST_SPACE_ID]);
+    }
+}
+
+/// Global bootstrap auth material authenticates the global bootstrap server. A
+/// config merge hands a space every field its override did not set, so a space
+/// naming its own server is still handed our credential - presenting it there
+/// would let that server replay it against ours.
+mod bootstrap_auth_material_is_not_carried_to_another_server {
+    use super::*;
+    use crate::factories::core_space::bootstrap_server_customized;
+    use crate::factories::{CoreBootstrapConfig, CoreBootstrapModConfig};
+
+    const GLOBAL_SERVER: &str = "http://global-bootstrap.example";
+    const SPACE_SERVER: &str = "http://space-bootstrap.example";
+
+    type Seen = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
+
+    #[derive(Debug)]
+    struct NoopBootstrap;
+    impl Bootstrap for NoopBootstrap {
+        fn put(&self, _info: Arc<AgentInfoSigned>) {}
+    }
+
+    /// Records the auth material the space's builder carries by the time the
+    /// bootstrap module is built from it.
+    #[derive(Debug)]
+    struct RecordingBootstrapFactory {
+        seen: Seen,
+    }
+
+    impl BootstrapFactory for RecordingBootstrapFactory {
+        fn default_config(&self, config: &mut Config) -> K2Result<()> {
+            config.set_module_config(&CoreBootstrapModConfig {
+                core_bootstrap: CoreBootstrapConfig {
+                    server_url: Some(GLOBAL_SERVER.into()),
+                    ..Default::default()
+                },
+            })
+        }
+
+        fn validate_config(&self, _config: &Config) -> K2Result<()> {
+            Ok(())
+        }
+
+        fn create(
+            &self,
+            builder: Arc<Builder>,
+            _peer_store: DynPeerStore,
+            _space_id: SpaceId,
+            _tx: DynTransport,
+        ) -> BoxFut<'static, K2Result<DynBootstrap>> {
+            self.seen
+                .lock()
+                .expect("poison")
+                .push(builder.auth_material_bootstrap.clone());
+            Box::pin(async { Ok(Arc::new(NoopBootstrap) as DynBootstrap) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct S;
+    impl SpaceHandler for S {}
+
+    #[derive(Debug)]
+    struct K;
+    impl KitsuneHandler for K {
+        fn create_space(
+            &self,
+            _space_id: SpaceId,
+            _config_override: Option<&Config>,
+        ) -> BoxFut<'_, K2Result<DynSpaceHandler>> {
+            Box::pin(async move {
+                let s: DynSpaceHandler = Arc::new(S);
+                Ok(s)
+            })
+        }
+    }
+
+    /// Build a node holding global bootstrap auth material, create one space
+    /// with the given override, and report the material its bootstrap was
+    /// built with.
+    async fn material_seen_by_space(
+        space_server: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let builder = Builder {
+            verifier: Arc::new(TestVerifier),
+            auth_material_bootstrap: Some(b"global-credential".to_vec()),
+            bootstrap: Arc::new(RecordingBootstrapFactory {
+                seen: seen.clone(),
+            }),
+            ..crate::default_test_builder()
+        }
+        .with_default_config()
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+        builder
+            .register_handler(Arc::new(K) as DynKitsuneHandler)
+            .await
+            .unwrap();
+
+        let config_override = Config::default();
+        config_override
+            .set_module_config(&CoreBootstrapModConfig {
+                core_bootstrap: CoreBootstrapConfig {
+                    server_url: Some(
+                        space_server.unwrap_or(GLOBAL_SERVER).into(),
+                    ),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+
+        builder
+            .space(TEST_SPACE_ID, Some(config_override))
+            .await
+            .unwrap();
+
+        let seen = seen.lock().expect("poison").clone();
+        assert_eq!(seen.len(), 1, "expected exactly one bootstrap to be built");
+        seen.into_iter().next().unwrap()
+    }
+
+    fn config_with_server(server_url: Option<&str>) -> Config {
+        let config = Config::default();
+        config
+            .set_module_config(&CoreBootstrapModConfig {
+                core_bootstrap: CoreBootstrapConfig {
+                    server_url: server_url.map(Into::into),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        config
+    }
+
+    #[test]
+    fn a_different_server_is_a_customized_one() {
+        assert!(bootstrap_server_customized(
+            &config_with_server(Some(GLOBAL_SERVER)),
+            &config_with_server(Some(SPACE_SERVER)),
+        ));
+    }
+
+    #[test]
+    fn a_trailing_slash_is_not_a_different_server() {
+        assert!(!bootstrap_server_customized(
+            &config_with_server(Some("http://bootstrap.example")),
+            &config_with_server(Some("http://bootstrap.example/")),
+        ));
+    }
+
+    /// Auth material given with no global server of our own was configured for
+    /// whatever server the spaces name, so it stays.
+    #[test]
+    fn no_global_server_means_the_material_was_meant_for_the_space() {
+        assert!(!bootstrap_server_customized(
+            &config_with_server(None),
+            &config_with_server(Some(SPACE_SERVER)),
+        ));
+    }
+
+    /// A bootstrap module with a config shape we cannot read handles its own
+    /// material; we leave it alone rather than guessing.
+    #[test]
+    fn an_unreadable_bootstrap_config_leaves_the_material_alone() {
+        let unknown = Config::default();
+        unknown
+            .set_module_config(&serde_json::json!({ "somethingElse": {} }))
+            .unwrap();
+
+        assert!(!bootstrap_server_customized(
+            &unknown,
+            &config_with_server(Some(SPACE_SERVER)),
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cleared_when_the_space_names_its_own_server() {
+        assert_eq!(material_seen_by_space(Some(SPACE_SERVER)).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kept_when_the_space_names_the_global_server() {
+        assert_eq!(
+            material_seen_by_space(None).await,
+            Some(b"global-credential".to_vec()),
+        );
+    }
+}
+
+/// A transport that behaves like the in-memory transport but keeps the
+/// space handler it is handed, so a test can drive the space's transport
+/// callbacks directly.
+#[derive(Debug)]
+struct HandlerCapturingTransport {
+    inner: DynTransport,
+    space_handler: Arc<Mutex<Option<DynTxSpaceHandler>>>,
+}
+
+impl Transport for HandlerCapturingTransport {
+    fn register_space_handler(
+        &self,
+        space_id: SpaceId,
+        handler: DynTxSpaceHandler,
+    ) -> Option<Url> {
+        *self.space_handler.lock().unwrap() = Some(handler.clone());
+        self.inner.register_space_handler(space_id, handler)
+    }
+
+    fn register_module_handler(
+        &self,
+        space_id: SpaceId,
+        module: String,
+        handler: DynTxModuleHandler,
+    ) {
+        self.inner
+            .register_module_handler(space_id, module, handler)
+    }
+
+    fn disconnect(&self, peer: Url, reason: Option<String>) -> BoxFut<'_, ()> {
+        self.inner.disconnect(peer, reason)
+    }
+
+    fn send_space_notify(
+        &self,
+        peer: Url,
+        space_id: SpaceId,
+        data: bytes::Bytes,
+    ) -> BoxFut<'_, K2Result<()>> {
+        self.inner.send_space_notify(peer, space_id, data)
+    }
+
+    fn send_module(
+        &self,
+        peer: Url,
+        space_id: SpaceId,
+        module: String,
+        data: bytes::Bytes,
+    ) -> BoxFut<'_, K2Result<()>> {
+        self.inner.send_module(peer, space_id, module, data)
+    }
+
+    fn dial(
+        &self,
+        space_id: SpaceId,
+        peer: Url,
+    ) -> BoxFut<'_, K2Result<DialOutcome>> {
+        self.inner.dial(space_id, peer)
+    }
+
+    fn get_connected_peers(&self) -> BoxFut<'_, K2Result<Vec<Url>>> {
+        self.inner.get_connected_peers()
+    }
+
+    fn unregister_space(&self, space_id: SpaceId) -> BoxFut<'_, ()> {
+        self.inner.unregister_space(space_id)
+    }
+
+    fn dump_network_stats(&self) -> BoxFut<'_, K2Result<ApiTransportStats>> {
+        self.inner.dump_network_stats()
+    }
+}
+
+#[derive(Debug)]
+struct HandlerCapturingTransportFactory {
+    space_handler: Arc<Mutex<Option<DynTxSpaceHandler>>>,
+}
+
+impl TransportFactory for HandlerCapturingTransportFactory {
+    fn default_config(&self, _config: &mut Config) -> K2Result<()> {
+        Ok(())
+    }
+
+    fn validate_config(&self, _config: &Config) -> K2Result<()> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        builder: Arc<Builder>,
+        handler: DynTxHandler,
+    ) -> BoxFut<'static, K2Result<DynTransport>> {
+        let space_handler = self.space_handler.clone();
+        Box::pin(async move {
+            let inner = crate::factories::MemTransportFactory::create()
+                .create(builder, handler)
+                .await?;
+            let out: DynTransport = Arc::new(HandlerCapturingTransport {
+                inner,
+                space_handler,
+            });
+            Ok(out)
+        })
+    }
+}
+
+/// A peer that completes a connection with us is responsive, whatever an
+/// earlier failed dial recorded about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_connect_clears_the_unresponsive_mark() {
+    #[derive(Debug)]
+    struct S;
+    impl SpaceHandler for S {}
+
+    #[derive(Debug)]
+    struct K;
+    impl KitsuneHandler for K {
+        fn create_space(
+            &self,
+            _space_id: SpaceId,
+            _config_override: Option<&Config>,
+        ) -> BoxFut<'_, K2Result<DynSpaceHandler>> {
+            Box::pin(async move {
+                let s: DynSpaceHandler = Arc::new(S);
+                Ok(s)
+            })
+        }
+    }
+
+    let space_handler = Arc::new(Mutex::new(None));
+    let builder = Builder {
+        verifier: Arc::new(TestVerifier),
+        transport: Arc::new(HandlerCapturingTransportFactory {
+            space_handler: space_handler.clone(),
+        }),
+        ..crate::default_test_builder()
+    }
+    .with_default_config()
+    .unwrap();
+
+    let kitsune = builder.build().await.unwrap();
+    kitsune.register_handler(Arc::new(K)).await.unwrap();
+    let space = kitsune.space(TEST_SPACE_ID.clone(), None).await.unwrap();
+    let translator = space_handler
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the space registers its handler with the transport");
+
+    let peer = Url::from_str("ws://peer.test:80/peer").unwrap();
+    let meta = space.peer_meta_store().clone();
+    meta.set_unresponsive(
+        peer.clone(),
+        Timestamp::now() + std::time::Duration::from_secs(600),
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    assert!(meta.get_unresponsive(peer.clone()).await.unwrap().is_some());
+
+    translator.peer_connect(peer.clone()).unwrap();
+
+    iter_check!(1000, {
+        if meta.get_unresponsive(peer.clone()).await.unwrap().is_none() {
+            break;
+        }
+    });
 }

@@ -2,6 +2,7 @@
 members = [
   "crates/api",
   "crates/bootstrap_client",
+  "crates/bootstrap_mdns",
   "crates/bootstrap_srv",
   "crates/core",
   "crates/dht",
@@ -16,7 +17,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0-dev.2"
 authors = ["Holochain Core Dev Team <devcore@holochain.org>"]
 homepage = "https://www.holochain.org/"
 repository = "https://github.com/holochain/kitsune2"
@@ -34,26 +35,27 @@ panic = "abort"
 [workspace.dependencies]
 # Self dependencies for workspace crates to depend on each other.
 # For example, most crates will depend on the api crate.
-kitsune2 = { version = "0.5.0-dev.0", path = "crates/kitsune2", default-features = false }
-kitsune2_api = { version = "0.5.0-dev.0", path = "crates/api" }
-kitsune2_dht = { version = "0.5.0-dev.0", path = "crates/dht" }
-kitsune2_gossip = { version = "0.5.0-dev.0", path = "crates/gossip" }
-kitsune2_transport_iroh = { version = "0.5.0-dev.0", path = "crates/transport_iroh" }
-kitsune2_bootstrap_client = { version = "0.5.0-dev.0", path = "crates/bootstrap_client" }
+kitsune2 = { version = "0.6.0-dev.0", path = "crates/kitsune2", default-features = false }
+kitsune2_api = { version = "0.6.0-dev.0", path = "crates/api" }
+kitsune2_dht = { version = "0.6.0-dev.0", path = "crates/dht" }
+kitsune2_gossip = { version = "0.6.0-dev.0", path = "crates/gossip" }
+kitsune2_transport_iroh = { version = "0.6.0-dev.0", path = "crates/transport_iroh" }
+kitsune2_bootstrap_client = { version = "0.6.0-dev.0", path = "crates/bootstrap_client" }
+kitsune2_bootstrap_mdns = { version = "0.6.0-dev.0", path = "crates/bootstrap_mdns" }
 
 # used by bootstrap_srv for mpmc worker queue pattern.
 async-channel = "2.3.1"
 # this is used by bootstrap_srv as the http server implementation.
 axum = { version = "0.8", default-features = false }
 # CORS support for axum
-tower-http = "0.6"
+tower-http = "0.7"
 # Tower middleware and service abstractions
 tower = "0.5"
 # Used with tower-http for constants
 http = "1.3"
 # debugging is far easier when you can see short byte arrays
 # as base64 instead of decimal u8s.
-base64 = "0.22.1"
+base64 = "0.23.0"
 # shallow-clone byte arrays is a solved problem.
 # bytes is the crate that solves it.
 bytes = { version = "1.8.0", features = ["serde"] }
@@ -65,11 +67,17 @@ clap = "4.5.21"
 # on shutdown.
 ctrlc = { version = "3.4.5", features = ["termination"] }
 # bootstrap_srv for signature verification.
-ed25519-dalek = "2.1.1"
+ed25519-dalek = "3.0.0"
+# key derivation for the per-space key material the access module uses.
+hkdf = "0.13.0"
+# the access module's proof-of-knowledge proofs are HMACs.
+hmac = "0.13.0"
 # alternative transport implementation using iroh
-iroh = "1.0.0"
+iroh = "1.4.1"
+# mDNS address lookup service for iroh, used for LAN discovery in the iroh transport
+iroh-mdns-address-lookup = "0.6.1"
 # automock traits for tests
-mockall = "0.14"
+mockall = "0.15"
 # watchable stream of values used in iroh transport
 n0-watcher = "1.0.0-rc.0"
 # bootstrap_srv uses this to determine worker thread count.
@@ -77,12 +85,14 @@ num_cpus = "1.16.0"
 # api uses this for the kitsune2 wire protocol.
 prost = "0.14"
 # used to generate private cryptography keys.
-rand = "0.8.5"
+rand = "0.10.1"
 # kitsune types need to be serializable for network transmission.
 serde = { version = "1.0", features = ["derive"] }
 # kitsune2 agent info is serialized as json to improve debugability of
 # bootstrapping. So, we need a json library.
 serde_json = "1.0"
+# the hash backing the access module's HMAC and KDF, and used to hash op data.
+sha2 = "0.11.0"
 # tokio is used for synchronization primitives as well as internal
 # task spawning. We could consider abstracting the async runtime
 # at some point in the future.
@@ -112,15 +122,15 @@ rustls-pemfile = "2.2"
 # axum-server integration with rustls for TLS
 tokio-rustls = "0.26"
 # for generating JSON schemas to help with checking configuration
-schemars = { version = "0.9", features = ["preserve_order"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
 # Used in the showcase CLI
 rustyline = { version = "18.0" }
 # Used in showcase app for the commands
 strum = { version = "0.28", features = ["derive", "strum_macros"] }
 # Used for telemetry in relay server and bootstrap relay metrics
-opentelemetry = "0.30"
-opentelemetry_sdk = "0.30"
-opentelemetry-otlp = { version = "0.30", features = ["http-proto"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", features = ["http-proto"] }
 # --- tool-dependencies ---
 # The following workspace dependencies are thus-far only used in unpublished
 # tools and so are not needed in any true dependency trees.
@@ -135,22 +145,20 @@ prost-build = "0.14"
 # --- dev-dependencies ---
 # Criterion benchmarks
 criterion = { version = "0.8", features = ["async_tokio"] }
-kitsune2_bootstrap_srv = { version = "0.5.0-dev.0", path = "crates/bootstrap_srv" }
-kitsune2_core = { version = "0.5.0-dev.0", path = "crates/core" }
-kitsune2_test_utils = { version = "0.5.0-dev.0", path = "crates/test_utils" }
+kitsune2_bootstrap_srv = { version = "0.6.0-dev.0", path = "crates/bootstrap_srv" }
+kitsune2_core = { version = "0.6.0-dev.0", path = "crates/core" }
+kitsune2_test_utils = { version = "0.6.0-dev.0", path = "crates/test_utils" }
 
 # iroh relay for testing iroh transport
-iroh-relay = "1.0.0"
-iroh-base = "1.0.0"
+iroh-relay = "1.4.1"
+iroh-base = "1.4.1"
 # DNS resolver split out of iroh-relay in the 1.0 release; used in tests
 # that drive a relay client.
-iroh-dns = "1.0.0"
+iroh-dns = "1.4.1"
 
-# used to hash op data
-sha2 = "0.11"
 # Generating test certificates in the bootstrap_srv
 rcgen = "0.14"
 # Deterministic RNG for reproducible tests
 rand_chacha = "0.10"
 # Used in the schema example
-jsonschema = "0.46"
+jsonschema = "0.55"

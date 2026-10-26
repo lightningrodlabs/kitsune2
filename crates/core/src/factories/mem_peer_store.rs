@@ -98,7 +98,22 @@ impl PeerStoreFactory for MemPeerStoreFactory {
 }
 
 /// A production-ready memory-based peer store.
-pub struct MemPeerStore(Mutex<Inner>);
+pub struct MemPeerStore {
+    inner: Mutex<Inner>,
+
+    /// The peer update listeners.
+    ///
+    /// These live outside [`Inner`], behind a std mutex rather than the async
+    /// one, because [`Inner::insert`] is awaited while the async lock is held
+    /// and registration cannot await: the trait method is synchronous, so
+    /// reaching for the async lock there could only ever be a `try_lock` that
+    /// fails whenever an insert happens to be in flight. Registration happens
+    /// during space construction, concurrently with the first bootstrap poll,
+    /// so that collision is a real one. Nothing is awaited while this lock is
+    /// held — the critical sections are a push and a clone — so a plain mutex
+    /// is both correct and infallible here.
+    listeners: std::sync::Mutex<Vec<Listener>>,
+}
 
 impl std::fmt::Debug for MemPeerStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,12 +128,23 @@ impl MemPeerStore {
         blocks: DynBlocks,
         known_peers: DynKnownPeers,
     ) -> Self {
-        Self(Mutex::new(Inner::new(
-            config,
-            std::time::Instant::now(),
-            blocks,
-            known_peers,
-        )))
+        Self {
+            inner: Mutex::new(Inner::new(
+                config,
+                std::time::Instant::now(),
+                blocks,
+                known_peers,
+            )),
+            listeners: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A snapshot of the listeners to dispatch to.
+    ///
+    /// Taken by value so that no lock of either kind is held while a listener
+    /// runs: they are async, and one of them inserts into this very store.
+    fn listeners(&self) -> Vec<Listener> {
+        self.listeners.lock().expect("poison").clone()
     }
 }
 
@@ -128,13 +154,12 @@ impl PeerStore for MemPeerStore {
         agent_list: Vec<Arc<AgentInfoSigned>>,
     ) -> BoxFut<'_, K2Result<()>> {
         Box::pin(async move {
-            let mut guard = self.0.lock().await;
+            let mut guard = self.inner.lock().await;
             let inserted = guard.insert(agent_list.clone()).await?;
+            drop(guard);
 
-            if !inserted.is_empty() && !guard.listeners.is_empty() {
-                let listeners = guard.listeners.to_vec();
-                drop(guard);
-
+            if !inserted.is_empty() {
+                let listeners = self.listeners();
                 for agent in inserted {
                     for listener in &listeners {
                         listener(agent.clone()).await;
@@ -148,14 +173,12 @@ impl PeerStore for MemPeerStore {
 
     fn remove(&self, agent_id: AgentId) -> BoxFut<'_, K2Result<()>> {
         Box::pin(async move {
-            let mut guard = self.0.lock().await;
+            let mut guard = self.inner.lock().await;
             let removed = guard.remove(&agent_id);
+            drop(guard);
 
             if let Some(removed) = removed {
-                let listeners = guard.listeners.to_vec();
-                drop(guard);
-
-                for listener in &listeners {
+                for listener in &self.listeners() {
                     listener(removed.clone()).await;
                 }
             }
@@ -168,11 +191,11 @@ impl PeerStore for MemPeerStore {
         &self,
         agent: AgentId,
     ) -> BoxFut<'_, K2Result<Option<Arc<AgentInfoSigned>>>> {
-        Box::pin(async move { Ok(self.0.lock().await.get(agent)) })
+        Box::pin(async move { Ok(self.inner.lock().await.get(agent)) })
     }
 
     fn get_all(&self) -> BoxFut<'_, K2Result<Vec<Arc<AgentInfoSigned>>>> {
-        Box::pin(async move { Ok(self.0.lock().await.get_all()) })
+        Box::pin(async move { Ok(self.inner.lock().await.get_all()) })
     }
 
     fn get_by_overlapping_storage_arc(
@@ -180,7 +203,7 @@ impl PeerStore for MemPeerStore {
         arc: DhtArc,
     ) -> BoxFut<'_, K2Result<Vec<Arc<AgentInfoSigned>>>> {
         Box::pin(async move {
-            Ok(self.0.lock().await.get_by_overlapping_storage_arc(arc))
+            Ok(self.inner.lock().await.get_by_overlapping_storage_arc(arc))
         })
     }
 
@@ -190,7 +213,7 @@ impl PeerStore for MemPeerStore {
         limit: usize,
     ) -> BoxFut<'_, K2Result<Vec<Arc<AgentInfoSigned>>>> {
         Box::pin(async move {
-            Ok(self.0.lock().await.get_near_location(loc, limit))
+            Ok(self.inner.lock().await.get_near_location(loc, limit))
         })
     }
 
@@ -198,7 +221,9 @@ impl PeerStore for MemPeerStore {
         &self,
         peer_url: Url,
     ) -> BoxFut<'_, K2Result<Vec<Arc<AgentInfoSigned>>>> {
-        Box::pin(async move { Ok(self.0.lock().await.get_by_url(&peer_url)) })
+        Box::pin(
+            async move { Ok(self.inner.lock().await.get_by_url(&peer_url)) },
+        )
     }
 
     fn register_peer_update_listener(
@@ -207,10 +232,9 @@ impl PeerStore for MemPeerStore {
             dyn (Fn(Arc<AgentInfoSigned>) -> BoxFut<'static, ()>) + Send + Sync,
         >,
     ) -> K2Result<()> {
-        let mut inner = self.0.try_lock().map_err(|e| {
-            K2Error::other_src("Unable to lock MemPeerStore", e)
-        })?;
-        inner.listeners.push(listener);
+        self.listeners.lock().expect("poison").push(listener);
+
+        // Infallible, but the trait signature is fallible, so say so.
         Ok(())
     }
 }
@@ -222,7 +246,6 @@ struct Inner {
     config: MemPeerStoreConfig,
     store: HashMap<AgentId, Arc<AgentInfoSigned>>,
     no_prune_until: std::time::Instant,
-    listeners: Vec<Listener>,
     blocks: DynBlocks,
     known_peers: DynKnownPeers,
 }
@@ -239,7 +262,6 @@ impl Inner {
             config,
             store: HashMap::new(),
             no_prune_until,
-            listeners: Vec::new(),
             blocks,
             known_peers,
         }

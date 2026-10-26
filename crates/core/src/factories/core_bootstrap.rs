@@ -126,6 +126,7 @@ impl BootstrapFactory for CoreBootstrapFactory {
         builder: Arc<Builder>,
         peer_store: DynPeerStore,
         space_id: SpaceId,
+        _tx: DynTransport,
     ) -> BoxFut<'static, K2Result<DynBootstrap>> {
         Box::pin(async move {
             Self::validate_config_for_context(&builder.config, true)?;

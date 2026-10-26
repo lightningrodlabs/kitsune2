@@ -15,28 +15,41 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[test]
-fn classify_not_active_is_quiet() {
-    assert_eq!(classify_exit(false, None, true), ReaderCleanup::Quiet);
+fn classify_not_active_is_inactive() {
+    assert_eq!(
+        classify_exit(false, false, None, true),
+        ReaderCleanup::Inactive
+    );
     assert_eq!(
         classify_exit(
+            false,
             false,
             Some((CloseCode::Graceful, Bytes::from_static(b"bye"))),
             true
         ),
-        ReaderCleanup::Quiet,
+        ReaderCleanup::Inactive,
         "a non-active connection is torn down quietly even on graceful close"
     );
 }
 
 #[test]
-fn classify_superseded_code_is_quiet() {
+fn classify_superseded_code_is_superseded() {
     assert_eq!(
         classify_exit(
             true,
+            false,
             Some((CloseCode::Superseded, Bytes::from_static(b"whatever"))),
             true
         ),
-        ReaderCleanup::Quiet
+        ReaderCleanup::Superseded
+    );
+}
+
+#[test]
+fn classify_superseded_state_is_superseded() {
+    assert_eq!(
+        classify_exit(false, true, None, true),
+        ReaderCleanup::Superseded
     );
 }
 
@@ -45,6 +58,7 @@ fn classify_graceful_close_carries_reason() {
     assert_eq!(
         classify_exit(
             true,
+            false,
             Some((CloseCode::Graceful, Bytes::from_static(b"space closed"))),
             true
         ),
@@ -57,7 +71,7 @@ fn classify_graceful_close_carries_reason() {
 #[test]
 fn classify_genuine_death_marks_unresponsive() {
     assert_eq!(
-        classify_exit(true, None, true),
+        classify_exit(true, false, None, true),
         ReaderCleanup::PeerGone {
             mark_unresponsive: true
         }
@@ -67,7 +81,7 @@ fn classify_genuine_death_marks_unresponsive() {
 #[test]
 fn classify_temporary_error_skips_unresponsive() {
     assert_eq!(
-        classify_exit(true, None, false),
+        classify_exit(true, false, None, false),
         ReaderCleanup::PeerGone {
             mark_unresponsive: false
         }
@@ -95,7 +109,7 @@ async fn graceful_remote_close_releases_quietly_with_reason() {
     .expect("condition not met within timeout");
 
     assert_eq!(
-        recorder.unresponsive_calls.load(Ordering::SeqCst),
+        recorder.unresponsive_calls.lock().unwrap().len(),
         0,
         "a graceful remote close must not mark the peer unresponsive"
     );
@@ -136,7 +150,7 @@ async fn local_disconnect_closes_with_graceful_code_and_reason() {
                 .all(|reason| reason.as_deref() == Some("bye")),
         "local handlers must get peer_disconnect with the reason, got {disconnects:?}"
     );
-    assert_eq!(recorder.unresponsive_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(recorder.unresponsive_calls.lock().unwrap().len(), 0);
 }
 
 /// End-to-end: a graceful `Transport::disconnect` on one peer must inform

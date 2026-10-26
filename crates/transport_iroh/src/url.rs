@@ -52,6 +52,41 @@ pub(super) fn canonicalize_relay_url(
     Url::from_str(canonical_relay_url)
 }
 
+/// Whether two relay URLs name the same relay.
+///
+/// This is deliberately not `==`. The same relay reaches us written both ways
+/// round: a fully qualified host name may carry the DNS root's trailing dot
+/// (`relay.example.com.`) or not, depending on what resolved it and when, and
+/// the two spellings have been seen alternating between sessions of the same
+/// node. String equality would then decide that a peer sharing our relay is on
+/// a foreign one, so the comparison normalizes the host before making that
+/// call. Host comparison is also case insensitive, which URL parsing already
+/// guarantees for these schemes but which costs nothing to state.
+///
+/// Everything else — scheme, port and path — must match exactly, since those
+/// really do select different relays.
+pub(super) fn relays_match(a: &RelayUrl, b: &RelayUrl) -> bool {
+    fn normalized_host(url: &RelayUrl) -> Option<&str> {
+        url.host_str()
+            .map(|host| host.strip_suffix('.').unwrap_or(host))
+    }
+
+    if a.scheme() != b.scheme()
+        || a.port_or_known_default() != b.port_or_known_default()
+        || a.path() != b.path()
+    {
+        return false;
+    }
+
+    match (normalized_host(a), normalized_host(b)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        // Neither has a host to normalize, so there is nothing left that could
+        // differ beyond what was compared above.
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Extract the relay URL from a kitsune2 peer URL.
 ///
 /// Everything before the last path segment is the relay URL.
@@ -91,4 +126,61 @@ pub(super) fn endpoint_from_url(url: &Url) -> K2Result<EndpointAddr> {
         endpoint_id,
         [TransportAddr::Relay(relay_url)],
     ))
+}
+
+/// What a space's config asks the transport to do about its relay.
+#[derive(Debug, PartialEq)]
+pub(super) struct SpaceRelay {
+    /// The relay to insert for this space.
+    pub url: String,
+    /// The auth material to present to it, if the space brought its own.
+    pub auth_material_base64: Option<String>,
+}
+
+/// What to configure for a space, or `None` to leave the transport's relay
+/// alone.
+///
+/// A relay is the space's own when it differs from the transport's - trailing
+/// slashes are not a difference - or when the space brought auth material of its
+/// own.
+///
+/// Auth material only authenticates the relay it was issued for, and a config
+/// merge hands a space every field its override did not set. Material equal to
+/// the transport's was therefore inherited rather than chosen, and is never
+/// carried to a relay the space named itself.
+pub(super) fn per_space_relay(
+    space_relay_url: Option<&str>,
+    space_auth_material: Option<&str>,
+    transport_relay_url: Option<&str>,
+    transport_auth_material: Option<&str>,
+) -> Option<SpaceRelay> {
+    let url = space_relay_url?;
+
+    let own_auth_material =
+        space_auth_material.filter(|m| Some(*m) != transport_auth_material);
+
+    let ours = is_transport_own_relay(url, transport_relay_url);
+
+    if ours && own_auth_material.is_none() {
+        return None;
+    }
+
+    Some(SpaceRelay {
+        url: url.to_string(),
+        auth_material_base64: own_auth_material.map(str::to_string),
+    })
+}
+
+/// Whether this relay is the one the transport connected to itself.
+///
+/// A trailing slash is not a difference. With no relay of our own, nothing is
+/// ours, so anything a space names is its own.
+pub(super) fn is_transport_own_relay(
+    relay_url: &str,
+    transport_relay_url: Option<&str>,
+) -> bool {
+    transport_relay_url.is_some_and(|transport_relay_url| {
+        relay_url.trim_end_matches('/')
+            == transport_relay_url.trim_end_matches('/')
+    })
 }

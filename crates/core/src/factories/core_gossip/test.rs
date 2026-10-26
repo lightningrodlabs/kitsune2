@@ -79,6 +79,7 @@ async fn create_gossip_instance() {
                 )
                 .await
                 .unwrap(),
+            GossipSpaceHooks::permissive(),
         )
         .await
         .unwrap();

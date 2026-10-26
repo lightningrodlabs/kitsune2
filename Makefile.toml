@@ -7,9 +7,28 @@ workspace = false
 command = "cargo"
 args = ["fmt", "--", "--check"]
 
-[tasks.clippy]
+[tasks.clippy-default]
+description = "Clippy with the default feature set"
 command = "cargo"
 args = ["clippy", "--all-targets", "--", "--deny=warnings"]
+
+[tasks.clippy-mdns]
+description = "Clippy with LAN discovery enabled, so the mDNS-gated code is linted too"
+workspace = false
+command = "cargo"
+args = [
+  "clippy",
+  "--features",
+  "kitsune2/mdns,kitsune2_transport_iroh/mdns",
+  "--all-targets",
+  "--",
+  "--deny=warnings",
+]
+
+[tasks.clippy]
+description = "Run clippy in every feature configuration that gates code"
+workspace = false
+dependencies = ["clippy-default", "clippy-mdns"]
 
 [tasks.format-toml-check]
 description = "Check that all TOML files are formatted correctly"
@@ -31,9 +50,27 @@ install_crate = false
 # Tests
 #
 
-[tasks.test]
+[tasks.test-default]
+description = "Run the tests with the default feature set"
 command = "cargo"
 args = ["test"]
+
+[tasks.test-metrics]
+description = "Run the tests with the iroh transport's `metrics` feature enabled"
+workspace = false
+command = "cargo"
+args = ["test", "-p", "kitsune2_transport_iroh", "--features", "metrics"]
+
+[tasks.test-mdns]
+description = "Run the tests with LAN discovery enabled, so the mDNS-gated tests are compiled and run"
+workspace = false
+command = "cargo"
+args = ["test", "--features", "kitsune2/mdns,kitsune2_transport_iroh/mdns"]
+
+[tasks.test]
+description = "Run the tests in every feature configuration that gates code"
+workspace = false
+dependencies = ["test-default", "test-metrics", "test-mdns"]
 
 [tasks.bench-build]
 description = "Build all benchmarks without running them so they don't bit-rot"
@@ -77,6 +114,7 @@ dependencies = ["format-toml-check", "format-check"]
 
 [tasks.static]
 description = "Run all static checks"
+workspace = false
 dependencies = [
   "format-toml-check",
   "format-check",

@@ -12,6 +12,7 @@ use tokio::task::AbortHandle;
 pub fn spawn_initiate_task(
     config: Arc<K2GossipConfig>,
     gossip: Weak<K2Gossip>,
+    hooks: GossipSpaceHooks,
 ) -> (tokio::sync::mpsc::Sender<()>, AbortHandle) {
     tracing::info!("Starting initiate task");
 
@@ -112,6 +113,7 @@ pub fn spawn_initiate_task(
                 gossip.peer_store.clone(),
                 &local_agents,
                 gossip.peer_meta_store.clone(),
+                &hooks.peer_eligible,
             )
             .await
             {
@@ -142,7 +144,15 @@ pub fn spawn_initiate_task(
                     }
                 }
                 Ok(None) => {
-                    // Nobody to gossip with, expect `select_next_target` to have logged a reason
+                    // Nobody to gossip with, expect `select_next_target` to have logged a reason.
+                    //
+                    // This covers both "we know of nobody" and "everybody we
+                    // know of is ineligible", which is the shape symmetric
+                    // grant loss takes: this timer is then the only thing
+                    // still firing, so report the starvation. It covers the
+                    // force-initiate path too, since forcing only skips the
+                    // delay ahead of this same selection.
+                    (hooks.on_no_target)();
                 }
                 Err(e) => {
                     tracing::error!("Error selecting target: {:?}", e);
@@ -159,6 +169,7 @@ async fn select_next_target(
     peer_store: DynPeerStore,
     local_agents: &[DynLocalAgent],
     peer_meta_store: Arc<K2PeerMetaStore>,
+    peer_eligible: &GossipPeerEligible,
 ) -> K2Result<Option<Url>> {
     let current_time = Timestamp::now();
 
@@ -207,6 +218,7 @@ async fn select_next_target(
         all_agents,
         peer_meta_store.clone(),
         current_time,
+        peer_eligible,
     )
     .await?;
 
@@ -223,6 +235,7 @@ async fn select_next_target(
             all_agents,
             peer_meta_store.clone(),
             current_time,
+            peer_eligible,
         )
         .await?;
     }
@@ -248,6 +261,7 @@ async fn select_responsive_and_least_recently_gossiped(
     all_agents: HashSet<Arc<AgentInfoSigned>>,
     peer_meta_store: Arc<K2PeerMetaStore>,
     current_time: Timestamp,
+    peer_eligible: &GossipPeerEligible,
 ) -> K2Result<Option<Url>> {
     let mut possible_targets = Vec::with_capacity(all_agents.len());
     for agent in all_agents {
@@ -265,6 +279,19 @@ async fn select_responsive_and_least_recently_gossiped(
         let Some(url) = agent.url.clone() else {
             continue;
         };
+
+        // The space has not granted this peer access, so the transport would
+        // refuse to send to it. Gossiping with it is not merely futile: the
+        // initiate message is dropped locally while the round it starts stays
+        // open, and no other peer is initiated with until that round times
+        // out.
+        if !peer_eligible(&url) {
+            tracing::debug!(
+                ?url,
+                "Skipping a peer that is not eligible to gossip with"
+            );
+            continue;
+        }
 
         // Agent has been marked as unresponsive, we won't be able to gossip
         // with them.
@@ -301,6 +328,11 @@ mod tests {
     use kitsune2_test_utils::enable_tracing;
     use kitsune2_test_utils::space::TEST_SPACE_ID;
     use std::sync::Arc;
+
+    /// Access is not what these tests are about, so every peer is eligible.
+    fn all_eligible() -> GossipPeerEligible {
+        Arc::new(|_| true)
+    }
 
     struct Harness {
         peer_store: DynPeerStore,
@@ -392,6 +424,214 @@ mod tests {
         }
     }
 
+    /// A gossip instance wired to in-memory modules, with the hooks a test
+    /// wants and nothing else in the peer store.
+    struct StarvationHarness {
+        gossip: Arc<crate::gossip::K2Gossip>,
+        peer_store: DynPeerStore,
+        peer_meta_store: Arc<K2PeerMetaStore>,
+        starved: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StarvationHarness {
+        async fn create(peer_eligible: GossipPeerEligible) -> Self {
+            #[derive(Debug)]
+            struct NoopTxHandler;
+            impl kitsune2_api::TxBaseHandler for NoopTxHandler {}
+            impl kitsune2_api::TxHandler for NoopTxHandler {}
+
+            let builder =
+                Arc::new(default_test_builder().with_default_config().unwrap());
+            let transport = builder
+                .transport
+                .create(builder.clone(), Arc::new(NoopTxHandler))
+                .await
+                .unwrap();
+            let report = builder
+                .report
+                .create(builder.clone(), transport.clone())
+                .await
+                .unwrap();
+            let blocks = builder
+                .blocks
+                .create(builder.clone(), TEST_SPACE_ID)
+                .await
+                .unwrap();
+            let known_peers = builder
+                .known_peers
+                .create(builder.clone(), TEST_SPACE_ID)
+                .await
+                .unwrap();
+            let peer_store = builder
+                .peer_store
+                .create(builder.clone(), TEST_SPACE_ID, blocks, known_peers)
+                .await
+                .unwrap();
+            let local_agent_store = builder
+                .local_agent_store
+                .create(builder.clone())
+                .await
+                .unwrap();
+            let peer_meta_store = builder
+                .peer_meta_store
+                .create(builder.clone(), TEST_SPACE_ID)
+                .await
+                .unwrap();
+            let op_store = builder
+                .op_store
+                .create(builder.clone(), TEST_SPACE_ID)
+                .await
+                .unwrap();
+            let fetch = builder
+                .fetch
+                .create(
+                    builder.clone(),
+                    TEST_SPACE_ID,
+                    report,
+                    op_store.clone(),
+                    peer_meta_store.clone(),
+                    transport.clone(),
+                )
+                .await
+                .unwrap();
+
+            // A local agent, so the initiate loop gets as far as looking for
+            // a target rather than skipping the iteration.
+            local_agent_store
+                .add(Arc::new(TestLocalAgent::default()))
+                .await
+                .unwrap();
+
+            let starved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let gossip = crate::gossip::K2Gossip::create(
+                K2GossipConfig {
+                    initiate_interval_ms: 5,
+                    min_initiate_interval_ms: 5,
+                    initial_initiate_interval_ms: 5,
+                    initiate_jitter_ms: 0,
+                    ..Default::default()
+                },
+                TEST_SPACE_ID,
+                peer_store.clone(),
+                local_agent_store,
+                peer_meta_store.clone(),
+                op_store,
+                transport,
+                fetch,
+                builder.verifier.clone(),
+                GossipSpaceHooks {
+                    peer_eligible,
+                    on_no_target: {
+                        let starved = starved.clone();
+                        Arc::new(move || {
+                            starved.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                        })
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+            StarvationHarness {
+                gossip,
+                peer_store,
+                peer_meta_store: Arc::new(K2PeerMetaStore::new(
+                    peer_meta_store,
+                )),
+                starved,
+            }
+        }
+
+        fn starved(&self) -> usize {
+            self.starved.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn await_starvation(&self) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.starved() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("gossip never reported having no target");
+        }
+
+        /// Whether this peer has been picked as a gossip target.
+        async fn was_selected(&self, url: &Url) -> bool {
+            self.peer_meta_store
+                .last_gossip_timestamp(url.clone())
+                .await
+                .unwrap()
+                .is_some()
+        }
+    }
+
+    /// Gossip reports a starved initiation, which is the only event still
+    /// firing when two peers have symmetrically forgotten each other's access
+    /// grant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notify_when_there_is_no_target() {
+        enable_tracing();
+
+        let harness = StarvationHarness::create(Arc::new(|_| true)).await;
+        harness.await_starvation().await;
+    }
+
+    /// A peer the space will not let us talk to is not a gossip target, and a
+    /// peer store holding only such peers starves gossip exactly as an empty
+    /// one does.
+    ///
+    /// Choosing an ineligible peer would be worse than useless: the transport
+    /// drops the initiate locally while the round it opened stays in flight,
+    /// and no other peer is initiated with until that round times out — which
+    /// is also what would hide the starvation the access module needs to hear
+    /// about.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ineligible_peers_are_not_gossip_targets() {
+        enable_tracing();
+
+        let peer_url = Url::from_str("ws://test:80/ineligible").unwrap();
+
+        // The control: with everyone eligible, this peer is picked, so the
+        // test below is about eligibility and not about some other filter.
+        let permissive = StarvationHarness::create(Arc::new(|_| true)).await;
+        insert_remote_agent(&permissive.peer_store, &peer_url).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !permissive.was_selected(&peer_url).await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an eligible peer must be selected");
+
+        let harness = StarvationHarness::create(Arc::new(|_| false)).await;
+        insert_remote_agent(&harness.peer_store, &peer_url).await;
+
+        harness.await_starvation().await;
+        assert!(
+            !harness.was_selected(&peer_url).await,
+            "an ineligible peer must never be initiated with"
+        );
+        assert!(
+            harness.gossip.initiated_round_state.lock().await.is_none(),
+            "no round may be opened toward an ineligible peer"
+        );
+    }
+
+    async fn insert_remote_agent(peer_store: &DynPeerStore, url: &Url) {
+        let local_agent: DynLocalAgent = Arc::new(TestLocalAgent::default());
+        local_agent.set_cur_storage_arc(DhtArc::FULL);
+        local_agent.set_tgt_storage_arc_hint(DhtArc::FULL);
+        let info = AgentBuilder::default()
+            .with_url(Some(url.clone()))
+            .with_storage_arc(DhtArc::FULL)
+            .build(local_agent);
+        peer_store.insert(vec![info]).await.unwrap();
+    }
+
     #[tokio::test]
     async fn skip_when_no_local_agents() {
         enable_tracing();
@@ -412,6 +652,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -440,6 +681,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -494,6 +736,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -515,6 +758,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -537,6 +781,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -568,6 +813,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -587,6 +833,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -634,6 +881,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -673,6 +921,7 @@ mod tests {
                 harness.peer_store.clone(),
                 &harness.local_agent_store.get_all().await.unwrap(),
                 harness.peer_meta_store.clone(),
+                &all_eligible(),
             )
             .await
             .unwrap() else {
@@ -724,6 +973,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap() else {
@@ -737,6 +987,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap() else {
@@ -759,6 +1010,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap() else {
@@ -788,6 +1040,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();
@@ -809,6 +1062,7 @@ mod tests {
             harness.peer_store.clone(),
             &harness.local_agent_store.get_all().await.unwrap(),
             harness.peer_meta_store.clone(),
+            &all_eligible(),
         )
         .await
         .unwrap();

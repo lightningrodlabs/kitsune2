@@ -9,6 +9,11 @@ pub const KEY_PREFIX_ROOT: &str = "root";
 /// Meta key for unresponsive URLs.
 pub const META_KEY_UNRESPONSIVE: &str = "unresponsive";
 
+/// The full key under which a peer's unresponsive mark is stored.
+fn unresponsive_key() -> String {
+    format!("{KEY_PREFIX_ROOT}:{META_KEY_UNRESPONSIVE}")
+}
+
 /// A store for peer metadata.
 ///
 /// This is expected to be backed by a key-value store that keys by space, peer URL and key.
@@ -51,7 +56,7 @@ pub trait PeerMetaStore: 'static + Send + Sync + std::fmt::Debug {
         Box::pin(async move {
             self.put(
                 peer.clone(),
-                format!("{KEY_PREFIX_ROOT}:{META_KEY_UNRESPONSIVE}"),
+                unresponsive_key(),
                 serde_json::to_vec(&when).map_err(K2Error::other)?.into(),
                 Some(expiry),
             )
@@ -67,9 +72,7 @@ pub trait PeerMetaStore: 'static + Send + Sync + std::fmt::Debug {
         peer: Url,
     ) -> BoxFuture<'_, K2Result<Option<Timestamp>>> {
         Box::pin(async move {
-            let maybe_value = self
-                .get(peer, format!("{KEY_PREFIX_ROOT}:{META_KEY_UNRESPONSIVE}"))
-                .await?;
+            let maybe_value = self.get(peer, unresponsive_key()).await?;
             match maybe_value {
                 None => Ok(None),
                 Some(value) => {
@@ -80,6 +83,16 @@ pub trait PeerMetaStore: 'static + Send + Sync + std::fmt::Debug {
                 }
             }
         })
+    }
+
+    /// Forget that a peer URL was marked unresponsive.
+    ///
+    /// A peer that has just completed a connection with us is responsive by
+    /// definition, so whatever earlier failure put it on the unresponsive
+    /// list no longer describes it. Clearing a URL that is not marked is not
+    /// an error.
+    fn clear_unresponsive(&self, peer: Url) -> BoxFuture<'_, K2Result<()>> {
+        self.delete(peer, unresponsive_key())
     }
 
     /// Delete a key-value pair for a given space and peer.

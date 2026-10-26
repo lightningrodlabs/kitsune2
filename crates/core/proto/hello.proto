@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package kitsune2.hello;
+
+// Opens a hello exchange. Sent by the initiator to the responder.
+message Initiate {
+  // The hello protocol version this initiator speaks.
+  uint32 proto_ver = 1;
+
+  // The initiator's fresh nonce. Exactly 32 bytes.
+  bytes nonce_i = 2;
+}
+
+// Answers an `Initiate`. Sent by the responder to the initiator.
+//
+// The responder proves first and discloses nothing: no agent infos ride on
+// this message, because the initiator has not proven anything yet.
+message Respond {
+  // The hello protocol version this responder speaks.
+  uint32 proto_ver = 1;
+
+  // The responder's fresh nonce. Exactly 32 bytes.
+  bytes nonce_r = 2;
+
+  // The responder's proof over its transcript.
+  bytes proof_r = 3;
+}
+
+// Answers a `Respond`. Sent by the initiator to the responder.
+//
+// Sent only after the responder's proof has been verified, so it is safe to
+// disclose the initiator's agent infos here.
+message Confirm {
+  // The initiator's proof over its transcript.
+  bytes proof_i = 1;
+
+  // The initiator's agent infos, each an encoded `AgentInfoSigned`.
+  repeated string agent_infos_i = 2;
+}
+
+// Answers a `Confirm`. Sent by the responder to the initiator.
+//
+// Sent only after the initiator's proof has been verified.
+message Ack {
+  // The responder's agent infos, each an encoded `AgentInfoSigned`.
+  repeated string agent_infos_r = 1;
+}
+
+// The envelope for all hello protocol messages.
+message K2HelloMessage {
+  // The message carried by this envelope.
+  oneof msg {
+    // An exchange opening message.
+    Initiate initiate = 1;
+
+    // A response to an `Initiate`.
+    Respond respond = 2;
+
+    // A response to a `Respond`.
+    Confirm confirm = 3;
+
+    // A response to a `Confirm`.
+    Ack ack = 4;
+  }
+}

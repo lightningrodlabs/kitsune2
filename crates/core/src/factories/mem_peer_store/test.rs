@@ -360,3 +360,66 @@ async fn remove_blocked_agent() {
     let agent_1 = mem_store.get(AGENT_1);
     assert!(agent_1.is_none());
 }
+
+/// Registering a listener must never fail, however busy the store is.
+///
+/// Registration has a synchronous signature and so cannot await, while an
+/// insert holds the store's async lock across await points — the block and
+/// known-peers checks it does per agent, and then the listeners it dispatches
+/// to. When the listeners lived inside that same lock, registration could only
+/// `try_lock`, and returned an error whenever it happened to collide with an
+/// insert. That collision is not hypothetical: a space registers two listeners
+/// while its bootstrap poll is already inserting, so under load the space
+/// simply failed to build.
+#[tokio::test(flavor = "multi_thread")]
+async fn registering_a_listener_never_fails_under_concurrent_inserts() {
+    const INSERTERS: usize = 8;
+    const INSERTS_EACH: usize = 32;
+    const REGISTRARS: usize = 4;
+    const REGISTRATIONS_EACH: usize = 32;
+
+    let store: DynPeerStore = Arc::new(MemPeerStore::new(
+        MemPeerStoreConfig {
+            prune_interval_s: 10,
+        },
+        Arc::new(MemBlocks::default()),
+        Arc::new(CoreKnownPeers::default()),
+    ));
+
+    // Every insert dispatches to every listener registered so far, and each
+    // listener awaits, so the inserts hold the store's lock across await
+    // points for as long as the storm lasts.
+    let mut tasks = Vec::new();
+    for _ in 0..INSERTERS {
+        let store = store.clone();
+        tasks.push(tokio::task::spawn(async move {
+            for _ in 0..INSERTS_EACH {
+                let info = AgentBuilder::default()
+                    .with_url(Some(sneak_url("hammer")))
+                    .build(TestLocalAgent::default());
+                store.insert(vec![info]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    for _ in 0..REGISTRARS {
+        let store = store.clone();
+        tasks.push(tokio::task::spawn(async move {
+            for _ in 0..REGISTRATIONS_EACH {
+                store
+                    .register_peer_update_listener(Arc::new(|_agent_info| {
+                        Box::pin(async {
+                            tokio::task::yield_now().await;
+                        })
+                    }))
+                    .expect("registering a listener must not fail");
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
