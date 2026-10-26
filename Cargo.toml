@@ -73,9 +73,9 @@ hkdf = "0.13.0"
 # the access module's proof-of-knowledge proofs are HMACs.
 hmac = "0.13.0"
 # alternative transport implementation using iroh
-iroh = "1.0.0"
+iroh = "1.4.1"
 # mDNS address lookup service for iroh, used for LAN discovery in the iroh transport
-iroh-mdns-address-lookup = "0.5.0"
+iroh-mdns-address-lookup = "0.6.1"
 # automock traits for tests
 mockall = "0.15"
 # watchable stream of values used in iroh transport
@@ -150,11 +150,11 @@ kitsune2_core = { version = "0.6.0-dev.0", path = "crates/core" }
 kitsune2_test_utils = { version = "0.6.0-dev.0", path = "crates/test_utils" }
 
 # iroh relay for testing iroh transport
-iroh-relay = "1.0.0"
-iroh-base = "1.0.0"
+iroh-relay = "1.4.1"
+iroh-base = "1.4.1"
 # DNS resolver split out of iroh-relay in the 1.0 release; used in tests
 # that drive a relay client.
-iroh-dns = "1.0.0"
+iroh-dns = "1.4.1"
 
 # Generating test certificates in the bootstrap_srv
 rcgen = "0.14"
